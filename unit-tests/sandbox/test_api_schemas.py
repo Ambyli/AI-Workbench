@@ -454,7 +454,33 @@ def test_spawn_paths(schema_file, runner, monkeypatch):
     monkeypatch.setattr(models, "MAX_FILE_BYTES", 8)
     expect(schema_file, "POST", "/run", http.post("/run", json={"runtime": "static", "files": {"a": "x" * 9}}), 422)
     expect(schema_file, "POST", "/run", http.post("/run", json={"runtime": "static", "env": {"HTTP_PROXY": "x"}}), 422)
+    # ttl_seconds: a negative one is refused (it used to give an expires_at in
+    # the past); 0, like omitted, is the default TTL; a positive one is used.
+    assert constants.TTL_SECONDS_MIN == 0
+    for bad in (-1, -60):
+        for route in ("/run", "/create"):
+            refused = expect(schema_file, "POST", route, http.post(route, json={"runtime": "static", "ttl_seconds": bad}), 422)
+            assert refused["detail"][0]["loc"][-1] == "ttl_seconds", refused
+    default_ttl = min(constants.DEFAULT_TTL_S, constants.HARD_TTL_S)
+    for route in ("/run", "/create"):
+        zero = check(schema_file, "POST", route, http.post(route, json={"runtime": "static", "ttl_seconds": 0}))
+        assert_ttl(runner, zero, default_ttl)
+    one = check(schema_file, "POST", "/create", http.post("/create", json={"runtime": "static", "ttl_seconds": 1}))
+    assert_ttl(runner, one, 1)
+    # chat_id: CHAT_ID_RE allows `@`, and a refusal quotes that pattern.
+    check(schema_file, "POST", "/create", http.post("/create", json={"runtime": "static", "chat_id": "alice@example.test"}))
+    bad_chat = expect(schema_file, "POST", "/create", http.post("/create", json={"runtime": "static", "chat_id": "a b"}), 422)
+    assert bad_chat["detail"][0]["msg"].endswith(f"chat_id must match {constants.CHAT_ID_RE.pattern}")
+    assert "@" in constants.CHAT_ID_RE.pattern
     RAN.add("spawn")
+
+
+def assert_ttl(runner, body, ttl: int) -> None:
+    """``body`` (a create / run answer) reports ``expires_at`` = spawn + ``ttl``
+    seconds, and its job row records that ``ttl_seconds``."""
+    assert runner.jobs.rows[body["sandbox_id"]]["metadata"]["ttl_seconds"] == ttl
+    left = (dt.datetime.fromisoformat(body["expires_at"]) - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    assert ttl - 60 < left <= ttl, (ttl, left)
 
 
 def test_session_writes_logs_and_jobs(schema_file, runner):
@@ -532,6 +558,15 @@ def test_file_tools(schema_file, runner):
     assert by_path["missing.txt"]["error"] == "not found"
     for response in (http.get("/session/bad.id/files"), http.get("/session/nosuchsession/files")):
         check(schema_file, "GET", "/session/:sandboxSessionId/files", response)
+    # A gone container: 409 (get_files never respawns) -- also when it goes
+    # between the liveness check and the read (docker's NotFound).
+    runner.alive = False
+    gone = expect(schema_file, "GET", "/session/:sandboxSessionId/files", http.get(f"/session/{sid}/files"), 409)
+    assert gone["detail"]["error"] == "sandbox container is gone" and gone["detail"]["session_id"] == sid
+    runner.alive = True
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner.spawner, "read_files", _gone_mid_call)
+        expect(schema_file, "GET", "/session/:sandboxSessionId/files", http.get(f"/session/{sid}/files"), 409)
     # read_file
     path = "/session/:sandboxSessionId/file"
     window = check(schema_file, "GET", path, http.get(f"/session/{sid}/file", params={"path": "app.py", "offset": 2, "limit": 3}))
@@ -590,7 +625,21 @@ def test_file_tools(schema_file, runner):
     expect(schema_file, "POST", path, http.post("/session/nosuchsession/exec", json={"command": "ls"}), 404)
     expect(schema_file, "POST", path, http.post(f"/session/{sid}/exec", json={"command": ""}), 400)
     expect(schema_file, "POST", path, http.post(f"/session/{sid}/exec", json={"timeout_seconds": 3}), 422)
+    runner.alive = False
+    gone = expect(schema_file, "POST", path, http.post(f"/session/{sid}/exec", json={"command": "ls"}), 409)
+    assert gone["detail"]["error"] == "sandbox container is gone" and "exec cannot respawn" in gone["detail"]["hint"]
+    runner.alive = True
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner.spawner, "exec_command", _gone_mid_call)
+        expect(schema_file, "POST", path, http.post(f"/session/{sid}/exec", json={"command": "ls"}), 409)
     RAN.add("files")
+
+
+def _gone_mid_call(*args, **kwargs):
+    """A spawner call whose container went after the liveness check."""
+    import spawner
+
+    raise spawner.NotFound("No such container")
 
 
 def test_teardown_and_browser_log(schema_file, runner):
@@ -626,6 +675,9 @@ def test_tool_server(schema_file, runner):
     assert page.headers["content-disposition"] == "inline" and "<" in page.text
     expect(schema_file, "POST", "/tool/run", http.post("/tool/run", json={"runtime": "static", "session_id": "bad id"}), 400)
     expect(schema_file, "POST", "/tool/run", http.post("/tool/run", json={"runtime": "python", "files": {"a.py": "(\n"}}), 400)
+    refused = expect(schema_file, "POST", "/tool/run", http.post("/tool/run", json={"runtime": "static", "ttl_seconds": -1}), 422)
+    assert refused["detail"][0]["loc"][-1] == "ttl_seconds", refused
+    check(schema_file, "POST", "/tool/run", http.post("/tool/run", json={"runtime": "static", "ttl_seconds": 0}))
     runner.jobs.refuse_register = True
     expect(schema_file, "POST", "/tool/run", http.post("/tool/run", json={"runtime": "static", "chat_id": "c1"}), 409)
     runner.jobs.refuse_register = False
@@ -763,6 +815,22 @@ def test_mcp_tools(schema_file, runner, monkeypatch):
     assert check_mcp(schema_file, "MCP get_logs", empty)["empty"] is True
     too_big = check_mcp(schema_file, "MCP write_files", too_big)
     assert too_big["status"] == 413 and too_big["detail"]["error"] == "payload too large"
+    # A gone container: get_files / exec answer the structured 409 as data
+    # (it used to be docker's NotFound, unhandled: an MCP isError).
+    runner.alive = False
+    files_gone, exec_gone = mcp_calls(mcp, [("get_files", {"session_id": sid2}),
+                                            ("exec", {"session_id": sid2, "command": "ls"})])
+    runner.alive = True
+    for key, result in (("get_files", files_gone), ("exec", exec_gone)):
+        payload = check_mcp(schema_file, f"MCP {key}", result)
+        assert payload["status"] == 409 and payload["detail"]["error"] == "sandbox container is gone", payload
+    # A negative ttl_seconds: invalid arguments, as data; 0 is the default TTL.
+    short_ttl, zero_ttl = mcp_calls(mcp, [("create", {"runtime": "static", "ttl_seconds": -5}),
+                                          ("create", {"runtime": "static", "ttl_seconds": 0})])
+    short_ttl = check_mcp(schema_file, "MCP create", short_ttl)
+    assert short_ttl["status"] == 422 and "ttl_seconds" in short_ttl["detail"]["message"]
+    assert_ttl(runner, check_mcp(schema_file, "MCP create", zero_ttl),
+               min(constants.DEFAULT_TTL_S, constants.HARD_TTL_S))
     RAN.add("mcp")
 
 

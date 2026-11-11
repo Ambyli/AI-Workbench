@@ -60,7 +60,13 @@ from components.phoenix_client import PhoenixClient
 from components.roofix_scraper_client import RoofixScraperClient
 
 TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
-FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH", "/app/config/field_mapping.json")
+# Michael's Roofix-event -> Phoenix milestone map. The default is the file
+# shipped beside this module (config/field_mapping.json -- in the image
+# /app/ai/roofix/config/field_mapping.json, Dockerfile.roofix's COPY); set
+# FIELD_MAPPING_PATH to read another (e.g. /config/field_mapping.json on the
+# ROOFIX_BRIDGE_CONFIG_DIR mount, to change it without a rebuild).
+DEFAULT_FIELD_MAPPING_PATH = str(Path(__file__).resolve().parent / "config" / "field_mapping.json")
+FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH") or DEFAULT_FIELD_MAPPING_PATH
 LOG_DIR = os.getenv("LOG_DIR", "/data")
 DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 
@@ -126,11 +132,11 @@ _STATE: dict = {
 
 
 def _load_milestone_map() -> dict:
-    """Read Michael's Roofix-event -> Phoenix (block_name, status_id) mapping.
-
-    The file lives on disk (mounted config) so it can be updated without a
-    container rebuild. Returns {} if the file is missing / malformed — brain
-    will log a "no milestone mapping for ..." warning and skip.
+    """Read Michael's Roofix-event -> Phoenix (block_name, status_id) mapping
+    from ``FIELD_MAPPING_PATH`` (by default the ``config/field_mapping.json``
+    shipped beside this module). Returns {} if the file is missing /
+    malformed — the orchestrator then logs a "no milestone mapping for ..."
+    warning and skips the write.
     """
     try:
         with open(FIELD_MAPPING_PATH, "r") as f:

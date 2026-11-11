@@ -500,6 +500,45 @@ def test_an_error_on_one_page_makes_the_criterion_incomplete_at_every_level():
     assert agg.final.status == "ok" and agg.final.score == 9 and agg.final.complete is False
 
 
+def _located(score, accepted_attempt, calls=2):
+    """An llm outcome carrying ONE unit's box-loop record (as llm_eval makes it)."""
+    out = _ok(score)
+    attempts = [{"attempt": n, "bbox_grid": None, "bbox_px": None, "valid": n == accepted_attempt,
+                 "accepted": n == accepted_attempt} for n in range(1, (accepted_attempt or 1) + 1)]
+    out.localization = {"attempts": attempts, "accepted_attempt": accepted_attempt, "calls": calls,
+                        "references": [{"item": None, "note": "tagged when made"}]}
+    return out
+
+
+def test_the_box_loop_record_merges_the_same_across_documents_as_across_pages():
+    """API.md § per-criterion entry: merged, every attempt carries its `item`
+    and `accepted` lists each accepted box -- also when the members are
+    single-page DOCUMENTS (whose records pass the pages level verbatim), and
+    when a merged document meets a single-page one."""
+    c = CriterionInput(name="x", type="llm", options={"hint": "presence", "boxes": True})
+
+    def merged(groups, outcomes):
+        loc = aggregate_criterion(c, _units(c, outcomes), groups).final.localization
+        assert loc["accepted_attempt"] is None
+        return loc
+
+    # Three single-page documents (items 0, 1, 2): item 1 accepted nothing.
+    loc = merged(_groups(1, 1, 1), [_located(9, 2), _located(2, None), _located(8, 1, calls=3)])
+    assert [(a["item"], a["attempt"]) for a in loc["attempts"]] == [(0, 1), (0, 2), (1, 1), (2, 1)]
+    assert loc["accepted"] == [{"item": 0, "attempt": 2}, {"item": 2, "attempt": 1}]
+    assert loc["calls"] == 7 and len(loc["references"]) == 3
+    # The same three items as the pages of ONE document: the identical record.
+    assert merged(_groups(3), [_located(9, 2), _located(2, None), _located(8, 1, calls=3)]) == loc
+    # A two-page document (items 0, 1, merged at the pages level) and a one-page one (item 2).
+    loc = merged(_groups(2, 1), [_located(9, 2), _located(2, None), _located(8, 1, calls=3)])
+    assert [(a["item"], a["attempt"]) for a in loc["attempts"]] == [(0, 1), (0, 2), (1, 1), (2, 1)]
+    assert loc["accepted"] == [{"item": 0, "attempt": 2}, {"item": 2, "attempt": 1}]
+    # One member at each level: the unit's record verbatim (no item, no `accepted`).
+    only = aggregate_criterion(c, _units(c, [_located(9, 2)]), _groups(1)).final.localization
+    assert "accepted" not in only and only["accepted_attempt"] == 2
+    assert all("item" not in a for a in only["attempts"])
+
+
 def test_document_scope_has_no_pages_level():
     c = CriterionInput(name="x", type="text", options={"scope": "document", "aggregate": "any"})
     units = scheduler.CriterionUnits(criterion=c, scope="document",

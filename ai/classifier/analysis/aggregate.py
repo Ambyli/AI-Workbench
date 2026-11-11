@@ -45,9 +45,15 @@ The rules around the rules:
     Several: every attempt, tagged with its ``item``, the total ``calls``,
     and ``accepted`` listing ``{"item", "attempt"}`` per accepted box
     (``accepted_attempt`` is null — an attempt number means nothing across
-    items). ``references`` (what the loop was shown, one entry per unit,
-    already tagged with its ``item``) is the members' lists concatenated, at
-    both levels; absent when no member has one.
+    items). A member's record is either ONE unit's (no ``accepted`` key: it
+    is tagged here with the member's item) or already merged (a document of
+    several pages: its attempts carry their items and its ``accepted`` is
+    taken as-is) -- at the documents level a single-page document's member
+    carries that page's item, so a job of several single-page documents
+    merges exactly like the pages of one. ``references`` (what the loop was
+    shown, one entry per unit, already tagged with its ``item``) is the
+    members' lists concatenated, at both levels; absent when no member has
+    one.
 
     aggregate_level()     — one level, over labelled members.
     pages_outcome()       — one document's pages, for per-item gating of a
@@ -74,8 +80,9 @@ from utils import verdict_from_score
 
 @dataclass
 class Member:
-    """One input to a level: a label for the reason, the item it is (pages
-    level only), and its outcome."""
+    """One input to a level: a label for the reason, the item it is (every
+    member of the pages level; at the documents level, a document of one
+    page -- else None), and its outcome."""
 
     label: str
     item: Optional[int]
@@ -97,12 +104,17 @@ def _merged_localization(members: list[Member]) -> Optional[dict]:
     for m in located:
         loc = m.outcome.localization
         calls += int(loc.get("calls") or 0)
-        for attempt in loc.get("attempts", []):
-            attempts.append(attempt if m.item is None else {"item": m.item, **attempt})
-        if m.item is None:
-            accepted.extend(loc.get("accepted", []))
-        elif loc.get("accepted_attempt") is not None:
-            accepted.append({"item": m.item, "attempt": loc["accepted_attempt"]})
+        if "accepted" in loc:
+            # Already merged (a document of several pages): its attempts
+            # carry their items and its accepted list is complete.
+            attempts.extend(loc.get("attempts", []))
+            accepted.extend(loc["accepted"])
+        else:
+            # One unit's record: tag it with the member's item.
+            for attempt in loc.get("attempts", []):
+                attempts.append(attempt if m.item is None else {"item": m.item, **attempt})
+            if loc.get("accepted_attempt") is not None and m.item is not None:
+                accepted.append({"item": m.item, "attempt": loc["accepted_attempt"]})
         if "references" in loc:
             # Each entry was tagged with its item when it was made, so both
             # levels just concatenate.
@@ -302,6 +314,13 @@ def aggregate_criterion(c: CriterionInput, units, groups) -> Aggregated:
             for g in groups
         ]
         used = {"pages": rules["pages"], "documents": rules["documents"]}
-    members = [Member(f"document {g.index}", None, o) for g, o in zip(groups, per_document)]
+
+    def only_item(g) -> Optional[int]:
+        # A single-page document's answer is that page's own record (one
+        # member passes straight through), so the documents level tags it
+        # with the page's item; a document-scope unit has no item.
+        return g.items[0].item if units.scope != "document" and len(g.items) == 1 else None
+
+    members = [Member(f"document {g.index}", only_item(g), o) for g, o in zip(groups, per_document)]
     final = aggregate_level(c, rules["documents"], members, "document")
     return Aggregated(final=final, per_document=per_document, used=used)

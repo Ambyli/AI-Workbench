@@ -137,7 +137,7 @@ Sub-cases that short-circuit before the action branches:
 | `ROOFIX_MAX_MATCHES_PER_PATTERN` | `5` | Cap on captures per URL pattern returned in one `/capture` response. |
 | `ROOFIX_INIT_DATA_URL_PATTERN` | `roofix\.io/api/1\.1/init/data` | Regex matched against captured XHR URLs to identify Bubble's page-hydrate endpoint. Override if Bubble ever renames it. |
 | `ROOFIX_MGET_URL_PATTERN` | `roofix\.io/elasticsearch/mget` | Regex matched against captured XHR URLs to identify the batch-get endpoint (customer + HIC + job docs). |
-| `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
+| `FIELD_MAPPING_PATH` | `config/field_mapping.json` beside `app.py` (in the image `/app/ai/roofix/config/field_mapping.json`) | Roofix-event → Phoenix (block_name, status_id) map. Unset or empty = the shipped file; point it at `/config/field_mapping.json` (the `ROOFIX_BRIDGE_CONFIG_DIR` mount) to change the map without a rebuild. |
 | `LOG_DIR` | `/data` | Where per-tick logs live (mounted volume). Two files: `roofix.log` (stdlib text log; framework messages + compact per-decision echo) and `agent_log.csv` (structured audit trail via `common.logging_setup.CsvLogger`). |
 | `DEBUG_LOGGING` | `false` | When true, promotes the stdlib file log to DEBUG level and the console to DEBUG. |
 
@@ -366,12 +366,12 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
    ```bash
    cd ai/roofix
    for t in test_parser test_brain test_proposal_extractor test_phoenix_client \
-            test_t9_orchestrator test_extracted_payload test_execute; do
+            test_t9_orchestrator test_extracted_payload test_execute test_field_mapping; do
      PYTHONPATH=. UV_LINK_MODE=copy uv run --no-sync python tests/$t.py || echo "FAILED: $t"
    done
    ```
 
-   `test_extracted_payload` pins the `_extracted_payload` names (ExtractedProposal → orchestrator → `ensure_entity_and_project`) and checks real records against `roofix.schemas.json`; `test_execute` covers the escalation branch, the `_phoenix_write_ok` stamp and `/status`'s `phoenix_write_failures`. (`test_e2e_offline.py` predates the async orchestrator and does not pass.)
+   `test_extracted_payload` pins the `_extracted_payload` names (ExtractedProposal → orchestrator → `ensure_entity_and_project`) and checks real records against `roofix.schemas.json`; `test_execute` covers the escalation branch, the `_phoenix_write_ok` stamp and `/status`'s `phoenix_write_failures`; `test_field_mapping` pins where the milestone map is read from (the shipped file, in the image too) and that it is still the stub. (`test_e2e_offline.py` predates the async orchestrator and does not pass.)
 
 2. **Bring up the stack**:
 
@@ -436,7 +436,8 @@ ai/roofix/
     roofix_email_samples.py         real observed email shapes
     fixtures/                       captured proposal payloads
     test_parser.py, test_brain.py, test_phoenix_client.py, test_proposal_extractor.py,
-    test_t9_orchestrator.py, test_extracted_payload.py, test_execute.py, test_e2e_offline.py
+    test_t9_orchestrator.py, test_extracted_payload.py, test_execute.py, test_field_mapping.py,
+    test_e2e_offline.py
 ```
 
 There is no separate scraper service any more: the Playwright proposal scraper (and its `save_roofix_session.py` + `/session/refresh` flow) was replaced by the generic `ai/interceptor/` service (Chrome under CDP), which owns the Roofix session as a named profile — see [Session profile](#session-profile-roofix-on-interceptor).
@@ -444,7 +445,7 @@ There is no separate scraper service any more: the Playwright proposal scraper (
 ### Known limitations / TODOs
 
 - **Phoenix writes are live via psycopg2** — no MCP dependency. The MCP client was reverted because the write tools weren't ready in time. `DRY_RUN=true` still short-circuits writes (returns Result with the intended SQL + params in `.data` for inspection).
-- **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. `update_milestone` will log a "no milestone mapping" warning and skip until the file is filled in.
+- **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. It loads (`FIELD_MAPPING_PATH`), but every milestone in it is `phoenix_block_TBD` / status `0`: `update_milestone` looks that block up in Phoenix (a read, even under `DRY_RUN`), finds no row, logs "process_block 'phoenix_block_TBD' resolved to 0 rows" and writes nothing (counted in `/status` `phoenix_write_failures`); an event with no entry at all (`Job Completed`, `Job Rescheduled`, `Execute HIC`, …) logs "no milestone mapping" and skips. Milestones are a Phase 0 rule (`AGENT_PHASE` does not gate them), so once real block names and status ids are filled in, `DRY_RUN=false` makes the writes real — the shipped file is baked into the image, so that is a rebuild (`make build roofix && make up roofix`) unless `FIELD_MAPPING_PATH` points at the mount.
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **Phase 1** — `create_project` and `notify_rep` paths exist but are stubbed. Wire a CloudTalk MCP when needed.
 - **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR.md § Refreshing a profile](../interceptor/INTERCEPTOR.md#refreshing-a-profile-operator-flow)).

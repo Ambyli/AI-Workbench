@@ -22,7 +22,8 @@ Modules:
                Endpoint, standalone(), walk() / transform() / open_objects(),
                inline_refs(), check_schema() and validate() (jsonschema),
                dump_schemas()
-    render     display_schema(), endpoint_markdown(), postman_section(),
+    render     display_schema(), shown() (a block over INLINE_LIMIT keeps its
+               $refs), definitions(), endpoint_markdown(), postman_section(),
                apply_to_collection(), schemas_markdown(), link_block(),
                apply_to_markdown(), render_service()
     generate   from_pydantic(), from_output_spec(), from_result_spec(),

@@ -59,6 +59,7 @@ from common.textops import (
     split_lines,
 )
 from runtimes import RUNTIMES, get_runtime
+from spawner import NotFound as ContainerNotFound  # docker's, as spawner.py imports it
 
 import state
 
@@ -711,20 +712,14 @@ async def _do_write_files(
 
     # Container is gone.
     if not recreate_if_gone:
-        raise HTTPException(
-            409,
-            {
-                "error": "sandbox container is gone",
-                "session_id": session_id,
-                "hint": (
-                    "Sandbox is no longer running (container gone). To keep "
-                    "working under this session_id, call write_files "
-                    "again with recreate_if_gone=true. The container will "
-                    "be respawned FRESH — packages installed via exec and "
-                    "in-container files not in your current files map will "
-                    "be LOST. Env vars set at create time ARE preserved."
-                ),
-            },
+        raise _container_gone(
+            session_id,
+            "Sandbox is no longer running (container gone). To keep "
+            "working under this session_id, call write_files "
+            "again with recreate_if_gone=true. The container will "
+            "be respawned FRESH — packages installed via exec and "
+            "in-container files not in your current files map will "
+            "be LOST. Env vars set at create time ARE preserved.",
         )
     # Self-heal path.
     return await _respawn_session(existing, session_id, files, deletes)
@@ -980,6 +975,16 @@ async def _respawn_session(
     return result
 
 
+def _container_gone(session_id: str, hint: str) -> HTTPException:
+    """The 409 a session route answers when the registry says running but
+    the container is gone and the call does not respawn (get_files, exec,
+    read_file, edit_file; write_files without ``recreate_if_gone``) — over
+    MCP, a structured error returned as data."""
+    return HTTPException(
+        409, {"error": "sandbox container is gone", "session_id": session_id, "hint": hint},
+    )
+
+
 async def _do_get_files(
     session_id: str,
     paths: Optional[list[str]],
@@ -994,10 +999,21 @@ async def _do_get_files(
         raise HTTPException(
             404, f"no running sandbox for session {session_id!r}"
         )
-    max_bytes = max(1, min(max_bytes_per_file, GET_FILES_HARD_CAP_BYTES))
-    entries = await asyncio.to_thread(
-        state.spawner.read_files, existing["container_name"], paths, max_bytes,
+    gone = _container_gone(
+        session_id,
+        "get_files cannot respawn a container — a fresh one would not have "
+        "your files. Call write_files with recreate_if_gone=true and the "
+        "files' full content to bring the session back, then continue.",
     )
+    if not await asyncio.to_thread(state.spawner.container_exists, existing["container_name"]):
+        raise gone
+    max_bytes = max(1, min(max_bytes_per_file, GET_FILES_HARD_CAP_BYTES))
+    try:
+        entries = await asyncio.to_thread(
+            state.spawner.read_files, existing["container_name"], paths, max_bytes,
+        )
+    except ContainerNotFound:
+        raise gone     # it went between the check and the read
     return {
         "session_id": session_id,
         "sandbox_id": existing["sandbox_id"],
@@ -1034,6 +1050,15 @@ async def _do_exec(
                 ),
             },
         )
+    gone = _container_gone(
+        session_id,
+        "exec cannot respawn a container. Call write_files with "
+        "recreate_if_gone=true and the files' full content to bring the "
+        "session back, then run the command again — packages installed "
+        "earlier via exec do NOT survive a respawn.",
+    )
+    if not await asyncio.to_thread(state.spawner.container_exists, existing["container_name"]):
+        raise gone
     try:
         res = await asyncio.to_thread(
             state.spawner.exec_command,
@@ -1045,6 +1070,8 @@ async def _do_exec(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except ContainerNotFound:
+        raise gone     # it went between the check and the exec
     # exec counts as activity — bump last_used_at so the reaper resets.
     await state.registry.update_metadata(
         existing["sandbox_id"], {"last_used_at": _now_iso()},
@@ -1088,18 +1115,12 @@ async def _require_live_container(session_id: str, tool: str) -> dict:
         state.spawner.container_exists, existing["container_name"]
     )
     if not alive:
-        raise HTTPException(
-            409,
-            {
-                "error": "sandbox container is gone",
-                "session_id": session_id,
-                "hint": (
-                    f"{tool} cannot respawn a container — a fresh one would "
-                    "not have your files. Call write_files with "
-                    "recreate_if_gone=true and the files' full content to "
-                    "bring the session back, then continue."
-                ),
-            },
+        raise _container_gone(
+            session_id,
+            f"{tool} cannot respawn a container — a fresh one would "
+            "not have your files. Call write_files with "
+            "recreate_if_gone=true and the files' full content to "
+            "bring the session back, then continue.",
         )
     return existing
 

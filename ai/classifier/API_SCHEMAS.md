@@ -1161,6592 +1161,10 @@ Response `202` (`application/json`) — Queued: poll GET /jobs/:jobId:
 Response `200` (`application/json`):
 
 ```json
-{
-  "description": "The 20 most recently updated jobs, finished ones included (PostgresRegistry.list_all)",
-  "allOf": [
-    {
-      "$comment": "generated from common.jobs.model.JobsListResponse — do not edit",
-      "description": "Response body for ``GET /jobs``.\n\n``max_concurrent`` and ``available`` are populated by backends that have\na concurrency ceiling (like the in-memory backend fronted by a port pool);\npersistent backends leave them ``None``.",
-      "properties": {
-        "active_count": {"type": "integer"},
-        "jobs": {
-          "items": {
-            "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"cleaning_up\"``;\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
-            "properties": {
-              "job_id": {"type": "string"},
-              "phase": {"type": "string"},
-              "created_at": {"type": "string"},
-              "updated_at": {"type": "string"},
-              "elapsed_seconds": {"type": "number"},
-              "metadata": {"additionalProperties": true, "type": "object"},
-              "result": {
-                "anyOf": [
-                  {"additionalProperties": true, "type": "object"},
-                  {"type": "null"}
-                ],
-                "default": null
-              },
-              "error": {
-                "anyOf": [
-                  {"type": "string"},
-                  {"type": "null"}
-                ],
-                "default": null
-              }
-            },
-            "required": [
-              "job_id",
-              "phase",
-              "created_at",
-              "updated_at",
-              "elapsed_seconds",
-              "metadata"
-            ],
-            "type": "object",
-            "additionalProperties": false
-          },
-          "type": "array"
-        },
-        "max_concurrent": {
-          "anyOf": [
-            {"type": "integer"},
-            {"type": "null"}
-          ],
-          "default": null
-        },
-        "available": {
-          "anyOf": [
-            {"type": "integer"},
-            {"type": "null"}
-          ],
-          "default": null
-        }
-      },
-      "required": ["active_count", "jobs"],
-      "type": "object",
-      "additionalProperties": false
-    }
-  ],
-  "properties": {
-    "jobs": {
-      "items": {
-        "description": "One job: the shared `common.jobs` `JobBase` with the classifier's metadata and result",
-        "allOf": [
-          {
-            "$comment": "generated from common.jobs.model.JobBase — do not edit",
-            "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"cleaning_up\"``;\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
-            "properties": {
-              "job_id": {"type": "string"},
-              "phase": {"type": "string"},
-              "created_at": {"type": "string"},
-              "updated_at": {"type": "string"},
-              "elapsed_seconds": {"type": "number"},
-              "metadata": {"additionalProperties": true, "type": "object"},
-              "result": {
-                "anyOf": [
-                  {"additionalProperties": true, "type": "object"},
-                  {"type": "null"}
-                ],
-                "default": null
-              },
-              "error": {
-                "anyOf": [
-                  {"type": "string"},
-                  {"type": "null"}
-                ],
-                "default": null
-              }
-            },
-            "required": [
-              "job_id",
-              "phase",
-              "created_at",
-              "updated_at",
-              "elapsed_seconds",
-              "metadata"
-            ],
-            "type": "object",
-            "additionalProperties": false
-          }
-        ],
-        "properties": {
-          "job_id": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{12}$",
-            "description": "A job's id: 12 hex characters"
-          },
-          "phase": {
-            "enum": ["staging", "pending", "processing", "completed", "failed", "cancelled"],
-            "description": "`staging` (being written) → `pending` (queued) → `processing` → `completed` | `failed` | `cancelled`"
-          },
-          "metadata": {
-            "type": "object",
-            "description": "`ClassifierMetadata` (left-out keys when unset) plus the progress snapshot",
-            "additionalProperties": false,
-            "required": ["type", "request_id"],
-            "properties": {
-              "type": {
-                "enum": ["assess", "reference", "compare", "locate"],
-                "description": "assess (POST /assess) or reference (the creation job POST /references queues); a row written by an older container may still say compare or locate (the worker fails it)"
-              },
-              "request_id": {
-                "type": "string",
-                "description": "The correlation id of the request that queued the job"
-              },
-              "reference_id": {
-                "type": "string",
-                "pattern": "^r[0-9a-f]{12}$",
-                "description": "A reference job: the reference it builds"
-              },
-              "references": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "pattern": "^r[0-9a-f]{12}$",
-                  "description": "A reference's id: `r` and 12 hex characters"
-                },
-                "description": "An assess job: the reference ids it reads"
-              },
-              "progress": {
-                "type": "object",
-                "description": "How far along the job is (`common.jobs.progress`): the snapshot, flushed about once a second (§ Progress)",
-                "additionalProperties": false,
-                "required": [
-                  "state",
-                  "percent",
-                  "stage",
-                  "stage_title",
-                  "label",
-                  "index",
-                  "length",
-                  "attempt",
-                  "seq",
-                  "updated_at",
-                  "stages"
-                ],
-                "properties": {
-                  "state": {"enum": ["queued", "running", "done", "failed", "cancelled"]},
-                  "percent": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 100,
-                    "description": "0-100, held just under 100 while the job runs"
-                  },
-                  "stage": {"type": ["string", "null"], "description": "The current stage's name"},
-                  "stage_title": {"type": ["string", "null"]},
-                  "label": {"type": ["string", "null"], "description": "What is happening now"},
-                  "index": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Units done in the current stage"
-                  },
-                  "length": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Units in the current stage"
-                  },
-                  "attempt": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Which run of the job (a requeue is the next)"
-                  },
-                  "seq": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "The snapshot's sequence number in the job's history"
-                  },
-                  "updated_at": {"type": "string", "format": "date-time"},
-                  "stages": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["name", "title", "weight", "index", "length"],
-                      "properties": {
-                        "name": {"type": "string"},
-                        "title": {"type": "string"},
-                        "weight": {"type": "number", "minimum": 0},
-                        "index": {"type": "integer", "minimum": 0},
-                        "length": {"type": "integer", "minimum": 0}
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "result": {
-            "oneOf": [
-              {"type": "null"},
-              {
-                "type": "object",
-                "description": "An assess job's result, `schema_version: 3` (§ Result shape)",
-                "additionalProperties": false,
-                "required": [
-                  "schema_version",
-                  "documents",
-                  "items",
-                  "assessment",
-                  "verdict",
-                  "page_geometry",
-                  "detector",
-                  "artifacts",
-                  "references",
-                  "request"
-                ],
-                "properties": {
-                  "schema_version": {"const": 3},
-                  "documents": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "index",
-                        "filename",
-                        "kind",
-                        "pages",
-                        "items",
-                        "warnings",
-                        "document_info"
-                      ],
-                      "properties": {
-                        "index": {"type": "integer", "minimum": 0},
-                        "filename": {"type": "string"},
-                        "kind": {"enum": ["image", "pdf", "svg", "txt", "docx"]},
-                        "pages": {"type": "integer", "minimum": 1},
-                        "items": {
-                          "type": "array",
-                          "items": {"type": "integer", "minimum": 0},
-                          "description": "Its global item indices"
-                        },
-                        "warnings": {
-                          "type": "array",
-                          "items": {"type": "string"},
-                          "description": "How the document was read that is worth knowing but is not an error (an SVG's external references); [] otherwise"
-                        },
-                        "document_info": {
-                          "type": "object",
-                          "additionalProperties": false,
-                          "required": [
-                            "content_type",
-                            "size_bytes",
-                            "has_image",
-                            "native_text_chars",
-                            "ocr",
-                            "llm_text_char_budget"
-                          ],
-                          "properties": {
-                            "content_type": {"type": "string"},
-                            "size_bytes": {"type": "integer", "minimum": 0},
-                            "has_image": {"type": "boolean", "description": "Any page has an image"},
-                            "native_text_chars": {"type": "integer", "minimum": 0},
-                            "ocr": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": [
-                                "engine",
-                                "min_native_chars",
-                                "layers",
-                                "document_layers"
-                              ],
-                              "properties": {
-                                "engine": {"type": "string"},
-                                "min_native_chars": {"type": "integer"},
-                                "layers": {
-                                  "type": "array",
-                                  "items": {
-                                    "type": "object",
-                                    "description": "One text layer one item's criteria asked for (`text.p{item}.<key>.json`)",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "item",
-                                      "key",
-                                      "mode",
-                                      "ran",
-                                      "source",
-                                      "chars",
-                                      "confidence",
-                                      "note"
-                                    ],
-                                    "properties": {
-                                      "item": {"type": "integer"},
-                                      "key": {
-                                        "type": "string",
-                                        "description": "The text-layer key (the OCR settings)"
-                                      },
-                                      "mode": {"enum": ["auto", "always", "never"]},
-                                      "ran": {
-                                        "type": "boolean",
-                                        "description": "Whether OCR ran for this layer"
-                                      },
-                                      "source": {
-                                        "type": "string",
-                                        "description": "native | ocr | none"
-                                      },
-                                      "chars": {"type": "integer", "minimum": 0},
-                                      "confidence": {"type": ["number", "null"]},
-                                      "note": {"type": ["string", "null"]}
-                                    }
-                                  }
-                                },
-                                "document_layers": {
-                                  "type": "array",
-                                  "items": {
-                                    "type": "object",
-                                    "description": "The joined text a `scope: \"document\"` search read",
-                                    "additionalProperties": false,
-                                    "required": ["key", "source", "chars", "file"],
-                                    "properties": {
-                                      "key": {"type": "string"},
-                                      "source": {"type": "string"},
-                                      "chars": {"type": "integer", "minimum": 0},
-                                      "file": {
-                                        "type": "string",
-                                        "description": "`text.d{index}.<key>.json`"
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            "llm_text_char_budget": {
-                              "type": "integer",
-                              "description": "The job model's text budget"
-                            }
-                          }
-                        }
-                      }
-                    },
-                    "description": "One per document, in request order"
-                  },
-                  "items": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "description": "One item's own weighted answer, from its per-criterion unit results (§ Scores per item, and overall)",
-                      "additionalProperties": false,
-                      "required": [
-                        "item",
-                        "document",
-                        "page",
-                        "filename",
-                        "overall_score",
-                        "overall_verdict",
-                        "complete"
-                      ],
-                      "properties": {
-                        "item": {"type": "integer", "minimum": 0},
-                        "document": {"type": "integer", "minimum": 0},
-                        "page": {
-                          "type": "integer",
-                          "minimum": 0,
-                          "description": "Within its document"
-                        },
-                        "filename": {"type": "string"},
-                        "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                        "overall_verdict": {
-                          "anyOf": [
-                            {"type": "null"},
-                            {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                          ]
-                        },
-                        "complete": {"type": "boolean"}
-                      }
-                    },
-                    "description": "One per item"
-                  },
-                  "assessment": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                      "overall_score",
-                      "overall_verdict",
-                      "complete",
-                      "weighted_score_breakdown",
-                      "per_criterion_scores"
-                    ],
-                    "properties": {
-                      "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                      "overall_verdict": {
-                        "anyOf": [
-                          {"type": "null"},
-                          {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                        ]
-                      },
-                      "complete": {
-                        "type": "boolean",
-                        "description": "false when any scored criterion errored"
-                      },
-                      "weighted_score_breakdown": {
-                        "anyOf": [
-                          {"type": "null"},
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "formula",
-                              "total_weight",
-                              "weighted_sum",
-                              "unrounded_average",
-                              "final_score",
-                              "partial",
-                              "excluded",
-                              "per_criterion"
-                            ],
-                            "properties": {
-                              "formula": {"const": "sum(score * weight) / total_weight"},
-                              "total_weight": {"type": "number"},
-                              "weighted_sum": {"type": "number"},
-                              "unrounded_average": {"type": "number"},
-                              "final_score": {"type": "integer"},
-                              "partial": {
-                                "type": "boolean",
-                                "description": "Some scored criterion errored: this is the score of what succeeded"
-                              },
-                              "excluded": {
-                                "type": "object",
-                                "additionalProperties": {"type": "string"},
-                                "description": "Criterion name → why it was left out"
-                              },
-                              "per_criterion": {
-                                "type": "object",
-                                "additionalProperties": {
-                                  "type": "object",
-                                  "additionalProperties": false,
-                                  "required": ["score", "weight", "contribution"],
-                                  "properties": {
-                                    "score": {"type": "integer"},
-                                    "weight": {"type": "number"},
-                                    "contribution": {"type": "number"}
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        ]
-                      },
-                      "per_criterion_scores": {
-                        "type": "object",
-                        "additionalProperties": {
-                          "type": "object",
-                          "description": "One criterion: the same keys for every type and status (§ Result shape)",
-                          "additionalProperties": false,
-                          "required": [
-                            "status",
-                            "type",
-                            "key",
-                            "method",
-                            "scored",
-                            "score",
-                            "verdict",
-                            "confidence",
-                            "reason",
-                            "detail",
-                            "regions",
-                            "regions_truncated",
-                            "artifacts",
-                            "localization",
-                            "options_used",
-                            "error",
-                            "complete",
-                            "aggregate_used",
-                            "items"
-                          ],
-                          "properties": {
-                            "status": {
-                              "enum": ["ok", "error", "skipped"],
-                              "description": "`ok` when at least one unit answered, `error` when none did and one errored, `skipped` when every unit was skipped"
-                            },
-                            "type": {"enum": ["llm", "text", "detector", "cv"]},
-                            "key": {
-                              "type": ["string", "null"],
-                              "description": "The criterion's `key` as sent (stripped)"
-                            },
-                            "method": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "enum": ["llm", "text", "detector", "cv"],
-                                  "description": "The path that answered (a cv fallback's); null when skipped by a dependency"
-                                }
-                              ]
-                            },
-                            "scored": {
-                              "type": "boolean",
-                              "description": "The criterion's `score` flag"
-                            },
-                            "score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                            "verdict": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                              ]
-                            },
-                            "confidence": {
-                              "type": ["integer", "null"],
-                              "minimum": 0,
-                              "maximum": 100
-                            },
-                            "reason": {"type": "string"},
-                            "detail": {
-                              "description": "Structured diagnostics: its method's declared shape (GET /criterion-types `result`), or null"
-                            },
-                            "regions": {
-                              "type": "array",
-                              "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": [
-                                  "page",
-                                  "kind",
-                                  "points",
-                                  "label",
-                                  "score",
-                                  "source",
-                                  "attrs"
-                                ],
-                                "properties": {
-                                  "page": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                    "description": "Its item"
-                                  },
-                                  "kind": {"enum": ["box", "polygon"]},
-                                  "points": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "array",
-                                      "items": {"type": "number"},
-                                      "minItems": 2,
-                                      "maxItems": 2
-                                    },
-                                    "description": "[[x, y], …] in original page pixels"
-                                  },
-                                  "label": {"type": "string"},
-                                  "score": {
-                                    "type": ["number", "null"],
-                                    "description": "The producer's confidence"
-                                  },
-                                  "source": {"enum": ["cv", "ocr", "pdf-text", "detector", "llm"]},
-                                  "attrs": {
-                                    "type": "object",
-                                    "additionalProperties": true,
-                                    "description": "Free-form extras per source (`common.vision.Region.attrs`): a `text` snippet, `pdf_rect`, the llm loop's `attempt` / `accepted` / `verify_score`, …"
-                                  }
-                                }
-                              },
-                              "description": "The union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX"
-                            },
-                            "regions_truncated": {"type": "boolean"},
-                            "artifacts": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "type": "object",
-                                  "description": "Per-criterion links; null when there is neither geometry nor text",
-                                  "additionalProperties": false,
-                                  "required": [],
-                                  "properties": {
-                                    "slug": {
-                                      "type": "string",
-                                      "description": "The criterion's file-name slug"
-                                    },
-                                    "regions_url": {
-                                      "type": "string",
-                                      "description": "regions.json scoped to the criterion"
-                                    },
-                                    "items": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": ["item", "count", "layers", "attempts"],
-                                        "properties": {
-                                          "item": {"type": "integer"},
-                                          "count": {"type": "integer", "minimum": 0},
-                                          "layers": {
-                                            "type": "object",
-                                            "description": "Layer URLs (rendered on first fetch)",
-                                            "additionalProperties": false,
-                                            "required": [],
-                                            "properties": {
-                                              "svg": {"type": "string"},
-                                              "png": {"type": "string"},
-                                              "preview": {"type": "string"}
-                                            }
-                                          },
-                                          "attempts": {
-                                            "type": "array",
-                                            "items": {
-                                              "type": "object",
-                                              "additionalProperties": false,
-                                              "required": ["attempt", "accepted"],
-                                              "properties": {
-                                                "attempt": {"type": "integer"},
-                                                "accepted": {"type": "boolean"},
-                                                "svg": {"type": "string"},
-                                                "png": {"type": "string"},
-                                                "preview": {"type": "string"}
-                                              }
-                                            },
-                                            "description": "One per enforcement-loop attempt with a drawable box on the item"
-                                          }
-                                        }
-                                      },
-                                      "description": "Per item it found something on"
-                                    },
-                                    "text": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                        "additionalProperties": false,
-                                        "required": ["key", "url", "source", "chars"],
-                                        "properties": {
-                                          "item": {"type": "integer"},
-                                          "document": {"type": "integer"},
-                                          "key": {"type": "string"},
-                                          "url": {"type": "string"},
-                                          "source": {"type": "string"},
-                                          "chars": {"type": "integer", "minimum": 0}
-                                        }
-                                      },
-                                      "description": "One link per text layer its units read"
-                                    }
-                                  }
-                                }
-                              ]
-                            },
-                            "localization": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "type": "object",
-                                  "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                                  "additionalProperties": false,
-                                  "required": ["attempts", "accepted_attempt", "calls"],
-                                  "properties": {
-                                    "attempts": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                        "additionalProperties": false,
-                                        "required": [
-                                          "attempt",
-                                          "bbox_grid",
-                                          "bbox_px",
-                                          "valid",
-                                          "accepted"
-                                        ],
-                                        "properties": {
-                                          "item": {
-                                            "type": "integer",
-                                            "description": "Present when the record merges several items"
-                                          },
-                                          "attempt": {"type": "integer", "minimum": 1},
-                                          "bbox_grid": {
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "type": "array",
-                                                "items": {"type": "number"},
-                                                "minItems": 4,
-                                                "maxItems": 4
-                                              }
-                                            ]
-                                          },
-                                          "bbox_px": {
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "type": "array",
-                                                "items": {"type": "number"},
-                                                "minItems": 4,
-                                                "maxItems": 4
-                                              }
-                                            ]
-                                          },
-                                          "valid": {"type": "boolean"},
-                                          "accepted": {"type": "boolean"},
-                                          "reject": {
-                                            "type": "string",
-                                            "description": "Why the box was rejected (the retry's feedback)"
-                                          },
-                                          "verify_score": {"type": "integer"},
-                                          "verify_reason": {"type": "string"},
-                                          "verify_partial": {"type": "boolean"},
-                                          "detector_iou": {"type": "number"},
-                                          "coarse_bbox_grid": {
-                                            "type": "array",
-                                            "items": {"type": "number"}
-                                          },
-                                          "refine_window_grid": {
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "type": "array",
-                                                "items": {"type": "number"}
-                                              }
-                                            ]
-                                          },
-                                          "refined": {"type": "boolean"},
-                                          "refine_reject": {"type": "string"},
-                                          "refine_mode": {"enum": ["marks", "grid"]},
-                                          "marks_shown": {"type": "integer"},
-                                          "marks_lines": {"enum": ["native", "ocr", "window"]},
-                                          "marks": {
-                                            "type": "array",
-                                            "items": {"type": "integer"}
-                                          },
-                                          "marks_fallback": {"type": "string"}
-                                        }
-                                      }
-                                    },
-                                    "accepted_attempt": {"type": ["integer", "null"]},
-                                    "calls": {"type": "integer", "minimum": 0},
-                                    "accepted": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": ["item", "attempt"],
-                                        "properties": {
-                                          "item": {"type": "integer"},
-                                          "attempt": {"type": "integer"}
-                                        }
-                                      },
-                                      "description": "Merged records: each accepted box"
-                                    },
-                                    "references": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": [
-                                          "item",
-                                          "applied",
-                                          "ask_images",
-                                          "examples",
-                                          "ask",
-                                          "refine",
-                                          "verify",
-                                          "note"
-                                        ],
-                                        "properties": {
-                                          "item": {"type": "integer"},
-                                          "applied": {"type": "boolean"},
-                                          "ask_images": {
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {"enum": ["composite", "crop"]}
-                                            ]
-                                          },
-                                          "examples": {
-                                            "type": "array",
-                                            "items": {
-                                              "type": "object",
-                                              "additionalProperties": true,
-                                              "description": "{reference_id, criterion, polarity, composite}"
-                                            }
-                                          },
-                                          "ask": {"type": "boolean"},
-                                          "refine": {"type": "boolean"},
-                                          "verify": {"type": "boolean"},
-                                          "note": {"type": ["string", "null"]}
-                                        }
-                                      },
-                                      "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                    }
-                                  }
-                                }
-                              ]
-                            },
-                            "options_used": {
-                              "type": "object",
-                              "additionalProperties": true,
-                              "description": "Options after defaults and caps, `aggregate` resolved — the keys of the type's options (GET /criterion-types `types.<type>.defaults`)"
-                            },
-                            "error": {"type": ["string", "null"]},
-                            "complete": {
-                              "type": "boolean",
-                              "description": "false when any of its units errored"
-                            },
-                            "aggregate_used": {
-                              "type": "object",
-                              "description": "The rules applied; `pages: null` plus a `note` for a document-scope text criterion",
-                              "additionalProperties": false,
-                              "required": ["pages", "documents"],
-                              "properties": {
-                                "pages": {"type": ["string", "null"]},
-                                "documents": {"type": "string"},
-                                "note": {"type": "string"}
-                              }
-                            },
-                            "items": {
-                              "type": "array",
-                              "items": {
-                                "type": "object",
-                                "description": "One unit: one item (or, document scope, one document)",
-                                "additionalProperties": false,
-                                "required": [
-                                  "item",
-                                  "document",
-                                  "page",
-                                  "status",
-                                  "score",
-                                  "verdict",
-                                  "confidence",
-                                  "reason",
-                                  "detail",
-                                  "error",
-                                  "regions",
-                                  "text_layer"
-                                ],
-                                "properties": {
-                                  "item": {
-                                    "type": ["integer", "null"],
-                                    "description": "The global item; null for a document-scope unit"
-                                  },
-                                  "document": {"type": "integer", "minimum": 0},
-                                  "page": {
-                                    "type": ["integer", "null"],
-                                    "description": "Within its document; null for a document-scope unit"
-                                  },
-                                  "items": {
-                                    "type": "array",
-                                    "items": {"type": "integer"},
-                                    "description": "Document scope: the items it searched"
-                                  },
-                                  "status": {"enum": ["ok", "error", "skipped"]},
-                                  "score": {
-                                    "type": ["integer", "null"],
-                                    "minimum": 1,
-                                    "maximum": 10
-                                  },
-                                  "verdict": {
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                    ]
-                                  },
-                                  "confidence": {
-                                    "type": ["integer", "null"],
-                                    "minimum": 0,
-                                    "maximum": 100
-                                  },
-                                  "reason": {"type": "string"},
-                                  "detail": {
-                                    "description": "The criterion's method's detail (see the criterion)"
-                                  },
-                                  "error": {"type": ["string", "null"]},
-                                  "regions": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                    "description": "A COUNT of the unit's regions (the geometry is the criterion's `regions`)"
-                                  },
-                                  "text_layer": {
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "type": "object",
-                                        "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                        "additionalProperties": false,
-                                        "required": ["key", "url", "source", "chars"],
-                                        "properties": {
-                                          "item": {"type": "integer"},
-                                          "document": {"type": "integer"},
-                                          "key": {"type": "string"},
-                                          "url": {"type": "string"},
-                                          "source": {"type": "string"},
-                                          "chars": {"type": "integer", "minimum": 0}
-                                        }
-                                      }
-                                    ]
-                                  },
-                                  "localization": {
-                                    "type": "object",
-                                    "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                                    "additionalProperties": false,
-                                    "required": ["attempts", "accepted_attempt", "calls"],
-                                    "properties": {
-                                      "attempts": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "attempt",
-                                            "bbox_grid",
-                                            "bbox_px",
-                                            "valid",
-                                            "accepted"
-                                          ],
-                                          "properties": {
-                                            "item": {
-                                              "type": "integer",
-                                              "description": "Present when the record merges several items"
-                                            },
-                                            "attempt": {"type": "integer", "minimum": 1},
-                                            "bbox_grid": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {
-                                                  "type": "array",
-                                                  "items": {"type": "number"},
-                                                  "minItems": 4,
-                                                  "maxItems": 4
-                                                }
-                                              ]
-                                            },
-                                            "bbox_px": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {
-                                                  "type": "array",
-                                                  "items": {"type": "number"},
-                                                  "minItems": 4,
-                                                  "maxItems": 4
-                                                }
-                                              ]
-                                            },
-                                            "valid": {"type": "boolean"},
-                                            "accepted": {"type": "boolean"},
-                                            "reject": {
-                                              "type": "string",
-                                              "description": "Why the box was rejected (the retry's feedback)"
-                                            },
-                                            "verify_score": {"type": "integer"},
-                                            "verify_reason": {"type": "string"},
-                                            "verify_partial": {"type": "boolean"},
-                                            "detector_iou": {"type": "number"},
-                                            "coarse_bbox_grid": {
-                                              "type": "array",
-                                              "items": {"type": "number"}
-                                            },
-                                            "refine_window_grid": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {
-                                                  "type": "array",
-                                                  "items": {"type": "number"}
-                                                }
-                                              ]
-                                            },
-                                            "refined": {"type": "boolean"},
-                                            "refine_reject": {"type": "string"},
-                                            "refine_mode": {"enum": ["marks", "grid"]},
-                                            "marks_shown": {"type": "integer"},
-                                            "marks_lines": {"enum": ["native", "ocr", "window"]},
-                                            "marks": {
-                                              "type": "array",
-                                              "items": {"type": "integer"}
-                                            },
-                                            "marks_fallback": {"type": "string"}
-                                          }
-                                        }
-                                      },
-                                      "accepted_attempt": {"type": ["integer", "null"]},
-                                      "calls": {"type": "integer", "minimum": 0},
-                                      "accepted": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "additionalProperties": false,
-                                          "required": ["item", "attempt"],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "attempt": {"type": "integer"}
-                                          }
-                                        },
-                                        "description": "Merged records: each accepted box"
-                                      },
-                                      "references": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "item",
-                                            "applied",
-                                            "ask_images",
-                                            "examples",
-                                            "ask",
-                                            "refine",
-                                            "verify",
-                                            "note"
-                                          ],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "applied": {"type": "boolean"},
-                                            "ask_images": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {"enum": ["composite", "crop"]}
-                                              ]
-                                            },
-                                            "examples": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "additionalProperties": true,
-                                                "description": "{reference_id, criterion, polarity, composite}"
-                                              }
-                                            },
-                                            "ask": {"type": "boolean"},
-                                            "refine": {"type": "boolean"},
-                                            "verify": {"type": "boolean"},
-                                            "note": {"type": ["string", "null"]}
-                                          }
-                                        },
-                                        "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                      }
-                                    }
-                                  }
-                                }
-                              },
-                              "description": "One entry per unit"
-                            }
-                          },
-                          "allOf": [
-                            {
-                              "if": {
-                                "properties": {
-                                  "method": {"const": "llm"}
-                                },
-                                "required": ["method"]
-                              },
-                              "then": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `llm` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "hint",
-                                            "model",
-                                            "image_sent",
-                                            "aggregate"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": ["number", "null"],
-                                              "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                            },
-                                            "hint": {
-                                              "type": "string",
-                                              "description": "The rubric the model was asked to use"
-                                            },
-                                            "model": {
-                                              "type": "string",
-                                              "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                            },
-                                            "image_sent": {
-                                              "type": "boolean",
-                                              "description": "Whether the page image was attached (never, for a text-only model)"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `llm` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "hint",
-                                            "model",
-                                            "image_sent",
-                                            "text_sent",
-                                            "confidence"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": ["number", "null"],
-                                              "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                            },
-                                            "hint": {
-                                              "type": "string",
-                                              "description": "The rubric the model was asked to use"
-                                            },
-                                            "model": {
-                                              "type": "string",
-                                              "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                            },
-                                            "image_sent": {
-                                              "type": "boolean",
-                                              "description": "Whether the page image was attached (never, for a text-only model)"
-                                            },
-                                            "text_sent": {
-                                              "type": "object",
-                                              "description": "The text attached: `{chars, truncated, budget, source}`",
-                                              "additionalProperties": true
-                                            },
-                                            "confidence": {
-                                              "type": ["object", "null"],
-                                              "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                              "additionalProperties": true
-                                            },
-                                            "reference": {
-                                              "type": "object",
-                                              "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                              "additionalProperties": true
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    ]
-                                  },
-                                  "items": {
-                                    "items": {
-                                      "properties": {
-                                        "detail": {
-                                          "description": "An `llm` detail, or null (skipped, errored)",
-                                          "anyOf": [
-                                            {"type": "null"},
-                                            {
-                                              "if": {
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "properties": {
-                                                      "rule": {"const": "mean"}
-                                                    },
-                                                    "required": ["rule"]
-                                                  }
-                                                },
-                                                "required": ["aggregate"]
-                                              },
-                                              "then": {
-                                                "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "hint",
-                                                  "model",
-                                                  "image_sent",
-                                                  "aggregate"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": ["number", "null"],
-                                                    "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                  },
-                                                  "hint": {
-                                                    "type": "string",
-                                                    "description": "The rubric the model was asked to use"
-                                                  },
-                                                  "model": {
-                                                    "type": "string",
-                                                    "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                  },
-                                                  "image_sent": {
-                                                    "type": "boolean",
-                                                    "description": "Whether the page image was attached (never, for a text-only model)"
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail`",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "else": {
-                                                "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `llm` criterion",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "hint",
-                                                  "model",
-                                                  "image_sent",
-                                                  "text_sent",
-                                                  "confidence"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": ["number", "null"],
-                                                    "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                  },
-                                                  "hint": {
-                                                    "type": "string",
-                                                    "description": "The rubric the model was asked to use"
-                                                  },
-                                                  "model": {
-                                                    "type": "string",
-                                                    "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                  },
-                                                  "image_sent": {
-                                                    "type": "boolean",
-                                                    "description": "Whether the page image was attached (never, for a text-only model)"
-                                                  },
-                                                  "text_sent": {
-                                                    "type": "object",
-                                                    "description": "The text attached: `{chars, truncated, budget, source}`",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "confidence": {
-                                                    "type": ["object", "null"],
-                                                    "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "reference": {
-                                                    "type": "object",
-                                                    "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "properties": {
-                                                "aggregate": {
-                                                  "type": "object",
-                                                  "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                  "additionalProperties": false,
-                                                  "required": ["rule", "level", "from", "values"],
-                                                  "properties": {
-                                                    "rule": {
-                                                      "enum": ["any", "worst", "all", "mean", "sum"]
-                                                    },
-                                                    "level": {"enum": ["pages", "documents"]},
-                                                    "from": {
-                                                      "type": ["string", "null"],
-                                                      "description": "The member whose detail this is (any / worst)"
-                                                    },
-                                                    "values": {
-                                                      "type": "object",
-                                                      "additionalProperties": {
-                                                        "type": ["number", "null"]
-                                                      },
-                                                      "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          ]
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "method": {"const": "text"}
-                                },
-                                "required": ["method"]
-                              },
-                              "then": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `text` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "mode",
-                                            "pattern",
-                                            "case_sensitive",
-                                            "min_count",
-                                            "fuzzy_threshold",
-                                            "aggregate"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "mode": {
-                                              "type": "string",
-                                              "description": "The match mode used"
-                                            },
-                                            "pattern": {
-                                              "type": "string",
-                                              "description": "What was searched for"
-                                            },
-                                            "case_sensitive": {
-                                              "type": "boolean",
-                                              "description": "Whether matching was case-sensitive"
-                                            },
-                                            "min_count": {
-                                              "type": "integer",
-                                              "description": "Hits required to PASS"
-                                            },
-                                            "fuzzy_threshold": {
-                                              "type": ["number", "null"],
-                                              "description": "Similarity a fuzzy window must reach; null for other modes"
-                                            },
-                                            "scope": {
-                                              "type": "string",
-                                              "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                            },
-                                            "separator": {
-                                              "type": "string",
-                                              "description": "What joined the pages (present only when options.scope is document)"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `text` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "found",
-                                            "count",
-                                            "best_ratio",
-                                            "mode",
-                                            "pattern",
-                                            "snippets",
-                                            "searched_chars",
-                                            "case_sensitive",
-                                            "min_count",
-                                            "fuzzy_threshold",
-                                            "text_source"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "found": {
-                                              "type": "boolean",
-                                              "description": "Whether count reached min_count"
-                                            },
-                                            "count": {
-                                              "type": "integer",
-                                              "description": "Hits found (summed across members under `sum`)"
-                                            },
-                                            "best_ratio": {
-                                              "type": "number",
-                                              "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                            },
-                                            "mode": {
-                                              "type": "string",
-                                              "description": "The match mode used"
-                                            },
-                                            "pattern": {
-                                              "type": "string",
-                                              "description": "What was searched for"
-                                            },
-                                            "snippets": {
-                                              "type": "array",
-                                              "description": "Up to 8 context excerpts around the hits"
-                                            },
-                                            "searched_chars": {
-                                              "type": "integer",
-                                              "description": "Characters searched"
-                                            },
-                                            "case_sensitive": {
-                                              "type": "boolean",
-                                              "description": "Whether matching was case-sensitive"
-                                            },
-                                            "min_count": {
-                                              "type": "integer",
-                                              "description": "Hits required to PASS"
-                                            },
-                                            "fuzzy_threshold": {
-                                              "type": ["number", "null"],
-                                              "description": "Similarity a fuzzy window must reach; null for other modes"
-                                            },
-                                            "text_source": {
-                                              "type": "string",
-                                              "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                            },
-                                            "scope": {
-                                              "type": "string",
-                                              "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                            },
-                                            "separator": {
-                                              "type": "string",
-                                              "description": "What joined the pages (present only when options.scope is document)"
-                                            },
-                                            "items_with_hits": {
-                                              "type": "array",
-                                              "description": "Items the hits landed on (present only when options.scope is document)"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    ]
-                                  },
-                                  "items": {
-                                    "items": {
-                                      "properties": {
-                                        "detail": {
-                                          "description": "An `text` detail, or null (skipped, errored)",
-                                          "anyOf": [
-                                            {"type": "null"},
-                                            {
-                                              "if": {
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "properties": {
-                                                      "rule": {"const": "mean"}
-                                                    },
-                                                    "required": ["rule"]
-                                                  }
-                                                },
-                                                "required": ["aggregate"]
-                                              },
-                                              "then": {
-                                                "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "mode",
-                                                  "pattern",
-                                                  "case_sensitive",
-                                                  "min_count",
-                                                  "fuzzy_threshold",
-                                                  "aggregate"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": "number",
-                                                    "description": "The headline number (the mean of the members' values under `mean`)"
-                                                  },
-                                                  "mode": {
-                                                    "type": "string",
-                                                    "description": "The match mode used"
-                                                  },
-                                                  "pattern": {
-                                                    "type": "string",
-                                                    "description": "What was searched for"
-                                                  },
-                                                  "case_sensitive": {
-                                                    "type": "boolean",
-                                                    "description": "Whether matching was case-sensitive"
-                                                  },
-                                                  "min_count": {
-                                                    "type": "integer",
-                                                    "description": "Hits required to PASS"
-                                                  },
-                                                  "fuzzy_threshold": {
-                                                    "type": ["number", "null"],
-                                                    "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                  },
-                                                  "scope": {
-                                                    "type": "string",
-                                                    "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                  },
-                                                  "separator": {
-                                                    "type": "string",
-                                                    "description": "What joined the pages (present only when options.scope is document)"
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail`",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "else": {
-                                                "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `text` criterion",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "found",
-                                                  "count",
-                                                  "best_ratio",
-                                                  "mode",
-                                                  "pattern",
-                                                  "snippets",
-                                                  "searched_chars",
-                                                  "case_sensitive",
-                                                  "min_count",
-                                                  "fuzzy_threshold",
-                                                  "text_source"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": "number",
-                                                    "description": "The headline number (the mean of the members' values under `mean`)"
-                                                  },
-                                                  "found": {
-                                                    "type": "boolean",
-                                                    "description": "Whether count reached min_count"
-                                                  },
-                                                  "count": {
-                                                    "type": "integer",
-                                                    "description": "Hits found (summed across members under `sum`)"
-                                                  },
-                                                  "best_ratio": {
-                                                    "type": "number",
-                                                    "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                                  },
-                                                  "mode": {
-                                                    "type": "string",
-                                                    "description": "The match mode used"
-                                                  },
-                                                  "pattern": {
-                                                    "type": "string",
-                                                    "description": "What was searched for"
-                                                  },
-                                                  "snippets": {
-                                                    "type": "array",
-                                                    "description": "Up to 8 context excerpts around the hits"
-                                                  },
-                                                  "searched_chars": {
-                                                    "type": "integer",
-                                                    "description": "Characters searched"
-                                                  },
-                                                  "case_sensitive": {
-                                                    "type": "boolean",
-                                                    "description": "Whether matching was case-sensitive"
-                                                  },
-                                                  "min_count": {
-                                                    "type": "integer",
-                                                    "description": "Hits required to PASS"
-                                                  },
-                                                  "fuzzy_threshold": {
-                                                    "type": ["number", "null"],
-                                                    "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                  },
-                                                  "text_source": {
-                                                    "type": "string",
-                                                    "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                                  },
-                                                  "scope": {
-                                                    "type": "string",
-                                                    "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                  },
-                                                  "separator": {
-                                                    "type": "string",
-                                                    "description": "What joined the pages (present only when options.scope is document)"
-                                                  },
-                                                  "items_with_hits": {
-                                                    "type": "array",
-                                                    "description": "Items the hits landed on (present only when options.scope is document)"
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "properties": {
-                                                "aggregate": {
-                                                  "type": "object",
-                                                  "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                  "additionalProperties": false,
-                                                  "required": ["rule", "level", "from", "values"],
-                                                  "properties": {
-                                                    "rule": {
-                                                      "enum": ["any", "worst", "all", "mean", "sum"]
-                                                    },
-                                                    "level": {"enum": ["pages", "documents"]},
-                                                    "from": {
-                                                      "type": ["string", "null"],
-                                                      "description": "The member whose detail this is (any / worst)"
-                                                    },
-                                                    "values": {
-                                                      "type": "object",
-                                                      "additionalProperties": {
-                                                        "type": ["number", "null"]
-                                                      },
-                                                      "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          ]
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "method": {"const": "detector"}
-                                },
-                                "required": ["method"]
-                              },
-                              "then": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `detector` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": ["metric", "value", "min_score", "aggregate"],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "min_score": {
-                                              "type": "number",
-                                              "description": "The confidence floor used"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `detector` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "detector_matches",
-                                            "best_score",
-                                            "min_score"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "detector_matches": {
-                                              "type": "integer",
-                                              "description": "Boxes found at or above min_score"
-                                            },
-                                            "best_score": {
-                                              "type": "number",
-                                              "description": "The best box's confidence, 0-1; 0 when none"
-                                            },
-                                            "min_score": {
-                                              "type": "number",
-                                              "description": "The confidence floor used"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    ]
-                                  },
-                                  "items": {
-                                    "items": {
-                                      "properties": {
-                                        "detail": {
-                                          "description": "An `detector` detail, or null (skipped, errored)",
-                                          "anyOf": [
-                                            {"type": "null"},
-                                            {
-                                              "if": {
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "properties": {
-                                                      "rule": {"const": "mean"}
-                                                    },
-                                                    "required": ["rule"]
-                                                  }
-                                                },
-                                                "required": ["aggregate"]
-                                              },
-                                              "then": {
-                                                "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "min_score",
-                                                  "aggregate"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": "number",
-                                                    "description": "The headline number (the mean of the members' values under `mean`)"
-                                                  },
-                                                  "min_score": {
-                                                    "type": "number",
-                                                    "description": "The confidence floor used"
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail`",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "else": {
-                                                "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `detector` criterion",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "detector_matches",
-                                                  "best_score",
-                                                  "min_score"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": "number",
-                                                    "description": "The headline number (the mean of the members' values under `mean`)"
-                                                  },
-                                                  "detector_matches": {
-                                                    "type": "integer",
-                                                    "description": "Boxes found at or above min_score"
-                                                  },
-                                                  "best_score": {
-                                                    "type": "number",
-                                                    "description": "The best box's confidence, 0-1; 0 when none"
-                                                  },
-                                                  "min_score": {
-                                                    "type": "number",
-                                                    "description": "The confidence floor used"
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "properties": {
-                                                "aggregate": {
-                                                  "type": "object",
-                                                  "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                  "additionalProperties": false,
-                                                  "required": ["rule", "level", "from", "values"],
-                                                  "properties": {
-                                                    "rule": {
-                                                      "enum": ["any", "worst", "all", "mean", "sum"]
-                                                    },
-                                                    "level": {"enum": ["pages", "documents"]},
-                                                    "from": {
-                                                      "type": ["string", "null"],
-                                                      "description": "The member whose detail this is (any / worst)"
-                                                    },
-                                                    "values": {
-                                                      "type": "object",
-                                                      "additionalProperties": {
-                                                        "type": ["number", "null"]
-                                                      },
-                                                      "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          ]
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "method": {"const": "cv"}
-                                },
-                                "required": ["method"]
-                              },
-                              "then": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `cv` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "detector",
-                                            "thresholds",
-                                            "parameters",
-                                            "image",
-                                            "aggregate"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "detector": {
-                                              "type": "string",
-                                              "description": "The OpenCV function that ran"
-                                            },
-                                            "thresholds": {
-                                              "type": "object",
-                                              "description": "The lines that decide the verdict",
-                                              "additionalProperties": true
-                                            },
-                                            "parameters": {
-                                              "type": "object",
-                                              "description": "Config values it measured with",
-                                              "additionalProperties": true
-                                            },
-                                            "image": {
-                                              "type": "object",
-                                              "description": "The working-image frame the *_px measurements are in",
-                                              "additionalProperties": true
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `cv` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "detector",
-                                            "measurements",
-                                            "thresholds",
-                                            "parameters",
-                                            "image"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "detector": {
-                                              "type": "string",
-                                              "description": "The OpenCV function that ran"
-                                            },
-                                            "measurements": {
-                                              "type": "object",
-                                              "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                              "additionalProperties": true
-                                            },
-                                            "thresholds": {
-                                              "type": "object",
-                                              "description": "The lines that decide the verdict",
-                                              "additionalProperties": true
-                                            },
-                                            "parameters": {
-                                              "type": "object",
-                                              "description": "Config values it measured with",
-                                              "additionalProperties": true
-                                            },
-                                            "state": {
-                                              "type": "string",
-                                              "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                            },
-                                            "image": {
-                                              "type": "object",
-                                              "description": "The working-image frame the *_px measurements are in",
-                                              "additionalProperties": true
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        },
-                                        "allOf": [
-                                          {
-                                            "$comment": "generated from cv.REGISTRY — do not edit",
-                                            "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                            "properties": {
-                                              "detector": {
-                                                "enum": [
-                                                  "check_blur",
-                                                  "check_exposure",
-                                                  "detect_faces",
-                                                  "detect_sky",
-                                                  "detect_text",
-                                                  "detect_vegetation",
-                                                  "detect_water"
-                                                ]
-                                              }
-                                            },
-                                            "allOf": [
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "check_blur"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Laplacian variance)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "laplacian_variance": {
-                                                          "type": "number",
-                                                          "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "check_exposure"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "mean_intensity": {
-                                                          "type": "number",
-                                                          "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_faces"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "faces_count": {
-                                                          "type": "number",
-                                                          "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                        },
-                                                        "faces_high_count": {
-                                                          "type": "number",
-                                                          "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                        },
-                                                        "faces_low_count": {
-                                                          "type": "number",
-                                                          "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_sky"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "sky_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                        },
-                                                        "sky_px": {
-                                                          "type": "number",
-                                                          "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                        },
-                                                        "blue_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels matching the clear-blue range (unit: px)"
-                                                        },
-                                                        "grey_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                        },
-                                                        "analysed_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_text"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_text — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "dense_block_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                        },
-                                                        "dense_blocks_count": {
-                                                          "type": "number",
-                                                          "description": "Blocks above block_density (unit: count)"
-                                                        },
-                                                        "total_blocks_count": {
-                                                          "type": "number",
-                                                          "description": "Blocks the page was divided into (unit: count)"
-                                                        },
-                                                        "text_regions_count": {
-                                                          "type": "number",
-                                                          "description": "Merged text regions returned as boxes (unit: count)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_vegetation"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (HSV green masking)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "green_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                        },
-                                                        "green_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels inside the green mask (unit: px)"
-                                                        },
-                                                        "total_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels in the page (unit: px)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_water"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_water — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "water_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                        },
-                                                        "water_px": {
-                                                          "type": "number",
-                                                          "description": "Area of those qualifying blobs (unit: px)"
-                                                        },
-                                                        "total_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels in the page (unit: px)"
-                                                        },
-                                                        "blue_blobs_count": {
-                                                          "type": "number",
-                                                          "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                        },
-                                                        "candidates_count": {
-                                                          "type": "number",
-                                                          "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                        },
-                                                        "flat_count": {
-                                                          "type": "number",
-                                                          "description": "Candidates flat enough to be water (unit: count)"
-                                                        },
-                                                        "rejected_textured_count": {
-                                                          "type": "number",
-                                                          "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          }
-                                        ]
-                                      }
-                                    ]
-                                  },
-                                  "items": {
-                                    "items": {
-                                      "properties": {
-                                        "detail": {
-                                          "description": "An `cv` detail, or null (skipped, errored)",
-                                          "anyOf": [
-                                            {"type": "null"},
-                                            {
-                                              "if": {
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "properties": {
-                                                      "rule": {"const": "mean"}
-                                                    },
-                                                    "required": ["rule"]
-                                                  }
-                                                },
-                                                "required": ["aggregate"]
-                                              },
-                                              "then": {
-                                                "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "detector",
-                                                  "thresholds",
-                                                  "parameters",
-                                                  "image",
-                                                  "aggregate"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": "number",
-                                                    "description": "The headline number (the mean of the members' values under `mean`)"
-                                                  },
-                                                  "detector": {
-                                                    "type": "string",
-                                                    "description": "The OpenCV function that ran"
-                                                  },
-                                                  "thresholds": {
-                                                    "type": "object",
-                                                    "description": "The lines that decide the verdict",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "parameters": {
-                                                    "type": "object",
-                                                    "description": "Config values it measured with",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "image": {
-                                                    "type": "object",
-                                                    "description": "The working-image frame the *_px measurements are in",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail`",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "else": {
-                                                "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                                "type": "object",
-                                                "description": "`detail` of a `cv` criterion",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "metric",
-                                                  "value",
-                                                  "detector",
-                                                  "measurements",
-                                                  "thresholds",
-                                                  "parameters",
-                                                  "image"
-                                                ],
-                                                "properties": {
-                                                  "metric": {
-                                                    "type": "string",
-                                                    "description": "Name of the headline number"
-                                                  },
-                                                  "value": {
-                                                    "type": "number",
-                                                    "description": "The headline number (the mean of the members' values under `mean`)"
-                                                  },
-                                                  "detector": {
-                                                    "type": "string",
-                                                    "description": "The OpenCV function that ran"
-                                                  },
-                                                  "measurements": {
-                                                    "type": "object",
-                                                    "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "thresholds": {
-                                                    "type": "object",
-                                                    "description": "The lines that decide the verdict",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "parameters": {
-                                                    "type": "object",
-                                                    "description": "Config values it measured with",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "state": {
-                                                    "type": "string",
-                                                    "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                                  },
-                                                  "image": {
-                                                    "type": "object",
-                                                    "description": "The working-image frame the *_px measurements are in",
-                                                    "additionalProperties": true
-                                                  },
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                    "additionalProperties": true
-                                                  }
-                                                }
-                                              },
-                                              "properties": {
-                                                "aggregate": {
-                                                  "type": "object",
-                                                  "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                  "additionalProperties": false,
-                                                  "required": ["rule", "level", "from", "values"],
-                                                  "properties": {
-                                                    "rule": {
-                                                      "enum": ["any", "worst", "all", "mean", "sum"]
-                                                    },
-                                                    "level": {"enum": ["pages", "documents"]},
-                                                    "from": {
-                                                      "type": ["string", "null"],
-                                                      "description": "The member whose detail this is (any / worst)"
-                                                    },
-                                                    "values": {
-                                                      "type": "object",
-                                                      "additionalProperties": {
-                                                        "type": ["number", "null"]
-                                                      },
-                                                      "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              "allOf": [
-                                                {
-                                                  "$comment": "generated from cv.REGISTRY — do not edit",
-                                                  "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                                  "properties": {
-                                                    "detector": {
-                                                      "enum": [
-                                                        "check_blur",
-                                                        "check_exposure",
-                                                        "detect_faces",
-                                                        "detect_sky",
-                                                        "detect_text",
-                                                        "detect_vegetation",
-                                                        "detect_water"
-                                                      ]
-                                                    }
-                                                  },
-                                                  "allOf": [
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "check_blur"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (Laplacian variance)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "laplacian_variance": {
-                                                                "type": "number",
-                                                                "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    },
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "check_exposure"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "mean_intensity": {
-                                                                "type": "number",
-                                                                "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    },
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "detect_faces"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "faces_count": {
-                                                                "type": "number",
-                                                                "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                              },
-                                                              "faces_high_count": {
-                                                                "type": "number",
-                                                                "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                              },
-                                                              "faces_low_count": {
-                                                                "type": "number",
-                                                                "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    },
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "detect_sky"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "sky_ratio": {
-                                                                "type": "number",
-                                                                "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                              },
-                                                              "sky_px": {
-                                                                "type": "number",
-                                                                "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                              },
-                                                              "blue_px": {
-                                                                "type": "number",
-                                                                "description": "Pixels matching the clear-blue range (unit: px)"
-                                                              },
-                                                              "grey_px": {
-                                                                "type": "number",
-                                                                "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                              },
-                                                              "analysed_px": {
-                                                                "type": "number",
-                                                                "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    },
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "detect_text"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.features.detect_text — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "dense_block_ratio": {
-                                                                "type": "number",
-                                                                "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                              },
-                                                              "dense_blocks_count": {
-                                                                "type": "number",
-                                                                "description": "Blocks above block_density (unit: count)"
-                                                              },
-                                                              "total_blocks_count": {
-                                                                "type": "number",
-                                                                "description": "Blocks the page was divided into (unit: count)"
-                                                              },
-                                                              "text_regions_count": {
-                                                                "type": "number",
-                                                                "description": "Merged text regions returned as boxes (unit: count)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    },
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "detect_vegetation"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (HSV green masking)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "green_ratio": {
-                                                                "type": "number",
-                                                                "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                              },
-                                                              "green_px": {
-                                                                "type": "number",
-                                                                "description": "Pixels inside the green mask (unit: px)"
-                                                              },
-                                                              "total_px": {
-                                                                "type": "number",
-                                                                "description": "Pixels in the page (unit: px)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    },
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "detector": {"const": "detect_water"}
-                                                        },
-                                                        "required": ["detector"]
-                                                      },
-                                                      "then": {
-                                                        "properties": {
-                                                          "measurements": {
-                                                            "$comment": "generated from cv.features.detect_water — do not edit",
-                                                            "type": "object",
-                                                            "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                            "additionalProperties": false,
-                                                            "properties": {
-                                                              "water_ratio": {
-                                                                "type": "number",
-                                                                "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                              },
-                                                              "water_px": {
-                                                                "type": "number",
-                                                                "description": "Area of those qualifying blobs (unit: px)"
-                                                              },
-                                                              "total_px": {
-                                                                "type": "number",
-                                                                "description": "Pixels in the page (unit: px)"
-                                                              },
-                                                              "blue_blobs_count": {
-                                                                "type": "number",
-                                                                "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                              },
-                                                              "candidates_count": {
-                                                                "type": "number",
-                                                                "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                              },
-                                                              "flat_count": {
-                                                                "type": "number",
-                                                                "description": "Candidates flat enough to be water (unit: count)"
-                                                              },
-                                                              "rejected_textured_count": {
-                                                                "type": "number",
-                                                                "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  ]
-                                                }
-                                              ]
-                                            }
-                                          ]
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "method": {"type": "null"}
-                                },
-                                "required": ["method"]
-                              },
-                              "then": {
-                                "properties": {
-                                  "detail": {"type": "null"}
-                                }
-                              }
-                            }
-                          ]
-                        },
-                        "description": "By criterion name, in request order"
-                      }
-                    }
-                  },
-                  "verdict": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                    ]
-                  },
-                  "page_geometry": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["item", "page", "width", "height", "working_scale", "pdf_points"],
-                      "properties": {
-                        "item": {"type": "integer"},
-                        "page": {"type": "integer", "description": "Equals `item`"},
-                        "width": {"type": ["integer", "null"]},
-                        "height": {"type": ["integer", "null"]},
-                        "working_scale": {"type": ["number", "null"]},
-                        "pdf_points": {
-                          "anyOf": [
-                            {"type": "null"},
-                            {
-                              "type": "array",
-                              "items": {"type": "number"},
-                              "minItems": 2,
-                              "maxItems": 2
-                            }
-                          ]
-                        }
-                      }
-                    },
-                    "description": "One per item; nulls for an item with no page image"
-                  },
-                  "detector": {
-                    "type": "object",
-                    "description": "What the open-vocabulary detector did for the whole job",
-                    "additionalProperties": false,
-                    "required": [
-                      "configured",
-                      "url_host",
-                      "min_score",
-                      "timeout_seconds",
-                      "max_labels_per_call",
-                      "model",
-                      "device",
-                      "calls",
-                      "labels",
-                      "detections",
-                      "elapsed_ms",
-                      "errors",
-                      "used"
-                    ],
-                    "properties": {
-                      "configured": {"type": "boolean"},
-                      "url_host": {"type": ["string", "null"]},
-                      "min_score": {"type": "number"},
-                      "timeout_seconds": {"type": "number"},
-                      "max_labels_per_call": {"type": "integer"},
-                      "model": {"type": ["string", "null"]},
-                      "device": {"type": ["string", "null"]},
-                      "calls": {"type": "integer", "minimum": 0},
-                      "labels": {"type": "integer", "minimum": 0},
-                      "detections": {"type": "integer", "minimum": 0},
-                      "elapsed_ms": {"type": "number", "minimum": 0},
-                      "errors": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                      },
-                      "used": {"type": "boolean"}
-                    }
-                  },
-                  "artifacts": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {
-                        "type": "object",
-                        "description": "The job's artifact directory",
-                        "additionalProperties": false,
-                        "required": [
-                          "dir",
-                          "files",
-                          "items",
-                          "zip_url",
-                          "total_bytes",
-                          "expires_at",
-                          "dropped",
-                          "notes"
-                        ],
-                        "properties": {
-                          "dir": {"type": "string"},
-                          "files": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
-                              "additionalProperties": false,
-                              "required": [
-                                "name",
-                                "bytes",
-                                "content_type",
-                                "url",
-                                "kind",
-                                "item",
-                                "document",
-                                "criteria"
-                              ],
-                              "properties": {
-                                "name": {"type": "string"},
-                                "bytes": {"type": "integer", "minimum": 0},
-                                "content_type": {"type": "string"},
-                                "url": {"type": "string"},
-                                "kind": {
-                                  "type": "string",
-                                  "description": "What the file is: base image, layer, regions, text, manifest, references"
-                                },
-                                "format": {"type": "string"},
-                                "item": {"type": ["integer", "null"]},
-                                "document": {"type": ["integer", "null"]},
-                                "criteria": {
-                                  "type": "array",
-                                  "items": {"type": "string"},
-                                  "description": "The criteria the file belongs to"
-                                }
-                              }
-                            }
-                          },
-                          "items": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": ["item", "layers"],
-                              "properties": {
-                                "item": {"type": "integer"},
-                                "layers": {
-                                  "type": "object",
-                                  "description": "Layer URLs (rendered on first fetch)",
-                                  "additionalProperties": false,
-                                  "required": [],
-                                  "properties": {
-                                    "svg": {"type": "string"},
-                                    "png": {"type": "string"},
-                                    "preview": {"type": "string"}
-                                  }
-                                }
-                              }
-                            },
-                            "description": "Each item with a page image: its combined layer URLs"
-                          },
-                          "zip_url": {"type": "string"},
-                          "total_bytes": {"type": "integer", "minimum": 0},
-                          "expires_at": {"type": "string", "format": "date-time"},
-                          "dropped": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Files the byte cap removed"
-                          },
-                          "notes": {
-                            "type": "array",
-                            "items": {"type": "string"}
-                          }
-                        }
-                      }
-                    ]
-                  },
-                  "references": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {
-                        "type": "object",
-                        "description": "What the request's references did (§ Result shape, `references`)",
-                        "additionalProperties": false,
-                        "required": [
-                          "mode",
-                          "requested",
-                          "pool",
-                          "pool_truncated",
-                          "resolved",
-                          "inherited",
-                          "criteria",
-                          "selection",
-                          "calls",
-                          "selection_calls"
-                        ],
-                        "properties": {
-                          "mode": {"enum": ["explicit", "auto"]},
-                          "requested": {"description": "The ids (or the auto request) as sent"},
-                          "pool": {
-                            "anyOf": [
-                              {"type": "null"},
-                              {
-                                "type": "array",
-                                "items": {"type": "string"}
-                              }
-                            ]
-                          },
-                          "pool_truncated": {"type": "boolean"},
-                          "resolved": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "The ids used"
-                          },
-                          "inherited": {
-                            "type": "boolean",
-                            "description": "The criteria were inherited from the references"
-                          },
-                          "criteria": {
-                            "type": "object",
-                            "additionalProperties": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": [
-                                "matched",
-                                "matched_by",
-                                "use",
-                                "combine",
-                                "position",
-                                "examples"
-                              ],
-                              "properties": {
-                                "matched": {"type": ["string", "null"]},
-                                "matched_by": {"enum": ["criterion", "key", "name"]},
-                                "use": {"type": "boolean"},
-                                "combine": {"type": "string"},
-                                "position": {"type": "string"},
-                                "examples": {
-                                  "type": "array",
-                                  "items": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "reference_id",
-                                      "criterion",
-                                      "polarity",
-                                      "expected"
-                                    ],
-                                    "properties": {
-                                      "reference_id": {
-                                        "type": "string",
-                                        "pattern": "^r[0-9a-f]{12}$",
-                                        "description": "A reference's id: `r` and 12 hex characters"
-                                      },
-                                      "criterion": {"type": "string"},
-                                      "polarity": {"type": "string"},
-                                      "expected": {
-                                        "type": "object",
-                                        "additionalProperties": true,
-                                        "description": "The expected answer: {score, verdict, reason, source}"
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          },
-                          "selection": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "additionalProperties": true,
-                              "description": "One item's auto selection: {item, status: ok | failed | skipped, matches: [{id, confidence, reason}], dropped, error, reason}"
-                            }
-                          },
-                          "calls": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Guided scoring calls"
-                          },
-                          "selection_calls": {"type": "integer", "minimum": 0}
-                        }
-                      }
-                    ]
-                  },
-                  "request": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["criteria", "model"],
-                    "properties": {
-                      "criteria": {
-                        "type": "array",
-                        "items": {
-                          "$comment": "generated from api.schemas.CriterionInput — do not edit",
-                          "additionalProperties": false,
-                          "description": "One criterion: shared fields at the top, type-specific ones in options.\n\n``options`` arrives as a plain object and is replaced, during validation,\nby the options model for ``type`` — so every consumer reads\n``c.options.hint`` on an ``llm`` criterion and never a dict.",
-                          "properties": {
-                            "name": {
-                              "description": "The criterion to evaluate; unique within the request.",
-                              "maxLength": 200,
-                              "minLength": 1,
-                              "type": "string"
-                            },
-                            "key": {
-                              "anyOf": [
-                                {"maxLength": 200, "minLength": 1, "type": "string"},
-                                {"type": "null"}
-                              ],
-                              "default": null,
-                              "description": "Optional label used ONLY to find reference examples: the criterion is guided by the reference criteria with the same key (case-insensitive), whatever either is named, and never falls back to its name. options.reference.criterion wins over it. Never shown to the model; results, depends_on and prompts stay on `name`. May repeat in a request; unique within one reference."
-                            },
-                            "type": {
-                              "default": "llm",
-                              "description": "'llm': the vision model scores it (one call per criterion). 'text': deterministic search of the text layer. 'cv': a registered OpenCV detector by name (GET /cv-detectors), with options.fallback when none matches. 'detector': the open-vocabulary detector service, using the name as its text prompt.",
-                              "enum": ["llm", "text", "cv", "detector"],
-                              "type": "string"
-                            },
-                            "weight": {
-                              "default": 1.0,
-                              "description": "Relative weight in the overall score. Default 1.",
-                              "exclusiveMinimum": 0.0,
-                              "type": "number"
-                            },
-                            "depends_on": {
-                              "anyOf": [
-                                {"type": "string"},
-                                {"type": "null"}
-                              ],
-                              "default": null,
-                              "description": "Name of another SCORED criterion that must PASS first. Until it does, this criterion is not evaluated at all; if it does not, this one is SKIPPED (no model call spent). Chains propagate."
-                            },
-                            "score": {
-                              "default": true,
-                              "description": "false = locate without judging: the criterion still produces regions but is excluded from the weighted score and the verdict, and its score / verdict / confidence are null. Refused for a criterion that cannot produce geometry.",
-                              "type": "boolean"
-                            },
-                            "options": {
-                              "default": null,
-                              "description": "Type-specific options; see GET /criterion-types."
-                            }
-                          },
-                          "required": ["name"],
-                          "type": "object"
-                        },
-                        "description": "The criteria exactly as validated"
-                      },
-                      "model": {"type": "string", "description": "The job's model, resolved"}
-                    }
-                  },
-                  "usage": {
-                    "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
-                    "type": "object",
-                    "allOf": [
-                      {
-                        "properties": {
-                          "calls": {"type": "integer", "minimum": 0},
-                          "errors": {"type": "integer", "minimum": 0},
-                          "seconds": {"type": "number", "minimum": 0},
-                          "prompt_tokens": {"type": ["integer", "null"]},
-                          "cached_tokens": {"type": ["integer", "null"]},
-                          "completion_tokens": {"type": ["integer", "null"]},
-                          "reasoning_tokens": {"type": ["integer", "null"]},
-                          "total_tokens": {"type": ["integer", "null"]}
-                        }
-                      }
-                    ],
-                    "properties": {
-                      "models": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                      },
-                      "first_call_at": {"type": ["string", "null"], "format": "date-time"},
-                      "last_call_at": {"type": ["string", "null"], "format": "date-time"},
-                      "usage_url": {"type": "string"}
-                    },
-                    "required": [
-                      "calls",
-                      "errors",
-                      "seconds",
-                      "prompt_tokens",
-                      "cached_tokens",
-                      "completion_tokens",
-                      "reasoning_tokens",
-                      "total_tokens",
-                      "models",
-                      "first_call_at",
-                      "last_call_at",
-                      "usage_url"
-                    ],
-                    "unevaluatedProperties": false
-                  }
-                }
-              },
-              {
-                "type": "object",
-                "description": "A reference job's result: where the reference is, and the pipeline run (null when the caller supplied everything)",
-                "additionalProperties": false,
-                "required": [
-                  "reference_id",
-                  "status",
-                  "reference_url",
-                  "record_url",
-                  "description",
-                  "criteria",
-                  "warnings",
-                  "artifacts",
-                  "pipeline"
-                ],
-                "properties": {
-                  "reference_id": {
-                    "type": "string",
-                    "pattern": "^r[0-9a-f]{12}$",
-                    "description": "A reference's id: `r` and 12 hex characters"
-                  },
-                  "status": {"const": "ready"},
-                  "reference_url": {"type": "string"},
-                  "record_url": {"type": "string"},
-                  "description": {"type": ["string", "null"]},
-                  "criteria": {
-                    "type": "object",
-                    "additionalProperties": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["expected", "region_source", "usable"],
-                      "properties": {
-                        "expected": {
-                          "anyOf": [
-                            {"type": "null"},
-                            {
-                              "type": "object",
-                              "additionalProperties": true,
-                              "description": "{score, verdict, reason, source}"
-                            }
-                          ]
-                        },
-                        "region_source": {"type": ["string", "null"]},
-                        "usable": {"type": ["boolean", "null"]}
-                      }
-                    }
-                  },
-                  "warnings": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                  },
-                  "artifacts": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {
-                        "type": "object",
-                        "description": "The job's artifact directory",
-                        "additionalProperties": false,
-                        "required": [
-                          "dir",
-                          "files",
-                          "items",
-                          "zip_url",
-                          "total_bytes",
-                          "expires_at",
-                          "dropped",
-                          "notes"
-                        ],
-                        "properties": {
-                          "dir": {"type": "string"},
-                          "files": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
-                              "additionalProperties": false,
-                              "required": [
-                                "name",
-                                "bytes",
-                                "content_type",
-                                "url",
-                                "kind",
-                                "item",
-                                "document",
-                                "criteria"
-                              ],
-                              "properties": {
-                                "name": {"type": "string"},
-                                "bytes": {"type": "integer", "minimum": 0},
-                                "content_type": {"type": "string"},
-                                "url": {"type": "string"},
-                                "kind": {
-                                  "type": "string",
-                                  "description": "What the file is: base image, layer, regions, text, manifest, references"
-                                },
-                                "format": {"type": "string"},
-                                "item": {"type": ["integer", "null"]},
-                                "document": {"type": ["integer", "null"]},
-                                "criteria": {
-                                  "type": "array",
-                                  "items": {"type": "string"},
-                                  "description": "The criteria the file belongs to"
-                                }
-                              }
-                            }
-                          },
-                          "items": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": ["item", "layers"],
-                              "properties": {
-                                "item": {"type": "integer"},
-                                "layers": {
-                                  "type": "object",
-                                  "description": "Layer URLs (rendered on first fetch)",
-                                  "additionalProperties": false,
-                                  "required": [],
-                                  "properties": {
-                                    "svg": {"type": "string"},
-                                    "png": {"type": "string"},
-                                    "preview": {"type": "string"}
-                                  }
-                                }
-                              }
-                            },
-                            "description": "Each item with a page image: its combined layer URLs"
-                          },
-                          "zip_url": {"type": "string"},
-                          "total_bytes": {"type": "integer", "minimum": 0},
-                          "expires_at": {"type": "string", "format": "date-time"},
-                          "dropped": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Files the byte cap removed"
-                          },
-                          "notes": {
-                            "type": "array",
-                            "items": {"type": "string"}
-                          }
-                        }
-                      }
-                    ]
-                  },
-                  "pipeline": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {
-                        "type": "object",
-                        "description": "An assess job's result, `schema_version: 3` (§ Result shape)",
-                        "additionalProperties": false,
-                        "required": [
-                          "schema_version",
-                          "documents",
-                          "items",
-                          "assessment",
-                          "verdict",
-                          "page_geometry",
-                          "detector",
-                          "artifacts",
-                          "references",
-                          "request"
-                        ],
-                        "properties": {
-                          "schema_version": {"const": 3},
-                          "documents": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": [
-                                "index",
-                                "filename",
-                                "kind",
-                                "pages",
-                                "items",
-                                "warnings",
-                                "document_info"
-                              ],
-                              "properties": {
-                                "index": {"type": "integer", "minimum": 0},
-                                "filename": {"type": "string"},
-                                "kind": {"enum": ["image", "pdf", "svg", "txt", "docx"]},
-                                "pages": {"type": "integer", "minimum": 1},
-                                "items": {
-                                  "type": "array",
-                                  "items": {"type": "integer", "minimum": 0},
-                                  "description": "Its global item indices"
-                                },
-                                "warnings": {
-                                  "type": "array",
-                                  "items": {"type": "string"},
-                                  "description": "How the document was read that is worth knowing but is not an error (an SVG's external references); [] otherwise"
-                                },
-                                "document_info": {
-                                  "type": "object",
-                                  "additionalProperties": false,
-                                  "required": [
-                                    "content_type",
-                                    "size_bytes",
-                                    "has_image",
-                                    "native_text_chars",
-                                    "ocr",
-                                    "llm_text_char_budget"
-                                  ],
-                                  "properties": {
-                                    "content_type": {"type": "string"},
-                                    "size_bytes": {"type": "integer", "minimum": 0},
-                                    "has_image": {
-                                      "type": "boolean",
-                                      "description": "Any page has an image"
-                                    },
-                                    "native_text_chars": {"type": "integer", "minimum": 0},
-                                    "ocr": {
-                                      "type": "object",
-                                      "additionalProperties": false,
-                                      "required": [
-                                        "engine",
-                                        "min_native_chars",
-                                        "layers",
-                                        "document_layers"
-                                      ],
-                                      "properties": {
-                                        "engine": {"type": "string"},
-                                        "min_native_chars": {"type": "integer"},
-                                        "layers": {
-                                          "type": "array",
-                                          "items": {
-                                            "type": "object",
-                                            "description": "One text layer one item's criteria asked for (`text.p{item}.<key>.json`)",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "item",
-                                              "key",
-                                              "mode",
-                                              "ran",
-                                              "source",
-                                              "chars",
-                                              "confidence",
-                                              "note"
-                                            ],
-                                            "properties": {
-                                              "item": {"type": "integer"},
-                                              "key": {
-                                                "type": "string",
-                                                "description": "The text-layer key (the OCR settings)"
-                                              },
-                                              "mode": {"enum": ["auto", "always", "never"]},
-                                              "ran": {
-                                                "type": "boolean",
-                                                "description": "Whether OCR ran for this layer"
-                                              },
-                                              "source": {
-                                                "type": "string",
-                                                "description": "native | ocr | none"
-                                              },
-                                              "chars": {"type": "integer", "minimum": 0},
-                                              "confidence": {"type": ["number", "null"]},
-                                              "note": {"type": ["string", "null"]}
-                                            }
-                                          }
-                                        },
-                                        "document_layers": {
-                                          "type": "array",
-                                          "items": {
-                                            "type": "object",
-                                            "description": "The joined text a `scope: \"document\"` search read",
-                                            "additionalProperties": false,
-                                            "required": ["key", "source", "chars", "file"],
-                                            "properties": {
-                                              "key": {"type": "string"},
-                                              "source": {"type": "string"},
-                                              "chars": {"type": "integer", "minimum": 0},
-                                              "file": {
-                                                "type": "string",
-                                                "description": "`text.d{index}.<key>.json`"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    },
-                                    "llm_text_char_budget": {
-                                      "type": "integer",
-                                      "description": "The job model's text budget"
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            "description": "One per document, in request order"
-                          },
-                          "items": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "description": "One item's own weighted answer, from its per-criterion unit results (§ Scores per item, and overall)",
-                              "additionalProperties": false,
-                              "required": [
-                                "item",
-                                "document",
-                                "page",
-                                "filename",
-                                "overall_score",
-                                "overall_verdict",
-                                "complete"
-                              ],
-                              "properties": {
-                                "item": {"type": "integer", "minimum": 0},
-                                "document": {"type": "integer", "minimum": 0},
-                                "page": {
-                                  "type": "integer",
-                                  "minimum": 0,
-                                  "description": "Within its document"
-                                },
-                                "filename": {"type": "string"},
-                                "overall_score": {
-                                  "type": ["integer", "null"],
-                                  "minimum": 1,
-                                  "maximum": 10
-                                },
-                                "overall_verdict": {
-                                  "anyOf": [
-                                    {"type": "null"},
-                                    {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                  ]
-                                },
-                                "complete": {"type": "boolean"}
-                              }
-                            },
-                            "description": "One per item"
-                          },
-                          "assessment": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "overall_score",
-                              "overall_verdict",
-                              "complete",
-                              "weighted_score_breakdown",
-                              "per_criterion_scores"
-                            ],
-                            "properties": {
-                              "overall_score": {
-                                "type": ["integer", "null"],
-                                "minimum": 1,
-                                "maximum": 10
-                              },
-                              "overall_verdict": {
-                                "anyOf": [
-                                  {"type": "null"},
-                                  {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                ]
-                              },
-                              "complete": {
-                                "type": "boolean",
-                                "description": "false when any scored criterion errored"
-                              },
-                              "weighted_score_breakdown": {
-                                "anyOf": [
-                                  {"type": "null"},
-                                  {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "formula",
-                                      "total_weight",
-                                      "weighted_sum",
-                                      "unrounded_average",
-                                      "final_score",
-                                      "partial",
-                                      "excluded",
-                                      "per_criterion"
-                                    ],
-                                    "properties": {
-                                      "formula": {"const": "sum(score * weight) / total_weight"},
-                                      "total_weight": {"type": "number"},
-                                      "weighted_sum": {"type": "number"},
-                                      "unrounded_average": {"type": "number"},
-                                      "final_score": {"type": "integer"},
-                                      "partial": {
-                                        "type": "boolean",
-                                        "description": "Some scored criterion errored: this is the score of what succeeded"
-                                      },
-                                      "excluded": {
-                                        "type": "object",
-                                        "additionalProperties": {"type": "string"},
-                                        "description": "Criterion name → why it was left out"
-                                      },
-                                      "per_criterion": {
-                                        "type": "object",
-                                        "additionalProperties": {
-                                          "type": "object",
-                                          "additionalProperties": false,
-                                          "required": ["score", "weight", "contribution"],
-                                          "properties": {
-                                            "score": {"type": "integer"},
-                                            "weight": {"type": "number"},
-                                            "contribution": {"type": "number"}
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                ]
-                              },
-                              "per_criterion_scores": {
-                                "type": "object",
-                                "additionalProperties": {
-                                  "type": "object",
-                                  "description": "One criterion: the same keys for every type and status (§ Result shape)",
-                                  "additionalProperties": false,
-                                  "required": [
-                                    "status",
-                                    "type",
-                                    "key",
-                                    "method",
-                                    "scored",
-                                    "score",
-                                    "verdict",
-                                    "confidence",
-                                    "reason",
-                                    "detail",
-                                    "regions",
-                                    "regions_truncated",
-                                    "artifacts",
-                                    "localization",
-                                    "options_used",
-                                    "error",
-                                    "complete",
-                                    "aggregate_used",
-                                    "items"
-                                  ],
-                                  "properties": {
-                                    "status": {
-                                      "enum": ["ok", "error", "skipped"],
-                                      "description": "`ok` when at least one unit answered, `error` when none did and one errored, `skipped` when every unit was skipped"
-                                    },
-                                    "type": {"enum": ["llm", "text", "detector", "cv"]},
-                                    "key": {
-                                      "type": ["string", "null"],
-                                      "description": "The criterion's `key` as sent (stripped)"
-                                    },
-                                    "method": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "enum": ["llm", "text", "detector", "cv"],
-                                          "description": "The path that answered (a cv fallback's); null when skipped by a dependency"
-                                        }
-                                      ]
-                                    },
-                                    "scored": {
-                                      "type": "boolean",
-                                      "description": "The criterion's `score` flag"
-                                    },
-                                    "score": {
-                                      "type": ["integer", "null"],
-                                      "minimum": 1,
-                                      "maximum": 10
-                                    },
-                                    "verdict": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                      ]
-                                    },
-                                    "confidence": {
-                                      "type": ["integer", "null"],
-                                      "minimum": 0,
-                                      "maximum": 100
-                                    },
-                                    "reason": {"type": "string"},
-                                    "detail": {
-                                      "description": "Structured diagnostics: its method's declared shape (GET /criterion-types `result`), or null"
-                                    },
-                                    "regions": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": [
-                                          "page",
-                                          "kind",
-                                          "points",
-                                          "label",
-                                          "score",
-                                          "source",
-                                          "attrs"
-                                        ],
-                                        "properties": {
-                                          "page": {
-                                            "type": "integer",
-                                            "minimum": 0,
-                                            "description": "Its item"
-                                          },
-                                          "kind": {"enum": ["box", "polygon"]},
-                                          "points": {
-                                            "type": "array",
-                                            "items": {
-                                              "type": "array",
-                                              "items": {"type": "number"},
-                                              "minItems": 2,
-                                              "maxItems": 2
-                                            },
-                                            "description": "[[x, y], …] in original page pixels"
-                                          },
-                                          "label": {"type": "string"},
-                                          "score": {
-                                            "type": ["number", "null"],
-                                            "description": "The producer's confidence"
-                                          },
-                                          "source": {
-                                            "enum": ["cv", "ocr", "pdf-text", "detector", "llm"]
-                                          },
-                                          "attrs": {
-                                            "type": "object",
-                                            "additionalProperties": true,
-                                            "description": "Free-form extras per source (`common.vision.Region.attrs`): a `text` snippet, `pdf_rect`, the llm loop's `attempt` / `accepted` / `verify_score`, …"
-                                          }
-                                        }
-                                      },
-                                      "description": "The union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX"
-                                    },
-                                    "regions_truncated": {"type": "boolean"},
-                                    "artifacts": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "type": "object",
-                                          "description": "Per-criterion links; null when there is neither geometry nor text",
-                                          "additionalProperties": false,
-                                          "required": [],
-                                          "properties": {
-                                            "slug": {
-                                              "type": "string",
-                                              "description": "The criterion's file-name slug"
-                                            },
-                                            "regions_url": {
-                                              "type": "string",
-                                              "description": "regions.json scoped to the criterion"
-                                            },
-                                            "items": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "additionalProperties": false,
-                                                "required": ["item", "count", "layers", "attempts"],
-                                                "properties": {
-                                                  "item": {"type": "integer"},
-                                                  "count": {"type": "integer", "minimum": 0},
-                                                  "layers": {
-                                                    "type": "object",
-                                                    "description": "Layer URLs (rendered on first fetch)",
-                                                    "additionalProperties": false,
-                                                    "required": [],
-                                                    "properties": {
-                                                      "svg": {"type": "string"},
-                                                      "png": {"type": "string"},
-                                                      "preview": {"type": "string"}
-                                                    }
-                                                  },
-                                                  "attempts": {
-                                                    "type": "array",
-                                                    "items": {
-                                                      "type": "object",
-                                                      "additionalProperties": false,
-                                                      "required": ["attempt", "accepted"],
-                                                      "properties": {
-                                                        "attempt": {"type": "integer"},
-                                                        "accepted": {"type": "boolean"},
-                                                        "svg": {"type": "string"},
-                                                        "png": {"type": "string"},
-                                                        "preview": {"type": "string"}
-                                                      }
-                                                    },
-                                                    "description": "One per enforcement-loop attempt with a drawable box on the item"
-                                                  }
-                                                }
-                                              },
-                                              "description": "Per item it found something on"
-                                            },
-                                            "text": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                                "additionalProperties": false,
-                                                "required": ["key", "url", "source", "chars"],
-                                                "properties": {
-                                                  "item": {"type": "integer"},
-                                                  "document": {"type": "integer"},
-                                                  "key": {"type": "string"},
-                                                  "url": {"type": "string"},
-                                                  "source": {"type": "string"},
-                                                  "chars": {"type": "integer", "minimum": 0}
-                                                }
-                                              },
-                                              "description": "One link per text layer its units read"
-                                            }
-                                          }
-                                        }
-                                      ]
-                                    },
-                                    "localization": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "type": "object",
-                                          "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                                          "additionalProperties": false,
-                                          "required": ["attempts", "accepted_attempt", "calls"],
-                                          "properties": {
-                                            "attempts": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "attempt",
-                                                  "bbox_grid",
-                                                  "bbox_px",
-                                                  "valid",
-                                                  "accepted"
-                                                ],
-                                                "properties": {
-                                                  "item": {
-                                                    "type": "integer",
-                                                    "description": "Present when the record merges several items"
-                                                  },
-                                                  "attempt": {"type": "integer", "minimum": 1},
-                                                  "bbox_grid": {
-                                                    "anyOf": [
-                                                      {"type": "null"},
-                                                      {
-                                                        "type": "array",
-                                                        "items": {"type": "number"},
-                                                        "minItems": 4,
-                                                        "maxItems": 4
-                                                      }
-                                                    ]
-                                                  },
-                                                  "bbox_px": {
-                                                    "anyOf": [
-                                                      {"type": "null"},
-                                                      {
-                                                        "type": "array",
-                                                        "items": {"type": "number"},
-                                                        "minItems": 4,
-                                                        "maxItems": 4
-                                                      }
-                                                    ]
-                                                  },
-                                                  "valid": {"type": "boolean"},
-                                                  "accepted": {"type": "boolean"},
-                                                  "reject": {
-                                                    "type": "string",
-                                                    "description": "Why the box was rejected (the retry's feedback)"
-                                                  },
-                                                  "verify_score": {"type": "integer"},
-                                                  "verify_reason": {"type": "string"},
-                                                  "verify_partial": {"type": "boolean"},
-                                                  "detector_iou": {"type": "number"},
-                                                  "coarse_bbox_grid": {
-                                                    "type": "array",
-                                                    "items": {"type": "number"}
-                                                  },
-                                                  "refine_window_grid": {
-                                                    "anyOf": [
-                                                      {"type": "null"},
-                                                      {
-                                                        "type": "array",
-                                                        "items": {"type": "number"}
-                                                      }
-                                                    ]
-                                                  },
-                                                  "refined": {"type": "boolean"},
-                                                  "refine_reject": {"type": "string"},
-                                                  "refine_mode": {"enum": ["marks", "grid"]},
-                                                  "marks_shown": {"type": "integer"},
-                                                  "marks_lines": {
-                                                    "enum": ["native", "ocr", "window"]
-                                                  },
-                                                  "marks": {
-                                                    "type": "array",
-                                                    "items": {"type": "integer"}
-                                                  },
-                                                  "marks_fallback": {"type": "string"}
-                                                }
-                                              }
-                                            },
-                                            "accepted_attempt": {"type": ["integer", "null"]},
-                                            "calls": {"type": "integer", "minimum": 0},
-                                            "accepted": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "additionalProperties": false,
-                                                "required": ["item", "attempt"],
-                                                "properties": {
-                                                  "item": {"type": "integer"},
-                                                  "attempt": {"type": "integer"}
-                                                }
-                                              },
-                                              "description": "Merged records: each accepted box"
-                                            },
-                                            "references": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "additionalProperties": false,
-                                                "required": [
-                                                  "item",
-                                                  "applied",
-                                                  "ask_images",
-                                                  "examples",
-                                                  "ask",
-                                                  "refine",
-                                                  "verify",
-                                                  "note"
-                                                ],
-                                                "properties": {
-                                                  "item": {"type": "integer"},
-                                                  "applied": {"type": "boolean"},
-                                                  "ask_images": {
-                                                    "anyOf": [
-                                                      {"type": "null"},
-                                                      {"enum": ["composite", "crop"]}
-                                                    ]
-                                                  },
-                                                  "examples": {
-                                                    "type": "array",
-                                                    "items": {
-                                                      "type": "object",
-                                                      "additionalProperties": true,
-                                                      "description": "{reference_id, criterion, polarity, composite}"
-                                                    }
-                                                  },
-                                                  "ask": {"type": "boolean"},
-                                                  "refine": {"type": "boolean"},
-                                                  "verify": {"type": "boolean"},
-                                                  "note": {"type": ["string", "null"]}
-                                                }
-                                              },
-                                              "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                            }
-                                          }
-                                        }
-                                      ]
-                                    },
-                                    "options_used": {
-                                      "type": "object",
-                                      "additionalProperties": true,
-                                      "description": "Options after defaults and caps, `aggregate` resolved — the keys of the type's options (GET /criterion-types `types.<type>.defaults`)"
-                                    },
-                                    "error": {"type": ["string", "null"]},
-                                    "complete": {
-                                      "type": "boolean",
-                                      "description": "false when any of its units errored"
-                                    },
-                                    "aggregate_used": {
-                                      "type": "object",
-                                      "description": "The rules applied; `pages: null` plus a `note` for a document-scope text criterion",
-                                      "additionalProperties": false,
-                                      "required": ["pages", "documents"],
-                                      "properties": {
-                                        "pages": {"type": ["string", "null"]},
-                                        "documents": {"type": "string"},
-                                        "note": {"type": "string"}
-                                      }
-                                    },
-                                    "items": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "description": "One unit: one item (or, document scope, one document)",
-                                        "additionalProperties": false,
-                                        "required": [
-                                          "item",
-                                          "document",
-                                          "page",
-                                          "status",
-                                          "score",
-                                          "verdict",
-                                          "confidence",
-                                          "reason",
-                                          "detail",
-                                          "error",
-                                          "regions",
-                                          "text_layer"
-                                        ],
-                                        "properties": {
-                                          "item": {
-                                            "type": ["integer", "null"],
-                                            "description": "The global item; null for a document-scope unit"
-                                          },
-                                          "document": {"type": "integer", "minimum": 0},
-                                          "page": {
-                                            "type": ["integer", "null"],
-                                            "description": "Within its document; null for a document-scope unit"
-                                          },
-                                          "items": {
-                                            "type": "array",
-                                            "items": {"type": "integer"},
-                                            "description": "Document scope: the items it searched"
-                                          },
-                                          "status": {"enum": ["ok", "error", "skipped"]},
-                                          "score": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 1,
-                                            "maximum": 10
-                                          },
-                                          "verdict": {
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                            ]
-                                          },
-                                          "confidence": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
-                                            "maximum": 100
-                                          },
-                                          "reason": {"type": "string"},
-                                          "detail": {
-                                            "description": "The criterion's method's detail (see the criterion)"
-                                          },
-                                          "error": {"type": ["string", "null"]},
-                                          "regions": {
-                                            "type": "integer",
-                                            "minimum": 0,
-                                            "description": "A COUNT of the unit's regions (the geometry is the criterion's `regions`)"
-                                          },
-                                          "text_layer": {
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "type": "object",
-                                                "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                                "additionalProperties": false,
-                                                "required": ["key", "url", "source", "chars"],
-                                                "properties": {
-                                                  "item": {"type": "integer"},
-                                                  "document": {"type": "integer"},
-                                                  "key": {"type": "string"},
-                                                  "url": {"type": "string"},
-                                                  "source": {"type": "string"},
-                                                  "chars": {"type": "integer", "minimum": 0}
-                                                }
-                                              }
-                                            ]
-                                          },
-                                          "localization": {
-                                            "type": "object",
-                                            "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                                            "additionalProperties": false,
-                                            "required": ["attempts", "accepted_attempt", "calls"],
-                                            "properties": {
-                                              "attempts": {
-                                                "type": "array",
-                                                "items": {
-                                                  "type": "object",
-                                                  "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "attempt",
-                                                    "bbox_grid",
-                                                    "bbox_px",
-                                                    "valid",
-                                                    "accepted"
-                                                  ],
-                                                  "properties": {
-                                                    "item": {
-                                                      "type": "integer",
-                                                      "description": "Present when the record merges several items"
-                                                    },
-                                                    "attempt": {"type": "integer", "minimum": 1},
-                                                    "bbox_grid": {
-                                                      "anyOf": [
-                                                        {"type": "null"},
-                                                        {
-                                                          "type": "array",
-                                                          "items": {"type": "number"},
-                                                          "minItems": 4,
-                                                          "maxItems": 4
-                                                        }
-                                                      ]
-                                                    },
-                                                    "bbox_px": {
-                                                      "anyOf": [
-                                                        {"type": "null"},
-                                                        {
-                                                          "type": "array",
-                                                          "items": {"type": "number"},
-                                                          "minItems": 4,
-                                                          "maxItems": 4
-                                                        }
-                                                      ]
-                                                    },
-                                                    "valid": {"type": "boolean"},
-                                                    "accepted": {"type": "boolean"},
-                                                    "reject": {
-                                                      "type": "string",
-                                                      "description": "Why the box was rejected (the retry's feedback)"
-                                                    },
-                                                    "verify_score": {"type": "integer"},
-                                                    "verify_reason": {"type": "string"},
-                                                    "verify_partial": {"type": "boolean"},
-                                                    "detector_iou": {"type": "number"},
-                                                    "coarse_bbox_grid": {
-                                                      "type": "array",
-                                                      "items": {"type": "number"}
-                                                    },
-                                                    "refine_window_grid": {
-                                                      "anyOf": [
-                                                        {"type": "null"},
-                                                        {
-                                                          "type": "array",
-                                                          "items": {"type": "number"}
-                                                        }
-                                                      ]
-                                                    },
-                                                    "refined": {"type": "boolean"},
-                                                    "refine_reject": {"type": "string"},
-                                                    "refine_mode": {"enum": ["marks", "grid"]},
-                                                    "marks_shown": {"type": "integer"},
-                                                    "marks_lines": {
-                                                      "enum": ["native", "ocr", "window"]
-                                                    },
-                                                    "marks": {
-                                                      "type": "array",
-                                                      "items": {"type": "integer"}
-                                                    },
-                                                    "marks_fallback": {"type": "string"}
-                                                  }
-                                                }
-                                              },
-                                              "accepted_attempt": {"type": ["integer", "null"]},
-                                              "calls": {"type": "integer", "minimum": 0},
-                                              "accepted": {
-                                                "type": "array",
-                                                "items": {
-                                                  "type": "object",
-                                                  "additionalProperties": false,
-                                                  "required": ["item", "attempt"],
-                                                  "properties": {
-                                                    "item": {"type": "integer"},
-                                                    "attempt": {"type": "integer"}
-                                                  }
-                                                },
-                                                "description": "Merged records: each accepted box"
-                                              },
-                                              "references": {
-                                                "type": "array",
-                                                "items": {
-                                                  "type": "object",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "item",
-                                                    "applied",
-                                                    "ask_images",
-                                                    "examples",
-                                                    "ask",
-                                                    "refine",
-                                                    "verify",
-                                                    "note"
-                                                  ],
-                                                  "properties": {
-                                                    "item": {"type": "integer"},
-                                                    "applied": {"type": "boolean"},
-                                                    "ask_images": {
-                                                      "anyOf": [
-                                                        {"type": "null"},
-                                                        {"enum": ["composite", "crop"]}
-                                                      ]
-                                                    },
-                                                    "examples": {
-                                                      "type": "array",
-                                                      "items": {
-                                                        "type": "object",
-                                                        "additionalProperties": true,
-                                                        "description": "{reference_id, criterion, polarity, composite}"
-                                                      }
-                                                    },
-                                                    "ask": {"type": "boolean"},
-                                                    "refine": {"type": "boolean"},
-                                                    "verify": {"type": "boolean"},
-                                                    "note": {"type": ["string", "null"]}
-                                                  }
-                                                },
-                                                "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      },
-                                      "description": "One entry per unit"
-                                    }
-                                  },
-                                  "allOf": [
-                                    {
-                                      "if": {
-                                        "properties": {
-                                          "method": {"const": "llm"}
-                                        },
-                                        "required": ["method"]
-                                      },
-                                      "then": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `llm` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "hint",
-                                                    "model",
-                                                    "image_sent",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": ["number", "null"],
-                                                      "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                    },
-                                                    "hint": {
-                                                      "type": "string",
-                                                      "description": "The rubric the model was asked to use"
-                                                    },
-                                                    "model": {
-                                                      "type": "string",
-                                                      "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                    },
-                                                    "image_sent": {
-                                                      "type": "boolean",
-                                                      "description": "Whether the page image was attached (never, for a text-only model)"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `llm` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "hint",
-                                                    "model",
-                                                    "image_sent",
-                                                    "text_sent",
-                                                    "confidence"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": ["number", "null"],
-                                                      "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                    },
-                                                    "hint": {
-                                                      "type": "string",
-                                                      "description": "The rubric the model was asked to use"
-                                                    },
-                                                    "model": {
-                                                      "type": "string",
-                                                      "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                    },
-                                                    "image_sent": {
-                                                      "type": "boolean",
-                                                      "description": "Whether the page image was attached (never, for a text-only model)"
-                                                    },
-                                                    "text_sent": {
-                                                      "type": "object",
-                                                      "description": "The text attached: `{chars, truncated, budget, source}`",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "confidence": {
-                                                      "type": ["object", "null"],
-                                                      "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "reference": {
-                                                      "type": "object",
-                                                      "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          },
-                                          "items": {
-                                            "items": {
-                                              "properties": {
-                                                "detail": {
-                                                  "description": "An `llm` detail, or null (skipped, errored)",
-                                                  "anyOf": [
-                                                    {"type": "null"},
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "aggregate": {
-                                                            "properties": {
-                                                              "rule": {"const": "mean"}
-                                                            },
-                                                            "required": ["rule"]
-                                                          }
-                                                        },
-                                                        "required": ["aggregate"]
-                                                      },
-                                                      "then": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "hint",
-                                                          "model",
-                                                          "image_sent",
-                                                          "aggregate"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": ["number", "null"],
-                                                            "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                          },
-                                                          "hint": {
-                                                            "type": "string",
-                                                            "description": "The rubric the model was asked to use"
-                                                          },
-                                                          "model": {
-                                                            "type": "string",
-                                                            "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                          },
-                                                          "image_sent": {
-                                                            "type": "boolean",
-                                                            "description": "Whether the page image was attached (never, for a text-only model)"
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail`",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "else": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `llm` criterion",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "hint",
-                                                          "model",
-                                                          "image_sent",
-                                                          "text_sent",
-                                                          "confidence"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": ["number", "null"],
-                                                            "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                          },
-                                                          "hint": {
-                                                            "type": "string",
-                                                            "description": "The rubric the model was asked to use"
-                                                          },
-                                                          "model": {
-                                                            "type": "string",
-                                                            "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                          },
-                                                          "image_sent": {
-                                                            "type": "boolean",
-                                                            "description": "Whether the page image was attached (never, for a text-only model)"
-                                                          },
-                                                          "text_sent": {
-                                                            "type": "object",
-                                                            "description": "The text attached: `{chars, truncated, budget, source}`",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "confidence": {
-                                                            "type": ["object", "null"],
-                                                            "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "reference": {
-                                                            "type": "object",
-                                                            "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "properties": {
-                                                        "aggregate": {
-                                                          "type": "object",
-                                                          "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                          "additionalProperties": false,
-                                                          "required": [
-                                                            "rule",
-                                                            "level",
-                                                            "from",
-                                                            "values"
-                                                          ],
-                                                          "properties": {
-                                                            "rule": {
-                                                              "enum": [
-                                                                "any",
-                                                                "worst",
-                                                                "all",
-                                                                "mean",
-                                                                "sum"
-                                                              ]
-                                                            },
-                                                            "level": {
-                                                              "enum": ["pages", "documents"]
-                                                            },
-                                                            "from": {
-                                                              "type": ["string", "null"],
-                                                              "description": "The member whose detail this is (any / worst)"
-                                                            },
-                                                            "values": {
-                                                              "type": "object",
-                                                              "additionalProperties": {
-                                                                "type": ["number", "null"]
-                                                              },
-                                                              "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  ]
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    },
-                                    {
-                                      "if": {
-                                        "properties": {
-                                          "method": {"const": "text"}
-                                        },
-                                        "required": ["method"]
-                                      },
-                                      "then": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `text` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "mode",
-                                                    "pattern",
-                                                    "case_sensitive",
-                                                    "min_count",
-                                                    "fuzzy_threshold",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "mode": {
-                                                      "type": "string",
-                                                      "description": "The match mode used"
-                                                    },
-                                                    "pattern": {
-                                                      "type": "string",
-                                                      "description": "What was searched for"
-                                                    },
-                                                    "case_sensitive": {
-                                                      "type": "boolean",
-                                                      "description": "Whether matching was case-sensitive"
-                                                    },
-                                                    "min_count": {
-                                                      "type": "integer",
-                                                      "description": "Hits required to PASS"
-                                                    },
-                                                    "fuzzy_threshold": {
-                                                      "type": ["number", "null"],
-                                                      "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                    },
-                                                    "scope": {
-                                                      "type": "string",
-                                                      "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                    },
-                                                    "separator": {
-                                                      "type": "string",
-                                                      "description": "What joined the pages (present only when options.scope is document)"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `text` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "found",
-                                                    "count",
-                                                    "best_ratio",
-                                                    "mode",
-                                                    "pattern",
-                                                    "snippets",
-                                                    "searched_chars",
-                                                    "case_sensitive",
-                                                    "min_count",
-                                                    "fuzzy_threshold",
-                                                    "text_source"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "found": {
-                                                      "type": "boolean",
-                                                      "description": "Whether count reached min_count"
-                                                    },
-                                                    "count": {
-                                                      "type": "integer",
-                                                      "description": "Hits found (summed across members under `sum`)"
-                                                    },
-                                                    "best_ratio": {
-                                                      "type": "number",
-                                                      "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                                    },
-                                                    "mode": {
-                                                      "type": "string",
-                                                      "description": "The match mode used"
-                                                    },
-                                                    "pattern": {
-                                                      "type": "string",
-                                                      "description": "What was searched for"
-                                                    },
-                                                    "snippets": {
-                                                      "type": "array",
-                                                      "description": "Up to 8 context excerpts around the hits"
-                                                    },
-                                                    "searched_chars": {
-                                                      "type": "integer",
-                                                      "description": "Characters searched"
-                                                    },
-                                                    "case_sensitive": {
-                                                      "type": "boolean",
-                                                      "description": "Whether matching was case-sensitive"
-                                                    },
-                                                    "min_count": {
-                                                      "type": "integer",
-                                                      "description": "Hits required to PASS"
-                                                    },
-                                                    "fuzzy_threshold": {
-                                                      "type": ["number", "null"],
-                                                      "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                    },
-                                                    "text_source": {
-                                                      "type": "string",
-                                                      "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                                    },
-                                                    "scope": {
-                                                      "type": "string",
-                                                      "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                    },
-                                                    "separator": {
-                                                      "type": "string",
-                                                      "description": "What joined the pages (present only when options.scope is document)"
-                                                    },
-                                                    "items_with_hits": {
-                                                      "type": "array",
-                                                      "description": "Items the hits landed on (present only when options.scope is document)"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          },
-                                          "items": {
-                                            "items": {
-                                              "properties": {
-                                                "detail": {
-                                                  "description": "An `text` detail, or null (skipped, errored)",
-                                                  "anyOf": [
-                                                    {"type": "null"},
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "aggregate": {
-                                                            "properties": {
-                                                              "rule": {"const": "mean"}
-                                                            },
-                                                            "required": ["rule"]
-                                                          }
-                                                        },
-                                                        "required": ["aggregate"]
-                                                      },
-                                                      "then": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "mode",
-                                                          "pattern",
-                                                          "case_sensitive",
-                                                          "min_count",
-                                                          "fuzzy_threshold",
-                                                          "aggregate"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": "number",
-                                                            "description": "The headline number (the mean of the members' values under `mean`)"
-                                                          },
-                                                          "mode": {
-                                                            "type": "string",
-                                                            "description": "The match mode used"
-                                                          },
-                                                          "pattern": {
-                                                            "type": "string",
-                                                            "description": "What was searched for"
-                                                          },
-                                                          "case_sensitive": {
-                                                            "type": "boolean",
-                                                            "description": "Whether matching was case-sensitive"
-                                                          },
-                                                          "min_count": {
-                                                            "type": "integer",
-                                                            "description": "Hits required to PASS"
-                                                          },
-                                                          "fuzzy_threshold": {
-                                                            "type": ["number", "null"],
-                                                            "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                          },
-                                                          "scope": {
-                                                            "type": "string",
-                                                            "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                          },
-                                                          "separator": {
-                                                            "type": "string",
-                                                            "description": "What joined the pages (present only when options.scope is document)"
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail`",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "else": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `text` criterion",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "found",
-                                                          "count",
-                                                          "best_ratio",
-                                                          "mode",
-                                                          "pattern",
-                                                          "snippets",
-                                                          "searched_chars",
-                                                          "case_sensitive",
-                                                          "min_count",
-                                                          "fuzzy_threshold",
-                                                          "text_source"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": "number",
-                                                            "description": "The headline number (the mean of the members' values under `mean`)"
-                                                          },
-                                                          "found": {
-                                                            "type": "boolean",
-                                                            "description": "Whether count reached min_count"
-                                                          },
-                                                          "count": {
-                                                            "type": "integer",
-                                                            "description": "Hits found (summed across members under `sum`)"
-                                                          },
-                                                          "best_ratio": {
-                                                            "type": "number",
-                                                            "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                                          },
-                                                          "mode": {
-                                                            "type": "string",
-                                                            "description": "The match mode used"
-                                                          },
-                                                          "pattern": {
-                                                            "type": "string",
-                                                            "description": "What was searched for"
-                                                          },
-                                                          "snippets": {
-                                                            "type": "array",
-                                                            "description": "Up to 8 context excerpts around the hits"
-                                                          },
-                                                          "searched_chars": {
-                                                            "type": "integer",
-                                                            "description": "Characters searched"
-                                                          },
-                                                          "case_sensitive": {
-                                                            "type": "boolean",
-                                                            "description": "Whether matching was case-sensitive"
-                                                          },
-                                                          "min_count": {
-                                                            "type": "integer",
-                                                            "description": "Hits required to PASS"
-                                                          },
-                                                          "fuzzy_threshold": {
-                                                            "type": ["number", "null"],
-                                                            "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                          },
-                                                          "text_source": {
-                                                            "type": "string",
-                                                            "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                                          },
-                                                          "scope": {
-                                                            "type": "string",
-                                                            "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                          },
-                                                          "separator": {
-                                                            "type": "string",
-                                                            "description": "What joined the pages (present only when options.scope is document)"
-                                                          },
-                                                          "items_with_hits": {
-                                                            "type": "array",
-                                                            "description": "Items the hits landed on (present only when options.scope is document)"
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "properties": {
-                                                        "aggregate": {
-                                                          "type": "object",
-                                                          "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                          "additionalProperties": false,
-                                                          "required": [
-                                                            "rule",
-                                                            "level",
-                                                            "from",
-                                                            "values"
-                                                          ],
-                                                          "properties": {
-                                                            "rule": {
-                                                              "enum": [
-                                                                "any",
-                                                                "worst",
-                                                                "all",
-                                                                "mean",
-                                                                "sum"
-                                                              ]
-                                                            },
-                                                            "level": {
-                                                              "enum": ["pages", "documents"]
-                                                            },
-                                                            "from": {
-                                                              "type": ["string", "null"],
-                                                              "description": "The member whose detail this is (any / worst)"
-                                                            },
-                                                            "values": {
-                                                              "type": "object",
-                                                              "additionalProperties": {
-                                                                "type": ["number", "null"]
-                                                              },
-                                                              "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  ]
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    },
-                                    {
-                                      "if": {
-                                        "properties": {
-                                          "method": {"const": "detector"}
-                                        },
-                                        "required": ["method"]
-                                      },
-                                      "then": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `detector` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "min_score",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "min_score": {
-                                                      "type": "number",
-                                                      "description": "The confidence floor used"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `detector` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "detector_matches",
-                                                    "best_score",
-                                                    "min_score"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "detector_matches": {
-                                                      "type": "integer",
-                                                      "description": "Boxes found at or above min_score"
-                                                    },
-                                                    "best_score": {
-                                                      "type": "number",
-                                                      "description": "The best box's confidence, 0-1; 0 when none"
-                                                    },
-                                                    "min_score": {
-                                                      "type": "number",
-                                                      "description": "The confidence floor used"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          },
-                                          "items": {
-                                            "items": {
-                                              "properties": {
-                                                "detail": {
-                                                  "description": "An `detector` detail, or null (skipped, errored)",
-                                                  "anyOf": [
-                                                    {"type": "null"},
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "aggregate": {
-                                                            "properties": {
-                                                              "rule": {"const": "mean"}
-                                                            },
-                                                            "required": ["rule"]
-                                                          }
-                                                        },
-                                                        "required": ["aggregate"]
-                                                      },
-                                                      "then": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "min_score",
-                                                          "aggregate"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": "number",
-                                                            "description": "The headline number (the mean of the members' values under `mean`)"
-                                                          },
-                                                          "min_score": {
-                                                            "type": "number",
-                                                            "description": "The confidence floor used"
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail`",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "else": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `detector` criterion",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "detector_matches",
-                                                          "best_score",
-                                                          "min_score"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": "number",
-                                                            "description": "The headline number (the mean of the members' values under `mean`)"
-                                                          },
-                                                          "detector_matches": {
-                                                            "type": "integer",
-                                                            "description": "Boxes found at or above min_score"
-                                                          },
-                                                          "best_score": {
-                                                            "type": "number",
-                                                            "description": "The best box's confidence, 0-1; 0 when none"
-                                                          },
-                                                          "min_score": {
-                                                            "type": "number",
-                                                            "description": "The confidence floor used"
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "properties": {
-                                                        "aggregate": {
-                                                          "type": "object",
-                                                          "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                          "additionalProperties": false,
-                                                          "required": [
-                                                            "rule",
-                                                            "level",
-                                                            "from",
-                                                            "values"
-                                                          ],
-                                                          "properties": {
-                                                            "rule": {
-                                                              "enum": [
-                                                                "any",
-                                                                "worst",
-                                                                "all",
-                                                                "mean",
-                                                                "sum"
-                                                              ]
-                                                            },
-                                                            "level": {
-                                                              "enum": ["pages", "documents"]
-                                                            },
-                                                            "from": {
-                                                              "type": ["string", "null"],
-                                                              "description": "The member whose detail this is (any / worst)"
-                                                            },
-                                                            "values": {
-                                                              "type": "object",
-                                                              "additionalProperties": {
-                                                                "type": ["number", "null"]
-                                                              },
-                                                              "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  ]
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    },
-                                    {
-                                      "if": {
-                                        "properties": {
-                                          "method": {"const": "cv"}
-                                        },
-                                        "required": ["method"]
-                                      },
-                                      "then": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `cv` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "detector",
-                                                    "thresholds",
-                                                    "parameters",
-                                                    "image",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "detector": {
-                                                      "type": "string",
-                                                      "description": "The OpenCV function that ran"
-                                                    },
-                                                    "thresholds": {
-                                                      "type": "object",
-                                                      "description": "The lines that decide the verdict",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "parameters": {
-                                                      "type": "object",
-                                                      "description": "Config values it measured with",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "image": {
-                                                      "type": "object",
-                                                      "description": "The working-image frame the *_px measurements are in",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `cv` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "detector",
-                                                    "measurements",
-                                                    "thresholds",
-                                                    "parameters",
-                                                    "image"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "detector": {
-                                                      "type": "string",
-                                                      "description": "The OpenCV function that ran"
-                                                    },
-                                                    "measurements": {
-                                                      "type": "object",
-                                                      "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "thresholds": {
-                                                      "type": "object",
-                                                      "description": "The lines that decide the verdict",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "parameters": {
-                                                      "type": "object",
-                                                      "description": "Config values it measured with",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "state": {
-                                                      "type": "string",
-                                                      "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                                    },
-                                                    "image": {
-                                                      "type": "object",
-                                                      "description": "The working-image frame the *_px measurements are in",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                "allOf": [
-                                                  {
-                                                    "$comment": "generated from cv.REGISTRY — do not edit",
-                                                    "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                                    "properties": {
-                                                      "detector": {
-                                                        "enum": [
-                                                          "check_blur",
-                                                          "check_exposure",
-                                                          "detect_faces",
-                                                          "detect_sky",
-                                                          "detect_text",
-                                                          "detect_vegetation",
-                                                          "detect_water"
-                                                        ]
-                                                      }
-                                                    },
-                                                    "allOf": [
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "check_blur"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Laplacian variance)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "laplacian_variance": {
-                                                                  "type": "number",
-                                                                  "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "check_exposure"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "mean_intensity": {
-                                                                  "type": "number",
-                                                                  "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_faces"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "faces_count": {
-                                                                  "type": "number",
-                                                                  "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                                },
-                                                                "faces_high_count": {
-                                                                  "type": "number",
-                                                                  "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                                },
-                                                                "faces_low_count": {
-                                                                  "type": "number",
-                                                                  "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_sky"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "sky_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                                },
-                                                                "sky_px": {
-                                                                  "type": "number",
-                                                                  "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                                },
-                                                                "blue_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels matching the clear-blue range (unit: px)"
-                                                                },
-                                                                "grey_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                                },
-                                                                "analysed_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_text"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_text — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "dense_block_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                                },
-                                                                "dense_blocks_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blocks above block_density (unit: count)"
-                                                                },
-                                                                "total_blocks_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blocks the page was divided into (unit: count)"
-                                                                },
-                                                                "text_regions_count": {
-                                                                  "type": "number",
-                                                                  "description": "Merged text regions returned as boxes (unit: count)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {
-                                                              "const": "detect_vegetation"
-                                                            }
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (HSV green masking)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "green_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                                },
-                                                                "green_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels inside the green mask (unit: px)"
-                                                                },
-                                                                "total_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels in the page (unit: px)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_water"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_water — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "water_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                                },
-                                                                "water_px": {
-                                                                  "type": "number",
-                                                                  "description": "Area of those qualifying blobs (unit: px)"
-                                                                },
-                                                                "total_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels in the page (unit: px)"
-                                                                },
-                                                                "blue_blobs_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                                },
-                                                                "candidates_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                                },
-                                                                "flat_count": {
-                                                                  "type": "number",
-                                                                  "description": "Candidates flat enough to be water (unit: count)"
-                                                                },
-                                                                "rejected_textured_count": {
-                                                                  "type": "number",
-                                                                  "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    ]
-                                                  }
-                                                ]
-                                              }
-                                            ]
-                                          },
-                                          "items": {
-                                            "items": {
-                                              "properties": {
-                                                "detail": {
-                                                  "description": "An `cv` detail, or null (skipped, errored)",
-                                                  "anyOf": [
-                                                    {"type": "null"},
-                                                    {
-                                                      "if": {
-                                                        "properties": {
-                                                          "aggregate": {
-                                                            "properties": {
-                                                              "rule": {"const": "mean"}
-                                                            },
-                                                            "required": ["rule"]
-                                                          }
-                                                        },
-                                                        "required": ["aggregate"]
-                                                      },
-                                                      "then": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "detector",
-                                                          "thresholds",
-                                                          "parameters",
-                                                          "image",
-                                                          "aggregate"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": "number",
-                                                            "description": "The headline number (the mean of the members' values under `mean`)"
-                                                          },
-                                                          "detector": {
-                                                            "type": "string",
-                                                            "description": "The OpenCV function that ran"
-                                                          },
-                                                          "thresholds": {
-                                                            "type": "object",
-                                                            "description": "The lines that decide the verdict",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "parameters": {
-                                                            "type": "object",
-                                                            "description": "Config values it measured with",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "image": {
-                                                            "type": "object",
-                                                            "description": "The working-image frame the *_px measurements are in",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail`",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "else": {
-                                                        "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                                        "type": "object",
-                                                        "description": "`detail` of a `cv` criterion",
-                                                        "additionalProperties": false,
-                                                        "required": [
-                                                          "metric",
-                                                          "value",
-                                                          "detector",
-                                                          "measurements",
-                                                          "thresholds",
-                                                          "parameters",
-                                                          "image"
-                                                        ],
-                                                        "properties": {
-                                                          "metric": {
-                                                            "type": "string",
-                                                            "description": "Name of the headline number"
-                                                          },
-                                                          "value": {
-                                                            "type": "number",
-                                                            "description": "The headline number (the mean of the members' values under `mean`)"
-                                                          },
-                                                          "detector": {
-                                                            "type": "string",
-                                                            "description": "The OpenCV function that ran"
-                                                          },
-                                                          "measurements": {
-                                                            "type": "object",
-                                                            "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "thresholds": {
-                                                            "type": "object",
-                                                            "description": "The lines that decide the verdict",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "parameters": {
-                                                            "type": "object",
-                                                            "description": "Config values it measured with",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "state": {
-                                                            "type": "string",
-                                                            "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                                          },
-                                                          "image": {
-                                                            "type": "object",
-                                                            "description": "The working-image frame the *_px measurements are in",
-                                                            "additionalProperties": true
-                                                          },
-                                                          "aggregate": {
-                                                            "type": "object",
-                                                            "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                            "additionalProperties": true
-                                                          }
-                                                        }
-                                                      },
-                                                      "properties": {
-                                                        "aggregate": {
-                                                          "type": "object",
-                                                          "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                          "additionalProperties": false,
-                                                          "required": [
-                                                            "rule",
-                                                            "level",
-                                                            "from",
-                                                            "values"
-                                                          ],
-                                                          "properties": {
-                                                            "rule": {
-                                                              "enum": [
-                                                                "any",
-                                                                "worst",
-                                                                "all",
-                                                                "mean",
-                                                                "sum"
-                                                              ]
-                                                            },
-                                                            "level": {
-                                                              "enum": ["pages", "documents"]
-                                                            },
-                                                            "from": {
-                                                              "type": ["string", "null"],
-                                                              "description": "The member whose detail this is (any / worst)"
-                                                            },
-                                                            "values": {
-                                                              "type": "object",
-                                                              "additionalProperties": {
-                                                                "type": ["number", "null"]
-                                                              },
-                                                              "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      "allOf": [
-                                                        {
-                                                          "$comment": "generated from cv.REGISTRY — do not edit",
-                                                          "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                                          "properties": {
-                                                            "detector": {
-                                                              "enum": [
-                                                                "check_blur",
-                                                                "check_exposure",
-                                                                "detect_faces",
-                                                                "detect_sky",
-                                                                "detect_text",
-                                                                "detect_vegetation",
-                                                                "detect_water"
-                                                              ]
-                                                            }
-                                                          },
-                                                          "allOf": [
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "check_blur"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (Laplacian variance)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "laplacian_variance": {
-                                                                        "type": "number",
-                                                                        "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            },
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "check_exposure"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "mean_intensity": {
-                                                                        "type": "number",
-                                                                        "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            },
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "detect_faces"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "faces_count": {
-                                                                        "type": "number",
-                                                                        "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                                      },
-                                                                      "faces_high_count": {
-                                                                        "type": "number",
-                                                                        "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                                      },
-                                                                      "faces_low_count": {
-                                                                        "type": "number",
-                                                                        "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            },
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "detect_sky"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "sky_ratio": {
-                                                                        "type": "number",
-                                                                        "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                                      },
-                                                                      "sky_px": {
-                                                                        "type": "number",
-                                                                        "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                                      },
-                                                                      "blue_px": {
-                                                                        "type": "number",
-                                                                        "description": "Pixels matching the clear-blue range (unit: px)"
-                                                                      },
-                                                                      "grey_px": {
-                                                                        "type": "number",
-                                                                        "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                                      },
-                                                                      "analysed_px": {
-                                                                        "type": "number",
-                                                                        "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            },
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "detect_text"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.features.detect_text — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "dense_block_ratio": {
-                                                                        "type": "number",
-                                                                        "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                                      },
-                                                                      "dense_blocks_count": {
-                                                                        "type": "number",
-                                                                        "description": "Blocks above block_density (unit: count)"
-                                                                      },
-                                                                      "total_blocks_count": {
-                                                                        "type": "number",
-                                                                        "description": "Blocks the page was divided into (unit: count)"
-                                                                      },
-                                                                      "text_regions_count": {
-                                                                        "type": "number",
-                                                                        "description": "Merged text regions returned as boxes (unit: count)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            },
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "detect_vegetation"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (HSV green masking)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "green_ratio": {
-                                                                        "type": "number",
-                                                                        "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                                      },
-                                                                      "green_px": {
-                                                                        "type": "number",
-                                                                        "description": "Pixels inside the green mask (unit: px)"
-                                                                      },
-                                                                      "total_px": {
-                                                                        "type": "number",
-                                                                        "description": "Pixels in the page (unit: px)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            },
-                                                            {
-                                                              "if": {
-                                                                "properties": {
-                                                                  "detector": {
-                                                                    "const": "detect_water"
-                                                                  }
-                                                                },
-                                                                "required": ["detector"]
-                                                              },
-                                                              "then": {
-                                                                "properties": {
-                                                                  "measurements": {
-                                                                    "$comment": "generated from cv.features.detect_water — do not edit",
-                                                                    "type": "object",
-                                                                    "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                                    "additionalProperties": false,
-                                                                    "properties": {
-                                                                      "water_ratio": {
-                                                                        "type": "number",
-                                                                        "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                                      },
-                                                                      "water_px": {
-                                                                        "type": "number",
-                                                                        "description": "Area of those qualifying blobs (unit: px)"
-                                                                      },
-                                                                      "total_px": {
-                                                                        "type": "number",
-                                                                        "description": "Pixels in the page (unit: px)"
-                                                                      },
-                                                                      "blue_blobs_count": {
-                                                                        "type": "number",
-                                                                        "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                                      },
-                                                                      "candidates_count": {
-                                                                        "type": "number",
-                                                                        "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                                      },
-                                                                      "flat_count": {
-                                                                        "type": "number",
-                                                                        "description": "Candidates flat enough to be water (unit: count)"
-                                                                      },
-                                                                      "rejected_textured_count": {
-                                                                        "type": "number",
-                                                                        "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            }
-                                                          ]
-                                                        }
-                                                      ]
-                                                    }
-                                                  ]
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    },
-                                    {
-                                      "if": {
-                                        "properties": {
-                                          "method": {"type": "null"}
-                                        },
-                                        "required": ["method"]
-                                      },
-                                      "then": {
-                                        "properties": {
-                                          "detail": {"type": "null"}
-                                        }
-                                      }
-                                    }
-                                  ]
-                                },
-                                "description": "By criterion name, in request order"
-                              }
-                            }
-                          },
-                          "verdict": {
-                            "anyOf": [
-                              {"type": "null"},
-                              {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                            ]
-                          },
-                          "page_geometry": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": [
-                                "item",
-                                "page",
-                                "width",
-                                "height",
-                                "working_scale",
-                                "pdf_points"
-                              ],
-                              "properties": {
-                                "item": {"type": "integer"},
-                                "page": {"type": "integer", "description": "Equals `item`"},
-                                "width": {"type": ["integer", "null"]},
-                                "height": {"type": ["integer", "null"]},
-                                "working_scale": {"type": ["number", "null"]},
-                                "pdf_points": {
-                                  "anyOf": [
-                                    {"type": "null"},
-                                    {
-                                      "type": "array",
-                                      "items": {"type": "number"},
-                                      "minItems": 2,
-                                      "maxItems": 2
-                                    }
-                                  ]
-                                }
-                              }
-                            },
-                            "description": "One per item; nulls for an item with no page image"
-                          },
-                          "detector": {
-                            "type": "object",
-                            "description": "What the open-vocabulary detector did for the whole job",
-                            "additionalProperties": false,
-                            "required": [
-                              "configured",
-                              "url_host",
-                              "min_score",
-                              "timeout_seconds",
-                              "max_labels_per_call",
-                              "model",
-                              "device",
-                              "calls",
-                              "labels",
-                              "detections",
-                              "elapsed_ms",
-                              "errors",
-                              "used"
-                            ],
-                            "properties": {
-                              "configured": {"type": "boolean"},
-                              "url_host": {"type": ["string", "null"]},
-                              "min_score": {"type": "number"},
-                              "timeout_seconds": {"type": "number"},
-                              "max_labels_per_call": {"type": "integer"},
-                              "model": {"type": ["string", "null"]},
-                              "device": {"type": ["string", "null"]},
-                              "calls": {"type": "integer", "minimum": 0},
-                              "labels": {"type": "integer", "minimum": 0},
-                              "detections": {"type": "integer", "minimum": 0},
-                              "elapsed_ms": {"type": "number", "minimum": 0},
-                              "errors": {
-                                "type": "array",
-                                "items": {"type": "string"}
-                              },
-                              "used": {"type": "boolean"}
-                            }
-                          },
-                          "artifacts": {
-                            "anyOf": [
-                              {"type": "null"},
-                              {
-                                "type": "object",
-                                "description": "The job's artifact directory",
-                                "additionalProperties": false,
-                                "required": [
-                                  "dir",
-                                  "files",
-                                  "items",
-                                  "zip_url",
-                                  "total_bytes",
-                                  "expires_at",
-                                  "dropped",
-                                  "notes"
-                                ],
-                                "properties": {
-                                  "dir": {"type": "string"},
-                                  "files": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "object",
-                                      "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
-                                      "additionalProperties": false,
-                                      "required": [
-                                        "name",
-                                        "bytes",
-                                        "content_type",
-                                        "url",
-                                        "kind",
-                                        "item",
-                                        "document",
-                                        "criteria"
-                                      ],
-                                      "properties": {
-                                        "name": {"type": "string"},
-                                        "bytes": {"type": "integer", "minimum": 0},
-                                        "content_type": {"type": "string"},
-                                        "url": {"type": "string"},
-                                        "kind": {
-                                          "type": "string",
-                                          "description": "What the file is: base image, layer, regions, text, manifest, references"
-                                        },
-                                        "format": {"type": "string"},
-                                        "item": {"type": ["integer", "null"]},
-                                        "document": {"type": ["integer", "null"]},
-                                        "criteria": {
-                                          "type": "array",
-                                          "items": {"type": "string"},
-                                          "description": "The criteria the file belongs to"
-                                        }
-                                      }
-                                    }
-                                  },
-                                  "items": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "object",
-                                      "additionalProperties": false,
-                                      "required": ["item", "layers"],
-                                      "properties": {
-                                        "item": {"type": "integer"},
-                                        "layers": {
-                                          "type": "object",
-                                          "description": "Layer URLs (rendered on first fetch)",
-                                          "additionalProperties": false,
-                                          "required": [],
-                                          "properties": {
-                                            "svg": {"type": "string"},
-                                            "png": {"type": "string"},
-                                            "preview": {"type": "string"}
-                                          }
-                                        }
-                                      }
-                                    },
-                                    "description": "Each item with a page image: its combined layer URLs"
-                                  },
-                                  "zip_url": {"type": "string"},
-                                  "total_bytes": {"type": "integer", "minimum": 0},
-                                  "expires_at": {"type": "string", "format": "date-time"},
-                                  "dropped": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Files the byte cap removed"
-                                  },
-                                  "notes": {
-                                    "type": "array",
-                                    "items": {"type": "string"}
-                                  }
-                                }
-                              }
-                            ]
-                          },
-                          "references": {
-                            "anyOf": [
-                              {"type": "null"},
-                              {
-                                "type": "object",
-                                "description": "What the request's references did (§ Result shape, `references`)",
-                                "additionalProperties": false,
-                                "required": [
-                                  "mode",
-                                  "requested",
-                                  "pool",
-                                  "pool_truncated",
-                                  "resolved",
-                                  "inherited",
-                                  "criteria",
-                                  "selection",
-                                  "calls",
-                                  "selection_calls"
-                                ],
-                                "properties": {
-                                  "mode": {"enum": ["explicit", "auto"]},
-                                  "requested": {
-                                    "description": "The ids (or the auto request) as sent"
-                                  },
-                                  "pool": {
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "type": "array",
-                                        "items": {"type": "string"}
-                                      }
-                                    ]
-                                  },
-                                  "pool_truncated": {"type": "boolean"},
-                                  "resolved": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "The ids used"
-                                  },
-                                  "inherited": {
-                                    "type": "boolean",
-                                    "description": "The criteria were inherited from the references"
-                                  },
-                                  "criteria": {
-                                    "type": "object",
-                                    "additionalProperties": {
-                                      "type": "object",
-                                      "additionalProperties": false,
-                                      "required": [
-                                        "matched",
-                                        "matched_by",
-                                        "use",
-                                        "combine",
-                                        "position",
-                                        "examples"
-                                      ],
-                                      "properties": {
-                                        "matched": {"type": ["string", "null"]},
-                                        "matched_by": {"enum": ["criterion", "key", "name"]},
-                                        "use": {"type": "boolean"},
-                                        "combine": {"type": "string"},
-                                        "position": {"type": "string"},
-                                        "examples": {
-                                          "type": "array",
-                                          "items": {
-                                            "type": "object",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "reference_id",
-                                              "criterion",
-                                              "polarity",
-                                              "expected"
-                                            ],
-                                            "properties": {
-                                              "reference_id": {
-                                                "type": "string",
-                                                "pattern": "^r[0-9a-f]{12}$",
-                                                "description": "A reference's id: `r` and 12 hex characters"
-                                              },
-                                              "criterion": {"type": "string"},
-                                              "polarity": {"type": "string"},
-                                              "expected": {
-                                                "type": "object",
-                                                "additionalProperties": true,
-                                                "description": "The expected answer: {score, verdict, reason, source}"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    }
-                                  },
-                                  "selection": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "object",
-                                      "additionalProperties": true,
-                                      "description": "One item's auto selection: {item, status: ok | failed | skipped, matches: [{id, confidence, reason}], dropped, error, reason}"
-                                    }
-                                  },
-                                  "calls": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                    "description": "Guided scoring calls"
-                                  },
-                                  "selection_calls": {"type": "integer", "minimum": 0}
-                                }
-                              }
-                            ]
-                          },
-                          "request": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["criteria", "model"],
-                            "properties": {
-                              "criteria": {
-                                "type": "array",
-                                "items": {
-                                  "$comment": "generated from api.schemas.CriterionInput — do not edit",
-                                  "additionalProperties": false,
-                                  "description": "One criterion: shared fields at the top, type-specific ones in options.\n\n``options`` arrives as a plain object and is replaced, during validation,\nby the options model for ``type`` — so every consumer reads\n``c.options.hint`` on an ``llm`` criterion and never a dict.",
-                                  "properties": {
-                                    "name": {
-                                      "description": "The criterion to evaluate; unique within the request.",
-                                      "maxLength": 200,
-                                      "minLength": 1,
-                                      "type": "string"
-                                    },
-                                    "key": {
-                                      "anyOf": [
-                                        {"maxLength": 200, "minLength": 1, "type": "string"},
-                                        {"type": "null"}
-                                      ],
-                                      "default": null,
-                                      "description": "Optional label used ONLY to find reference examples: the criterion is guided by the reference criteria with the same key (case-insensitive), whatever either is named, and never falls back to its name. options.reference.criterion wins over it. Never shown to the model; results, depends_on and prompts stay on `name`. May repeat in a request; unique within one reference."
-                                    },
-                                    "type": {
-                                      "default": "llm",
-                                      "description": "'llm': the vision model scores it (one call per criterion). 'text': deterministic search of the text layer. 'cv': a registered OpenCV detector by name (GET /cv-detectors), with options.fallback when none matches. 'detector': the open-vocabulary detector service, using the name as its text prompt.",
-                                      "enum": ["llm", "text", "cv", "detector"],
-                                      "type": "string"
-                                    },
-                                    "weight": {
-                                      "default": 1.0,
-                                      "description": "Relative weight in the overall score. Default 1.",
-                                      "exclusiveMinimum": 0.0,
-                                      "type": "number"
-                                    },
-                                    "depends_on": {
-                                      "anyOf": [
-                                        {"type": "string"},
-                                        {"type": "null"}
-                                      ],
-                                      "default": null,
-                                      "description": "Name of another SCORED criterion that must PASS first. Until it does, this criterion is not evaluated at all; if it does not, this one is SKIPPED (no model call spent). Chains propagate."
-                                    },
-                                    "score": {
-                                      "default": true,
-                                      "description": "false = locate without judging: the criterion still produces regions but is excluded from the weighted score and the verdict, and its score / verdict / confidence are null. Refused for a criterion that cannot produce geometry.",
-                                      "type": "boolean"
-                                    },
-                                    "options": {
-                                      "default": null,
-                                      "description": "Type-specific options; see GET /criterion-types."
-                                    }
-                                  },
-                                  "required": ["name"],
-                                  "type": "object"
-                                },
-                                "description": "The criteria exactly as validated"
-                              },
-                              "model": {
-                                "type": "string",
-                                "description": "The job's model, resolved"
-                              }
-                            }
-                          },
-                          "usage": {
-                            "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
-                            "type": "object",
-                            "allOf": [
-                              {
-                                "properties": {
-                                  "calls": {"type": "integer", "minimum": 0},
-                                  "errors": {"type": "integer", "minimum": 0},
-                                  "seconds": {"type": "number", "minimum": 0},
-                                  "prompt_tokens": {"type": ["integer", "null"]},
-                                  "cached_tokens": {"type": ["integer", "null"]},
-                                  "completion_tokens": {"type": ["integer", "null"]},
-                                  "reasoning_tokens": {"type": ["integer", "null"]},
-                                  "total_tokens": {"type": ["integer", "null"]}
-                                }
-                              }
-                            ],
-                            "properties": {
-                              "models": {
-                                "type": "array",
-                                "items": {"type": "string"}
-                              },
-                              "first_call_at": {"type": ["string", "null"], "format": "date-time"},
-                              "last_call_at": {"type": ["string", "null"], "format": "date-time"},
-                              "usage_url": {"type": "string"}
-                            },
-                            "required": [
-                              "calls",
-                              "errors",
-                              "seconds",
-                              "prompt_tokens",
-                              "cached_tokens",
-                              "completion_tokens",
-                              "reasoning_tokens",
-                              "total_tokens",
-                              "models",
-                              "first_call_at",
-                              "last_call_at",
-                              "usage_url"
-                            ],
-                            "unevaluatedProperties": false
-                          }
-                        }
-                      }
-                    ]
-                  },
-                  "usage": {
-                    "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
-                    "type": "object",
-                    "allOf": [
-                      {
-                        "properties": {
-                          "calls": {"type": "integer", "minimum": 0},
-                          "errors": {"type": "integer", "minimum": 0},
-                          "seconds": {"type": "number", "minimum": 0},
-                          "prompt_tokens": {"type": ["integer", "null"]},
-                          "cached_tokens": {"type": ["integer", "null"]},
-                          "completion_tokens": {"type": ["integer", "null"]},
-                          "reasoning_tokens": {"type": ["integer", "null"]},
-                          "total_tokens": {"type": ["integer", "null"]}
-                        }
-                      }
-                    ],
-                    "properties": {
-                      "models": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                      },
-                      "first_call_at": {"type": ["string", "null"], "format": "date-time"},
-                      "last_call_at": {"type": ["string", "null"], "format": "date-time"},
-                      "usage_url": {"type": "string"}
-                    },
-                    "required": [
-                      "calls",
-                      "errors",
-                      "seconds",
-                      "prompt_tokens",
-                      "cached_tokens",
-                      "completion_tokens",
-                      "reasoning_tokens",
-                      "total_tokens",
-                      "models",
-                      "first_call_at",
-                      "last_call_at",
-                      "usage_url"
-                    ],
-                    "unevaluatedProperties": false
-                  }
-                }
-              }
-            ],
-            "description": "Set when the job completed: the assessment (an assess job) or the reference it built"
-          },
-          "error": {"type": ["string", "null"], "description": "Why a failed job failed"}
-        }
-      }
-    },
-    "max_concurrent": {"type": "null", "description": "The registry tracks no ceiling"},
-    "available": {"type": "null"}
-  },
-  "required": ["max_concurrent", "available"]
-}
+{"$ref": "#/$defs/classifier_jobs"}
 ```
+
+Uses: [`classifier_jobs`](#def-classifier_jobs), [`jobs_list_response`](#def-jobs_list_response), [`classifier_job`](#def-classifier_job), [`JobBase`](#def-JobBase), [`job_base`](#def-job_base), [`job_id`](#def-job_id), [`job_metadata`](#def-job_metadata), [`assess_result`](#def-assess_result), [`reference_result`](#def-reference_result), [`reference_id`](#def-reference_id), [`progress`](#def-progress), [`document_entry`](#def-document_entry), [`item_row`](#def-item_row), [`breakdown`](#def-breakdown), [`criterion_entry`](#def-criterion_entry), [`job_artifacts`](#def-job_artifacts), [`references_summary`](#def-references_summary), [`criterion_input`](#def-criterion_input), [`job_usage_block`](#def-job_usage_block), [`progress_stage`](#def-progress_stage), [`ocr_layer`](#def-ocr_layer), [`document_layer`](#def-document_layer), [`region`](#def-region), [`criterion_artifacts`](#def-criterion_artifacts), [`localization`](#def-localization), [`unit_entry`](#def-unit_entry), [`llm_detail`](#def-llm_detail), [`text_detail`](#def-text_detail), [`detector_detail`](#def-detector_detail), [`cv_detail`](#def-cv_detail), [`file_label`](#def-file_label), [`layer_links`](#def-layer_links), [`usage_totals_fields`](#def-usage_totals_fields), [`text_link`](#def-text_link), [`box_attempt`](#def-box_attempt), [`detail_llm_mean`](#def-detail_llm_mean), [`detail_llm`](#def-detail_llm), [`aggregate_block`](#def-aggregate_block), [`detail_text_mean`](#def-detail_text_mean), [`detail_text`](#def-detail_text), [`detail_detector_mean`](#def-detail_detector_mean), [`detail_detector`](#def-detail_detector), [`detail_cv_mean`](#def-detail_cv_mean), [`detail_cv`](#def-detail_cv), [`cv_measurements`](#def-cv_measurements), [`measurements_check_blur`](#def-measurements_check_blur), [`measurements_check_exposure`](#def-measurements_check_exposure), [`measurements_detect_faces`](#def-measurements_detect_faces), [`measurements_detect_sky`](#def-measurements_detect_sky), [`measurements_detect_text`](#def-measurements_detect_text), [`measurements_detect_vegetation`](#def-measurements_detect_vegetation), [`measurements_detect_water`](#def-measurements_detect_water) — too large to show inlined (over 64 KiB), so its `$ref`s are kept; each definition is shown once under [Definitions](#definitions).
 
 ## `GET /v1/classifier/jobs/:jobId`
 
@@ -7755,6369 +1173,10 @@ Response `200` (`application/json`):
 Response `200` (`application/json`):
 
 ```json
-{
-  "description": "One job: the shared `common.jobs` `JobBase` with the classifier's metadata and result",
-  "allOf": [
-    {
-      "$comment": "generated from common.jobs.model.JobBase — do not edit",
-      "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"cleaning_up\"``;\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
-      "properties": {
-        "job_id": {"type": "string"},
-        "phase": {"type": "string"},
-        "created_at": {"type": "string"},
-        "updated_at": {"type": "string"},
-        "elapsed_seconds": {"type": "number"},
-        "metadata": {"additionalProperties": true, "type": "object"},
-        "result": {
-          "anyOf": [
-            {"additionalProperties": true, "type": "object"},
-            {"type": "null"}
-          ],
-          "default": null
-        },
-        "error": {
-          "anyOf": [
-            {"type": "string"},
-            {"type": "null"}
-          ],
-          "default": null
-        }
-      },
-      "required": ["job_id", "phase", "created_at", "updated_at", "elapsed_seconds", "metadata"],
-      "type": "object",
-      "additionalProperties": false
-    }
-  ],
-  "properties": {
-    "job_id": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{12}$",
-      "description": "A job's id: 12 hex characters"
-    },
-    "phase": {
-      "enum": ["staging", "pending", "processing", "completed", "failed", "cancelled"],
-      "description": "`staging` (being written) → `pending` (queued) → `processing` → `completed` | `failed` | `cancelled`"
-    },
-    "metadata": {
-      "type": "object",
-      "description": "`ClassifierMetadata` (left-out keys when unset) plus the progress snapshot",
-      "additionalProperties": false,
-      "required": ["type", "request_id"],
-      "properties": {
-        "type": {
-          "enum": ["assess", "reference", "compare", "locate"],
-          "description": "assess (POST /assess) or reference (the creation job POST /references queues); a row written by an older container may still say compare or locate (the worker fails it)"
-        },
-        "request_id": {
-          "type": "string",
-          "description": "The correlation id of the request that queued the job"
-        },
-        "reference_id": {
-          "type": "string",
-          "pattern": "^r[0-9a-f]{12}$",
-          "description": "A reference job: the reference it builds"
-        },
-        "references": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "^r[0-9a-f]{12}$",
-            "description": "A reference's id: `r` and 12 hex characters"
-          },
-          "description": "An assess job: the reference ids it reads"
-        },
-        "progress": {
-          "type": "object",
-          "description": "How far along the job is (`common.jobs.progress`): the snapshot, flushed about once a second (§ Progress)",
-          "additionalProperties": false,
-          "required": [
-            "state",
-            "percent",
-            "stage",
-            "stage_title",
-            "label",
-            "index",
-            "length",
-            "attempt",
-            "seq",
-            "updated_at",
-            "stages"
-          ],
-          "properties": {
-            "state": {"enum": ["queued", "running", "done", "failed", "cancelled"]},
-            "percent": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 100,
-              "description": "0-100, held just under 100 while the job runs"
-            },
-            "stage": {"type": ["string", "null"], "description": "The current stage's name"},
-            "stage_title": {"type": ["string", "null"]},
-            "label": {"type": ["string", "null"], "description": "What is happening now"},
-            "index": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Units done in the current stage"
-            },
-            "length": {"type": "integer", "minimum": 0, "description": "Units in the current stage"},
-            "attempt": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Which run of the job (a requeue is the next)"
-            },
-            "seq": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "The snapshot's sequence number in the job's history"
-            },
-            "updated_at": {"type": "string", "format": "date-time"},
-            "stages": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["name", "title", "weight", "index", "length"],
-                "properties": {
-                  "name": {"type": "string"},
-                  "title": {"type": "string"},
-                  "weight": {"type": "number", "minimum": 0},
-                  "index": {"type": "integer", "minimum": 0},
-                  "length": {"type": "integer", "minimum": 0}
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "result": {
-      "oneOf": [
-        {"type": "null"},
-        {
-          "type": "object",
-          "description": "An assess job's result, `schema_version: 3` (§ Result shape)",
-          "additionalProperties": false,
-          "required": [
-            "schema_version",
-            "documents",
-            "items",
-            "assessment",
-            "verdict",
-            "page_geometry",
-            "detector",
-            "artifacts",
-            "references",
-            "request"
-          ],
-          "properties": {
-            "schema_version": {"const": 3},
-            "documents": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "index",
-                  "filename",
-                  "kind",
-                  "pages",
-                  "items",
-                  "warnings",
-                  "document_info"
-                ],
-                "properties": {
-                  "index": {"type": "integer", "minimum": 0},
-                  "filename": {"type": "string"},
-                  "kind": {"enum": ["image", "pdf", "svg", "txt", "docx"]},
-                  "pages": {"type": "integer", "minimum": 1},
-                  "items": {
-                    "type": "array",
-                    "items": {"type": "integer", "minimum": 0},
-                    "description": "Its global item indices"
-                  },
-                  "warnings": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "How the document was read that is worth knowing but is not an error (an SVG's external references); [] otherwise"
-                  },
-                  "document_info": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                      "content_type",
-                      "size_bytes",
-                      "has_image",
-                      "native_text_chars",
-                      "ocr",
-                      "llm_text_char_budget"
-                    ],
-                    "properties": {
-                      "content_type": {"type": "string"},
-                      "size_bytes": {"type": "integer", "minimum": 0},
-                      "has_image": {"type": "boolean", "description": "Any page has an image"},
-                      "native_text_chars": {"type": "integer", "minimum": 0},
-                      "ocr": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["engine", "min_native_chars", "layers", "document_layers"],
-                        "properties": {
-                          "engine": {"type": "string"},
-                          "min_native_chars": {"type": "integer"},
-                          "layers": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "description": "One text layer one item's criteria asked for (`text.p{item}.<key>.json`)",
-                              "additionalProperties": false,
-                              "required": [
-                                "item",
-                                "key",
-                                "mode",
-                                "ran",
-                                "source",
-                                "chars",
-                                "confidence",
-                                "note"
-                              ],
-                              "properties": {
-                                "item": {"type": "integer"},
-                                "key": {
-                                  "type": "string",
-                                  "description": "The text-layer key (the OCR settings)"
-                                },
-                                "mode": {"enum": ["auto", "always", "never"]},
-                                "ran": {
-                                  "type": "boolean",
-                                  "description": "Whether OCR ran for this layer"
-                                },
-                                "source": {"type": "string", "description": "native | ocr | none"},
-                                "chars": {"type": "integer", "minimum": 0},
-                                "confidence": {"type": ["number", "null"]},
-                                "note": {"type": ["string", "null"]}
-                              }
-                            }
-                          },
-                          "document_layers": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "description": "The joined text a `scope: \"document\"` search read",
-                              "additionalProperties": false,
-                              "required": ["key", "source", "chars", "file"],
-                              "properties": {
-                                "key": {"type": "string"},
-                                "source": {"type": "string"},
-                                "chars": {"type": "integer", "minimum": 0},
-                                "file": {
-                                  "type": "string",
-                                  "description": "`text.d{index}.<key>.json`"
-                                }
-                              }
-                            }
-                          }
-                        }
-                      },
-                      "llm_text_char_budget": {
-                        "type": "integer",
-                        "description": "The job model's text budget"
-                      }
-                    }
-                  }
-                }
-              },
-              "description": "One per document, in request order"
-            },
-            "items": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "description": "One item's own weighted answer, from its per-criterion unit results (§ Scores per item, and overall)",
-                "additionalProperties": false,
-                "required": [
-                  "item",
-                  "document",
-                  "page",
-                  "filename",
-                  "overall_score",
-                  "overall_verdict",
-                  "complete"
-                ],
-                "properties": {
-                  "item": {"type": "integer", "minimum": 0},
-                  "document": {"type": "integer", "minimum": 0},
-                  "page": {"type": "integer", "minimum": 0, "description": "Within its document"},
-                  "filename": {"type": "string"},
-                  "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                  "overall_verdict": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                    ]
-                  },
-                  "complete": {"type": "boolean"}
-                }
-              },
-              "description": "One per item"
-            },
-            "assessment": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "overall_score",
-                "overall_verdict",
-                "complete",
-                "weighted_score_breakdown",
-                "per_criterion_scores"
-              ],
-              "properties": {
-                "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                "overall_verdict": {
-                  "anyOf": [
-                    {"type": "null"},
-                    {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                  ]
-                },
-                "complete": {
-                  "type": "boolean",
-                  "description": "false when any scored criterion errored"
-                },
-                "weighted_score_breakdown": {
-                  "anyOf": [
-                    {"type": "null"},
-                    {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "formula",
-                        "total_weight",
-                        "weighted_sum",
-                        "unrounded_average",
-                        "final_score",
-                        "partial",
-                        "excluded",
-                        "per_criterion"
-                      ],
-                      "properties": {
-                        "formula": {"const": "sum(score * weight) / total_weight"},
-                        "total_weight": {"type": "number"},
-                        "weighted_sum": {"type": "number"},
-                        "unrounded_average": {"type": "number"},
-                        "final_score": {"type": "integer"},
-                        "partial": {
-                          "type": "boolean",
-                          "description": "Some scored criterion errored: this is the score of what succeeded"
-                        },
-                        "excluded": {
-                          "type": "object",
-                          "additionalProperties": {"type": "string"},
-                          "description": "Criterion name → why it was left out"
-                        },
-                        "per_criterion": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["score", "weight", "contribution"],
-                            "properties": {
-                              "score": {"type": "integer"},
-                              "weight": {"type": "number"},
-                              "contribution": {"type": "number"}
-                            }
-                          }
-                        }
-                      }
-                    }
-                  ]
-                },
-                "per_criterion_scores": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "object",
-                    "description": "One criterion: the same keys for every type and status (§ Result shape)",
-                    "additionalProperties": false,
-                    "required": [
-                      "status",
-                      "type",
-                      "key",
-                      "method",
-                      "scored",
-                      "score",
-                      "verdict",
-                      "confidence",
-                      "reason",
-                      "detail",
-                      "regions",
-                      "regions_truncated",
-                      "artifacts",
-                      "localization",
-                      "options_used",
-                      "error",
-                      "complete",
-                      "aggregate_used",
-                      "items"
-                    ],
-                    "properties": {
-                      "status": {
-                        "enum": ["ok", "error", "skipped"],
-                        "description": "`ok` when at least one unit answered, `error` when none did and one errored, `skipped` when every unit was skipped"
-                      },
-                      "type": {"enum": ["llm", "text", "detector", "cv"]},
-                      "key": {
-                        "type": ["string", "null"],
-                        "description": "The criterion's `key` as sent (stripped)"
-                      },
-                      "method": {
-                        "anyOf": [
-                          {"type": "null"},
-                          {
-                            "enum": ["llm", "text", "detector", "cv"],
-                            "description": "The path that answered (a cv fallback's); null when skipped by a dependency"
-                          }
-                        ]
-                      },
-                      "scored": {"type": "boolean", "description": "The criterion's `score` flag"},
-                      "score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                      "verdict": {
-                        "anyOf": [
-                          {"type": "null"},
-                          {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                        ]
-                      },
-                      "confidence": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
-                      "reason": {"type": "string"},
-                      "detail": {
-                        "description": "Structured diagnostics: its method's declared shape (GET /criterion-types `result`), or null"
-                      },
-                      "regions": {
-                        "type": "array",
-                        "items": {
-                          "type": "object",
-                          "additionalProperties": false,
-                          "required": [
-                            "page",
-                            "kind",
-                            "points",
-                            "label",
-                            "score",
-                            "source",
-                            "attrs"
-                          ],
-                          "properties": {
-                            "page": {"type": "integer", "minimum": 0, "description": "Its item"},
-                            "kind": {"enum": ["box", "polygon"]},
-                            "points": {
-                              "type": "array",
-                              "items": {
-                                "type": "array",
-                                "items": {"type": "number"},
-                                "minItems": 2,
-                                "maxItems": 2
-                              },
-                              "description": "[[x, y], …] in original page pixels"
-                            },
-                            "label": {"type": "string"},
-                            "score": {
-                              "type": ["number", "null"],
-                              "description": "The producer's confidence"
-                            },
-                            "source": {"enum": ["cv", "ocr", "pdf-text", "detector", "llm"]},
-                            "attrs": {
-                              "type": "object",
-                              "additionalProperties": true,
-                              "description": "Free-form extras per source (`common.vision.Region.attrs`): a `text` snippet, `pdf_rect`, the llm loop's `attempt` / `accepted` / `verify_score`, …"
-                            }
-                          }
-                        },
-                        "description": "The union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX"
-                      },
-                      "regions_truncated": {"type": "boolean"},
-                      "artifacts": {
-                        "anyOf": [
-                          {"type": "null"},
-                          {
-                            "type": "object",
-                            "description": "Per-criterion links; null when there is neither geometry nor text",
-                            "additionalProperties": false,
-                            "required": [],
-                            "properties": {
-                              "slug": {
-                                "type": "string",
-                                "description": "The criterion's file-name slug"
-                              },
-                              "regions_url": {
-                                "type": "string",
-                                "description": "regions.json scoped to the criterion"
-                              },
-                              "items": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "additionalProperties": false,
-                                  "required": ["item", "count", "layers", "attempts"],
-                                  "properties": {
-                                    "item": {"type": "integer"},
-                                    "count": {"type": "integer", "minimum": 0},
-                                    "layers": {
-                                      "type": "object",
-                                      "description": "Layer URLs (rendered on first fetch)",
-                                      "additionalProperties": false,
-                                      "required": [],
-                                      "properties": {
-                                        "svg": {"type": "string"},
-                                        "png": {"type": "string"},
-                                        "preview": {"type": "string"}
-                                      }
-                                    },
-                                    "attempts": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": ["attempt", "accepted"],
-                                        "properties": {
-                                          "attempt": {"type": "integer"},
-                                          "accepted": {"type": "boolean"},
-                                          "svg": {"type": "string"},
-                                          "png": {"type": "string"},
-                                          "preview": {"type": "string"}
-                                        }
-                                      },
-                                      "description": "One per enforcement-loop attempt with a drawable box on the item"
-                                    }
-                                  }
-                                },
-                                "description": "Per item it found something on"
-                              },
-                              "text": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                  "additionalProperties": false,
-                                  "required": ["key", "url", "source", "chars"],
-                                  "properties": {
-                                    "item": {"type": "integer"},
-                                    "document": {"type": "integer"},
-                                    "key": {"type": "string"},
-                                    "url": {"type": "string"},
-                                    "source": {"type": "string"},
-                                    "chars": {"type": "integer", "minimum": 0}
-                                  }
-                                },
-                                "description": "One link per text layer its units read"
-                              }
-                            }
-                          }
-                        ]
-                      },
-                      "localization": {
-                        "anyOf": [
-                          {"type": "null"},
-                          {
-                            "type": "object",
-                            "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                            "additionalProperties": false,
-                            "required": ["attempts", "accepted_attempt", "calls"],
-                            "properties": {
-                              "attempts": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                  "additionalProperties": false,
-                                  "required": [
-                                    "attempt",
-                                    "bbox_grid",
-                                    "bbox_px",
-                                    "valid",
-                                    "accepted"
-                                  ],
-                                  "properties": {
-                                    "item": {
-                                      "type": "integer",
-                                      "description": "Present when the record merges several items"
-                                    },
-                                    "attempt": {"type": "integer", "minimum": 1},
-                                    "bbox_grid": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "type": "array",
-                                          "items": {"type": "number"},
-                                          "minItems": 4,
-                                          "maxItems": 4
-                                        }
-                                      ]
-                                    },
-                                    "bbox_px": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "type": "array",
-                                          "items": {"type": "number"},
-                                          "minItems": 4,
-                                          "maxItems": 4
-                                        }
-                                      ]
-                                    },
-                                    "valid": {"type": "boolean"},
-                                    "accepted": {"type": "boolean"},
-                                    "reject": {
-                                      "type": "string",
-                                      "description": "Why the box was rejected (the retry's feedback)"
-                                    },
-                                    "verify_score": {"type": "integer"},
-                                    "verify_reason": {"type": "string"},
-                                    "verify_partial": {"type": "boolean"},
-                                    "detector_iou": {"type": "number"},
-                                    "coarse_bbox_grid": {
-                                      "type": "array",
-                                      "items": {"type": "number"}
-                                    },
-                                    "refine_window_grid": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "type": "array",
-                                          "items": {"type": "number"}
-                                        }
-                                      ]
-                                    },
-                                    "refined": {"type": "boolean"},
-                                    "refine_reject": {"type": "string"},
-                                    "refine_mode": {"enum": ["marks", "grid"]},
-                                    "marks_shown": {"type": "integer"},
-                                    "marks_lines": {"enum": ["native", "ocr", "window"]},
-                                    "marks": {
-                                      "type": "array",
-                                      "items": {"type": "integer"}
-                                    },
-                                    "marks_fallback": {"type": "string"}
-                                  }
-                                }
-                              },
-                              "accepted_attempt": {"type": ["integer", "null"]},
-                              "calls": {"type": "integer", "minimum": 0},
-                              "accepted": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "additionalProperties": false,
-                                  "required": ["item", "attempt"],
-                                  "properties": {
-                                    "item": {"type": "integer"},
-                                    "attempt": {"type": "integer"}
-                                  }
-                                },
-                                "description": "Merged records: each accepted box"
-                              },
-                              "references": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "additionalProperties": false,
-                                  "required": [
-                                    "item",
-                                    "applied",
-                                    "ask_images",
-                                    "examples",
-                                    "ask",
-                                    "refine",
-                                    "verify",
-                                    "note"
-                                  ],
-                                  "properties": {
-                                    "item": {"type": "integer"},
-                                    "applied": {"type": "boolean"},
-                                    "ask_images": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {"enum": ["composite", "crop"]}
-                                      ]
-                                    },
-                                    "examples": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "additionalProperties": true,
-                                        "description": "{reference_id, criterion, polarity, composite}"
-                                      }
-                                    },
-                                    "ask": {"type": "boolean"},
-                                    "refine": {"type": "boolean"},
-                                    "verify": {"type": "boolean"},
-                                    "note": {"type": ["string", "null"]}
-                                  }
-                                },
-                                "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                              }
-                            }
-                          }
-                        ]
-                      },
-                      "options_used": {
-                        "type": "object",
-                        "additionalProperties": true,
-                        "description": "Options after defaults and caps, `aggregate` resolved — the keys of the type's options (GET /criterion-types `types.<type>.defaults`)"
-                      },
-                      "error": {"type": ["string", "null"]},
-                      "complete": {
-                        "type": "boolean",
-                        "description": "false when any of its units errored"
-                      },
-                      "aggregate_used": {
-                        "type": "object",
-                        "description": "The rules applied; `pages: null` plus a `note` for a document-scope text criterion",
-                        "additionalProperties": false,
-                        "required": ["pages", "documents"],
-                        "properties": {
-                          "pages": {"type": ["string", "null"]},
-                          "documents": {"type": "string"},
-                          "note": {"type": "string"}
-                        }
-                      },
-                      "items": {
-                        "type": "array",
-                        "items": {
-                          "type": "object",
-                          "description": "One unit: one item (or, document scope, one document)",
-                          "additionalProperties": false,
-                          "required": [
-                            "item",
-                            "document",
-                            "page",
-                            "status",
-                            "score",
-                            "verdict",
-                            "confidence",
-                            "reason",
-                            "detail",
-                            "error",
-                            "regions",
-                            "text_layer"
-                          ],
-                          "properties": {
-                            "item": {
-                              "type": ["integer", "null"],
-                              "description": "The global item; null for a document-scope unit"
-                            },
-                            "document": {"type": "integer", "minimum": 0},
-                            "page": {
-                              "type": ["integer", "null"],
-                              "description": "Within its document; null for a document-scope unit"
-                            },
-                            "items": {
-                              "type": "array",
-                              "items": {"type": "integer"},
-                              "description": "Document scope: the items it searched"
-                            },
-                            "status": {"enum": ["ok", "error", "skipped"]},
-                            "score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                            "verdict": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                              ]
-                            },
-                            "confidence": {
-                              "type": ["integer", "null"],
-                              "minimum": 0,
-                              "maximum": 100
-                            },
-                            "reason": {"type": "string"},
-                            "detail": {
-                              "description": "The criterion's method's detail (see the criterion)"
-                            },
-                            "error": {"type": ["string", "null"]},
-                            "regions": {
-                              "type": "integer",
-                              "minimum": 0,
-                              "description": "A COUNT of the unit's regions (the geometry is the criterion's `regions`)"
-                            },
-                            "text_layer": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "type": "object",
-                                  "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                  "additionalProperties": false,
-                                  "required": ["key", "url", "source", "chars"],
-                                  "properties": {
-                                    "item": {"type": "integer"},
-                                    "document": {"type": "integer"},
-                                    "key": {"type": "string"},
-                                    "url": {"type": "string"},
-                                    "source": {"type": "string"},
-                                    "chars": {"type": "integer", "minimum": 0}
-                                  }
-                                }
-                              ]
-                            },
-                            "localization": {
-                              "type": "object",
-                              "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                              "additionalProperties": false,
-                              "required": ["attempts", "accepted_attempt", "calls"],
-                              "properties": {
-                                "attempts": {
-                                  "type": "array",
-                                  "items": {
-                                    "type": "object",
-                                    "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "attempt",
-                                      "bbox_grid",
-                                      "bbox_px",
-                                      "valid",
-                                      "accepted"
-                                    ],
-                                    "properties": {
-                                      "item": {
-                                        "type": "integer",
-                                        "description": "Present when the record merges several items"
-                                      },
-                                      "attempt": {"type": "integer", "minimum": 1},
-                                      "bbox_grid": {
-                                        "anyOf": [
-                                          {"type": "null"},
-                                          {
-                                            "type": "array",
-                                            "items": {"type": "number"},
-                                            "minItems": 4,
-                                            "maxItems": 4
-                                          }
-                                        ]
-                                      },
-                                      "bbox_px": {
-                                        "anyOf": [
-                                          {"type": "null"},
-                                          {
-                                            "type": "array",
-                                            "items": {"type": "number"},
-                                            "minItems": 4,
-                                            "maxItems": 4
-                                          }
-                                        ]
-                                      },
-                                      "valid": {"type": "boolean"},
-                                      "accepted": {"type": "boolean"},
-                                      "reject": {
-                                        "type": "string",
-                                        "description": "Why the box was rejected (the retry's feedback)"
-                                      },
-                                      "verify_score": {"type": "integer"},
-                                      "verify_reason": {"type": "string"},
-                                      "verify_partial": {"type": "boolean"},
-                                      "detector_iou": {"type": "number"},
-                                      "coarse_bbox_grid": {
-                                        "type": "array",
-                                        "items": {"type": "number"}
-                                      },
-                                      "refine_window_grid": {
-                                        "anyOf": [
-                                          {"type": "null"},
-                                          {
-                                            "type": "array",
-                                            "items": {"type": "number"}
-                                          }
-                                        ]
-                                      },
-                                      "refined": {"type": "boolean"},
-                                      "refine_reject": {"type": "string"},
-                                      "refine_mode": {"enum": ["marks", "grid"]},
-                                      "marks_shown": {"type": "integer"},
-                                      "marks_lines": {"enum": ["native", "ocr", "window"]},
-                                      "marks": {
-                                        "type": "array",
-                                        "items": {"type": "integer"}
-                                      },
-                                      "marks_fallback": {"type": "string"}
-                                    }
-                                  }
-                                },
-                                "accepted_attempt": {"type": ["integer", "null"]},
-                                "calls": {"type": "integer", "minimum": 0},
-                                "accepted": {
-                                  "type": "array",
-                                  "items": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["item", "attempt"],
-                                    "properties": {
-                                      "item": {"type": "integer"},
-                                      "attempt": {"type": "integer"}
-                                    }
-                                  },
-                                  "description": "Merged records: each accepted box"
-                                },
-                                "references": {
-                                  "type": "array",
-                                  "items": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "item",
-                                      "applied",
-                                      "ask_images",
-                                      "examples",
-                                      "ask",
-                                      "refine",
-                                      "verify",
-                                      "note"
-                                    ],
-                                    "properties": {
-                                      "item": {"type": "integer"},
-                                      "applied": {"type": "boolean"},
-                                      "ask_images": {
-                                        "anyOf": [
-                                          {"type": "null"},
-                                          {"enum": ["composite", "crop"]}
-                                        ]
-                                      },
-                                      "examples": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "additionalProperties": true,
-                                          "description": "{reference_id, criterion, polarity, composite}"
-                                        }
-                                      },
-                                      "ask": {"type": "boolean"},
-                                      "refine": {"type": "boolean"},
-                                      "verify": {"type": "boolean"},
-                                      "note": {"type": ["string", "null"]}
-                                    }
-                                  },
-                                  "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                }
-                              }
-                            }
-                          }
-                        },
-                        "description": "One entry per unit"
-                      }
-                    },
-                    "allOf": [
-                      {
-                        "if": {
-                          "properties": {
-                            "method": {"const": "llm"}
-                          },
-                          "required": ["method"]
-                        },
-                        "then": {
-                          "properties": {
-                            "detail": {
-                              "description": "An `llm` detail, or null (skipped, errored)",
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "if": {
-                                    "properties": {
-                                      "aggregate": {
-                                        "properties": {
-                                          "rule": {"const": "mean"}
-                                        },
-                                        "required": ["rule"]
-                                      }
-                                    },
-                                    "required": ["aggregate"]
-                                  },
-                                  "then": {
-                                    "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "hint",
-                                      "model",
-                                      "image_sent",
-                                      "aggregate"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": ["number", "null"],
-                                        "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                      },
-                                      "hint": {
-                                        "type": "string",
-                                        "description": "The rubric the model was asked to use"
-                                      },
-                                      "model": {
-                                        "type": "string",
-                                        "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                      },
-                                      "image_sent": {
-                                        "type": "boolean",
-                                        "description": "Whether the page image was attached (never, for a text-only model)"
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail`",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "else": {
-                                    "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `llm` criterion",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "hint",
-                                      "model",
-                                      "image_sent",
-                                      "text_sent",
-                                      "confidence"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": ["number", "null"],
-                                        "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                      },
-                                      "hint": {
-                                        "type": "string",
-                                        "description": "The rubric the model was asked to use"
-                                      },
-                                      "model": {
-                                        "type": "string",
-                                        "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                      },
-                                      "image_sent": {
-                                        "type": "boolean",
-                                        "description": "Whether the page image was attached (never, for a text-only model)"
-                                      },
-                                      "text_sent": {
-                                        "type": "object",
-                                        "description": "The text attached: `{chars, truncated, budget, source}`",
-                                        "additionalProperties": true
-                                      },
-                                      "confidence": {
-                                        "type": ["object", "null"],
-                                        "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                        "additionalProperties": true
-                                      },
-                                      "reference": {
-                                        "type": "object",
-                                        "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                        "additionalProperties": true
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "properties": {
-                                    "aggregate": {
-                                      "type": "object",
-                                      "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                      "additionalProperties": false,
-                                      "required": ["rule", "level", "from", "values"],
-                                      "properties": {
-                                        "rule": {"enum": ["any", "worst", "all", "mean", "sum"]},
-                                        "level": {"enum": ["pages", "documents"]},
-                                        "from": {
-                                          "type": ["string", "null"],
-                                          "description": "The member whose detail this is (any / worst)"
-                                        },
-                                        "values": {
-                                          "type": "object",
-                                          "additionalProperties": {"type": ["number", "null"]},
-                                          "description": "Each member's value, by member label (`item n` / `document n`)"
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              ]
-                            },
-                            "items": {
-                              "items": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `llm` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "hint",
-                                            "model",
-                                            "image_sent",
-                                            "aggregate"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": ["number", "null"],
-                                              "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                            },
-                                            "hint": {
-                                              "type": "string",
-                                              "description": "The rubric the model was asked to use"
-                                            },
-                                            "model": {
-                                              "type": "string",
-                                              "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                            },
-                                            "image_sent": {
-                                              "type": "boolean",
-                                              "description": "Whether the page image was attached (never, for a text-only model)"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `llm` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "hint",
-                                            "model",
-                                            "image_sent",
-                                            "text_sent",
-                                            "confidence"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": ["number", "null"],
-                                              "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                            },
-                                            "hint": {
-                                              "type": "string",
-                                              "description": "The rubric the model was asked to use"
-                                            },
-                                            "model": {
-                                              "type": "string",
-                                              "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                            },
-                                            "image_sent": {
-                                              "type": "boolean",
-                                              "description": "Whether the page image was attached (never, for a text-only model)"
-                                            },
-                                            "text_sent": {
-                                              "type": "object",
-                                              "description": "The text attached: `{chars, truncated, budget, source}`",
-                                              "additionalProperties": true
-                                            },
-                                            "confidence": {
-                                              "type": ["object", "null"],
-                                              "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                              "additionalProperties": true
-                                            },
-                                            "reference": {
-                                              "type": "object",
-                                              "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                              "additionalProperties": true
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    ]
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      },
-                      {
-                        "if": {
-                          "properties": {
-                            "method": {"const": "text"}
-                          },
-                          "required": ["method"]
-                        },
-                        "then": {
-                          "properties": {
-                            "detail": {
-                              "description": "An `text` detail, or null (skipped, errored)",
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "if": {
-                                    "properties": {
-                                      "aggregate": {
-                                        "properties": {
-                                          "rule": {"const": "mean"}
-                                        },
-                                        "required": ["rule"]
-                                      }
-                                    },
-                                    "required": ["aggregate"]
-                                  },
-                                  "then": {
-                                    "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "mode",
-                                      "pattern",
-                                      "case_sensitive",
-                                      "min_count",
-                                      "fuzzy_threshold",
-                                      "aggregate"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": "number",
-                                        "description": "The headline number (the mean of the members' values under `mean`)"
-                                      },
-                                      "mode": {
-                                        "type": "string",
-                                        "description": "The match mode used"
-                                      },
-                                      "pattern": {
-                                        "type": "string",
-                                        "description": "What was searched for"
-                                      },
-                                      "case_sensitive": {
-                                        "type": "boolean",
-                                        "description": "Whether matching was case-sensitive"
-                                      },
-                                      "min_count": {
-                                        "type": "integer",
-                                        "description": "Hits required to PASS"
-                                      },
-                                      "fuzzy_threshold": {
-                                        "type": ["number", "null"],
-                                        "description": "Similarity a fuzzy window must reach; null for other modes"
-                                      },
-                                      "scope": {
-                                        "type": "string",
-                                        "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                      },
-                                      "separator": {
-                                        "type": "string",
-                                        "description": "What joined the pages (present only when options.scope is document)"
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail`",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "else": {
-                                    "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `text` criterion",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "found",
-                                      "count",
-                                      "best_ratio",
-                                      "mode",
-                                      "pattern",
-                                      "snippets",
-                                      "searched_chars",
-                                      "case_sensitive",
-                                      "min_count",
-                                      "fuzzy_threshold",
-                                      "text_source"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": "number",
-                                        "description": "The headline number (the mean of the members' values under `mean`)"
-                                      },
-                                      "found": {
-                                        "type": "boolean",
-                                        "description": "Whether count reached min_count"
-                                      },
-                                      "count": {
-                                        "type": "integer",
-                                        "description": "Hits found (summed across members under `sum`)"
-                                      },
-                                      "best_ratio": {
-                                        "type": "number",
-                                        "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                      },
-                                      "mode": {
-                                        "type": "string",
-                                        "description": "The match mode used"
-                                      },
-                                      "pattern": {
-                                        "type": "string",
-                                        "description": "What was searched for"
-                                      },
-                                      "snippets": {
-                                        "type": "array",
-                                        "description": "Up to 8 context excerpts around the hits"
-                                      },
-                                      "searched_chars": {
-                                        "type": "integer",
-                                        "description": "Characters searched"
-                                      },
-                                      "case_sensitive": {
-                                        "type": "boolean",
-                                        "description": "Whether matching was case-sensitive"
-                                      },
-                                      "min_count": {
-                                        "type": "integer",
-                                        "description": "Hits required to PASS"
-                                      },
-                                      "fuzzy_threshold": {
-                                        "type": ["number", "null"],
-                                        "description": "Similarity a fuzzy window must reach; null for other modes"
-                                      },
-                                      "text_source": {
-                                        "type": "string",
-                                        "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                      },
-                                      "scope": {
-                                        "type": "string",
-                                        "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                      },
-                                      "separator": {
-                                        "type": "string",
-                                        "description": "What joined the pages (present only when options.scope is document)"
-                                      },
-                                      "items_with_hits": {
-                                        "type": "array",
-                                        "description": "Items the hits landed on (present only when options.scope is document)"
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "properties": {
-                                    "aggregate": {
-                                      "type": "object",
-                                      "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                      "additionalProperties": false,
-                                      "required": ["rule", "level", "from", "values"],
-                                      "properties": {
-                                        "rule": {"enum": ["any", "worst", "all", "mean", "sum"]},
-                                        "level": {"enum": ["pages", "documents"]},
-                                        "from": {
-                                          "type": ["string", "null"],
-                                          "description": "The member whose detail this is (any / worst)"
-                                        },
-                                        "values": {
-                                          "type": "object",
-                                          "additionalProperties": {"type": ["number", "null"]},
-                                          "description": "Each member's value, by member label (`item n` / `document n`)"
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              ]
-                            },
-                            "items": {
-                              "items": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `text` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "mode",
-                                            "pattern",
-                                            "case_sensitive",
-                                            "min_count",
-                                            "fuzzy_threshold",
-                                            "aggregate"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "mode": {
-                                              "type": "string",
-                                              "description": "The match mode used"
-                                            },
-                                            "pattern": {
-                                              "type": "string",
-                                              "description": "What was searched for"
-                                            },
-                                            "case_sensitive": {
-                                              "type": "boolean",
-                                              "description": "Whether matching was case-sensitive"
-                                            },
-                                            "min_count": {
-                                              "type": "integer",
-                                              "description": "Hits required to PASS"
-                                            },
-                                            "fuzzy_threshold": {
-                                              "type": ["number", "null"],
-                                              "description": "Similarity a fuzzy window must reach; null for other modes"
-                                            },
-                                            "scope": {
-                                              "type": "string",
-                                              "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                            },
-                                            "separator": {
-                                              "type": "string",
-                                              "description": "What joined the pages (present only when options.scope is document)"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `text` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "found",
-                                            "count",
-                                            "best_ratio",
-                                            "mode",
-                                            "pattern",
-                                            "snippets",
-                                            "searched_chars",
-                                            "case_sensitive",
-                                            "min_count",
-                                            "fuzzy_threshold",
-                                            "text_source"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "found": {
-                                              "type": "boolean",
-                                              "description": "Whether count reached min_count"
-                                            },
-                                            "count": {
-                                              "type": "integer",
-                                              "description": "Hits found (summed across members under `sum`)"
-                                            },
-                                            "best_ratio": {
-                                              "type": "number",
-                                              "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                            },
-                                            "mode": {
-                                              "type": "string",
-                                              "description": "The match mode used"
-                                            },
-                                            "pattern": {
-                                              "type": "string",
-                                              "description": "What was searched for"
-                                            },
-                                            "snippets": {
-                                              "type": "array",
-                                              "description": "Up to 8 context excerpts around the hits"
-                                            },
-                                            "searched_chars": {
-                                              "type": "integer",
-                                              "description": "Characters searched"
-                                            },
-                                            "case_sensitive": {
-                                              "type": "boolean",
-                                              "description": "Whether matching was case-sensitive"
-                                            },
-                                            "min_count": {
-                                              "type": "integer",
-                                              "description": "Hits required to PASS"
-                                            },
-                                            "fuzzy_threshold": {
-                                              "type": ["number", "null"],
-                                              "description": "Similarity a fuzzy window must reach; null for other modes"
-                                            },
-                                            "text_source": {
-                                              "type": "string",
-                                              "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                            },
-                                            "scope": {
-                                              "type": "string",
-                                              "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                            },
-                                            "separator": {
-                                              "type": "string",
-                                              "description": "What joined the pages (present only when options.scope is document)"
-                                            },
-                                            "items_with_hits": {
-                                              "type": "array",
-                                              "description": "Items the hits landed on (present only when options.scope is document)"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    ]
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      },
-                      {
-                        "if": {
-                          "properties": {
-                            "method": {"const": "detector"}
-                          },
-                          "required": ["method"]
-                        },
-                        "then": {
-                          "properties": {
-                            "detail": {
-                              "description": "An `detector` detail, or null (skipped, errored)",
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "if": {
-                                    "properties": {
-                                      "aggregate": {
-                                        "properties": {
-                                          "rule": {"const": "mean"}
-                                        },
-                                        "required": ["rule"]
-                                      }
-                                    },
-                                    "required": ["aggregate"]
-                                  },
-                                  "then": {
-                                    "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                    "additionalProperties": false,
-                                    "required": ["metric", "value", "min_score", "aggregate"],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": "number",
-                                        "description": "The headline number (the mean of the members' values under `mean`)"
-                                      },
-                                      "min_score": {
-                                        "type": "number",
-                                        "description": "The confidence floor used"
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail`",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "else": {
-                                    "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `detector` criterion",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "detector_matches",
-                                      "best_score",
-                                      "min_score"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": "number",
-                                        "description": "The headline number (the mean of the members' values under `mean`)"
-                                      },
-                                      "detector_matches": {
-                                        "type": "integer",
-                                        "description": "Boxes found at or above min_score"
-                                      },
-                                      "best_score": {
-                                        "type": "number",
-                                        "description": "The best box's confidence, 0-1; 0 when none"
-                                      },
-                                      "min_score": {
-                                        "type": "number",
-                                        "description": "The confidence floor used"
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "properties": {
-                                    "aggregate": {
-                                      "type": "object",
-                                      "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                      "additionalProperties": false,
-                                      "required": ["rule", "level", "from", "values"],
-                                      "properties": {
-                                        "rule": {"enum": ["any", "worst", "all", "mean", "sum"]},
-                                        "level": {"enum": ["pages", "documents"]},
-                                        "from": {
-                                          "type": ["string", "null"],
-                                          "description": "The member whose detail this is (any / worst)"
-                                        },
-                                        "values": {
-                                          "type": "object",
-                                          "additionalProperties": {"type": ["number", "null"]},
-                                          "description": "Each member's value, by member label (`item n` / `document n`)"
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              ]
-                            },
-                            "items": {
-                              "items": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `detector` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": ["metric", "value", "min_score", "aggregate"],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "min_score": {
-                                              "type": "number",
-                                              "description": "The confidence floor used"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `detector` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "detector_matches",
-                                            "best_score",
-                                            "min_score"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "detector_matches": {
-                                              "type": "integer",
-                                              "description": "Boxes found at or above min_score"
-                                            },
-                                            "best_score": {
-                                              "type": "number",
-                                              "description": "The best box's confidence, 0-1; 0 when none"
-                                            },
-                                            "min_score": {
-                                              "type": "number",
-                                              "description": "The confidence floor used"
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    ]
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      },
-                      {
-                        "if": {
-                          "properties": {
-                            "method": {"const": "cv"}
-                          },
-                          "required": ["method"]
-                        },
-                        "then": {
-                          "properties": {
-                            "detail": {
-                              "description": "An `cv` detail, or null (skipped, errored)",
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "if": {
-                                    "properties": {
-                                      "aggregate": {
-                                        "properties": {
-                                          "rule": {"const": "mean"}
-                                        },
-                                        "required": ["rule"]
-                                      }
-                                    },
-                                    "required": ["aggregate"]
-                                  },
-                                  "then": {
-                                    "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "detector",
-                                      "thresholds",
-                                      "parameters",
-                                      "image",
-                                      "aggregate"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": "number",
-                                        "description": "The headline number (the mean of the members' values under `mean`)"
-                                      },
-                                      "detector": {
-                                        "type": "string",
-                                        "description": "The OpenCV function that ran"
-                                      },
-                                      "thresholds": {
-                                        "type": "object",
-                                        "description": "The lines that decide the verdict",
-                                        "additionalProperties": true
-                                      },
-                                      "parameters": {
-                                        "type": "object",
-                                        "description": "Config values it measured with",
-                                        "additionalProperties": true
-                                      },
-                                      "image": {
-                                        "type": "object",
-                                        "description": "The working-image frame the *_px measurements are in",
-                                        "additionalProperties": true
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail`",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "else": {
-                                    "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                    "type": "object",
-                                    "description": "`detail` of a `cv` criterion",
-                                    "additionalProperties": false,
-                                    "required": [
-                                      "metric",
-                                      "value",
-                                      "detector",
-                                      "measurements",
-                                      "thresholds",
-                                      "parameters",
-                                      "image"
-                                    ],
-                                    "properties": {
-                                      "metric": {
-                                        "type": "string",
-                                        "description": "Name of the headline number"
-                                      },
-                                      "value": {
-                                        "type": "number",
-                                        "description": "The headline number (the mean of the members' values under `mean`)"
-                                      },
-                                      "detector": {
-                                        "type": "string",
-                                        "description": "The OpenCV function that ran"
-                                      },
-                                      "measurements": {
-                                        "type": "object",
-                                        "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                        "additionalProperties": true
-                                      },
-                                      "thresholds": {
-                                        "type": "object",
-                                        "description": "The lines that decide the verdict",
-                                        "additionalProperties": true
-                                      },
-                                      "parameters": {
-                                        "type": "object",
-                                        "description": "Config values it measured with",
-                                        "additionalProperties": true
-                                      },
-                                      "state": {
-                                        "type": "string",
-                                        "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                      },
-                                      "image": {
-                                        "type": "object",
-                                        "description": "The working-image frame the *_px measurements are in",
-                                        "additionalProperties": true
-                                      },
-                                      "aggregate": {
-                                        "type": "object",
-                                        "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                        "additionalProperties": true
-                                      }
-                                    }
-                                  },
-                                  "properties": {
-                                    "aggregate": {
-                                      "type": "object",
-                                      "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                      "additionalProperties": false,
-                                      "required": ["rule", "level", "from", "values"],
-                                      "properties": {
-                                        "rule": {"enum": ["any", "worst", "all", "mean", "sum"]},
-                                        "level": {"enum": ["pages", "documents"]},
-                                        "from": {
-                                          "type": ["string", "null"],
-                                          "description": "The member whose detail this is (any / worst)"
-                                        },
-                                        "values": {
-                                          "type": "object",
-                                          "additionalProperties": {"type": ["number", "null"]},
-                                          "description": "Each member's value, by member label (`item n` / `document n`)"
-                                        }
-                                      }
-                                    }
-                                  },
-                                  "allOf": [
-                                    {
-                                      "$comment": "generated from cv.REGISTRY — do not edit",
-                                      "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                      "properties": {
-                                        "detector": {
-                                          "enum": [
-                                            "check_blur",
-                                            "check_exposure",
-                                            "detect_faces",
-                                            "detect_sky",
-                                            "detect_text",
-                                            "detect_vegetation",
-                                            "detect_water"
-                                          ]
-                                        }
-                                      },
-                                      "allOf": [
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "check_blur"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (Laplacian variance)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "laplacian_variance": {
-                                                    "type": "number",
-                                                    "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        },
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "check_exposure"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "mean_intensity": {
-                                                    "type": "number",
-                                                    "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        },
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "detect_faces"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "faces_count": {
-                                                    "type": "number",
-                                                    "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                  },
-                                                  "faces_high_count": {
-                                                    "type": "number",
-                                                    "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                  },
-                                                  "faces_low_count": {
-                                                    "type": "number",
-                                                    "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        },
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "detect_sky"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "sky_ratio": {
-                                                    "type": "number",
-                                                    "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                  },
-                                                  "sky_px": {
-                                                    "type": "number",
-                                                    "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                  },
-                                                  "blue_px": {
-                                                    "type": "number",
-                                                    "description": "Pixels matching the clear-blue range (unit: px)"
-                                                  },
-                                                  "grey_px": {
-                                                    "type": "number",
-                                                    "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                  },
-                                                  "analysed_px": {
-                                                    "type": "number",
-                                                    "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        },
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "detect_text"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.features.detect_text — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "dense_block_ratio": {
-                                                    "type": "number",
-                                                    "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                  },
-                                                  "dense_blocks_count": {
-                                                    "type": "number",
-                                                    "description": "Blocks above block_density (unit: count)"
-                                                  },
-                                                  "total_blocks_count": {
-                                                    "type": "number",
-                                                    "description": "Blocks the page was divided into (unit: count)"
-                                                  },
-                                                  "text_regions_count": {
-                                                    "type": "number",
-                                                    "description": "Merged text regions returned as boxes (unit: count)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        },
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "detect_vegetation"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (HSV green masking)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "green_ratio": {
-                                                    "type": "number",
-                                                    "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                  },
-                                                  "green_px": {
-                                                    "type": "number",
-                                                    "description": "Pixels inside the green mask (unit: px)"
-                                                  },
-                                                  "total_px": {
-                                                    "type": "number",
-                                                    "description": "Pixels in the page (unit: px)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        },
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "detector": {"const": "detect_water"}
-                                            },
-                                            "required": ["detector"]
-                                          },
-                                          "then": {
-                                            "properties": {
-                                              "measurements": {
-                                                "$comment": "generated from cv.features.detect_water — do not edit",
-                                                "type": "object",
-                                                "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                "additionalProperties": false,
-                                                "properties": {
-                                                  "water_ratio": {
-                                                    "type": "number",
-                                                    "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                  },
-                                                  "water_px": {
-                                                    "type": "number",
-                                                    "description": "Area of those qualifying blobs (unit: px)"
-                                                  },
-                                                  "total_px": {
-                                                    "type": "number",
-                                                    "description": "Pixels in the page (unit: px)"
-                                                  },
-                                                  "blue_blobs_count": {
-                                                    "type": "number",
-                                                    "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                  },
-                                                  "candidates_count": {
-                                                    "type": "number",
-                                                    "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                  },
-                                                  "flat_count": {
-                                                    "type": "number",
-                                                    "description": "Candidates flat enough to be water (unit: count)"
-                                                  },
-                                                  "rejected_textured_count": {
-                                                    "type": "number",
-                                                    "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      ]
-                                    }
-                                  ]
-                                }
-                              ]
-                            },
-                            "items": {
-                              "items": {
-                                "properties": {
-                                  "detail": {
-                                    "description": "An `cv` detail, or null (skipped, errored)",
-                                    "anyOf": [
-                                      {"type": "null"},
-                                      {
-                                        "if": {
-                                          "properties": {
-                                            "aggregate": {
-                                              "properties": {
-                                                "rule": {"const": "mean"}
-                                              },
-                                              "required": ["rule"]
-                                            }
-                                          },
-                                          "required": ["aggregate"]
-                                        },
-                                        "then": {
-                                          "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "detector",
-                                            "thresholds",
-                                            "parameters",
-                                            "image",
-                                            "aggregate"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "detector": {
-                                              "type": "string",
-                                              "description": "The OpenCV function that ran"
-                                            },
-                                            "thresholds": {
-                                              "type": "object",
-                                              "description": "The lines that decide the verdict",
-                                              "additionalProperties": true
-                                            },
-                                            "parameters": {
-                                              "type": "object",
-                                              "description": "Config values it measured with",
-                                              "additionalProperties": true
-                                            },
-                                            "image": {
-                                              "type": "object",
-                                              "description": "The working-image frame the *_px measurements are in",
-                                              "additionalProperties": true
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail`",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "else": {
-                                          "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                          "type": "object",
-                                          "description": "`detail` of a `cv` criterion",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "metric",
-                                            "value",
-                                            "detector",
-                                            "measurements",
-                                            "thresholds",
-                                            "parameters",
-                                            "image"
-                                          ],
-                                          "properties": {
-                                            "metric": {
-                                              "type": "string",
-                                              "description": "Name of the headline number"
-                                            },
-                                            "value": {
-                                              "type": "number",
-                                              "description": "The headline number (the mean of the members' values under `mean`)"
-                                            },
-                                            "detector": {
-                                              "type": "string",
-                                              "description": "The OpenCV function that ran"
-                                            },
-                                            "measurements": {
-                                              "type": "object",
-                                              "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                              "additionalProperties": true
-                                            },
-                                            "thresholds": {
-                                              "type": "object",
-                                              "description": "The lines that decide the verdict",
-                                              "additionalProperties": true
-                                            },
-                                            "parameters": {
-                                              "type": "object",
-                                              "description": "Config values it measured with",
-                                              "additionalProperties": true
-                                            },
-                                            "state": {
-                                              "type": "string",
-                                              "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                            },
-                                            "image": {
-                                              "type": "object",
-                                              "description": "The working-image frame the *_px measurements are in",
-                                              "additionalProperties": true
-                                            },
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                              "additionalProperties": true
-                                            }
-                                          }
-                                        },
-                                        "properties": {
-                                          "aggregate": {
-                                            "type": "object",
-                                            "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                            "additionalProperties": false,
-                                            "required": ["rule", "level", "from", "values"],
-                                            "properties": {
-                                              "rule": {
-                                                "enum": ["any", "worst", "all", "mean", "sum"]
-                                              },
-                                              "level": {"enum": ["pages", "documents"]},
-                                              "from": {
-                                                "type": ["string", "null"],
-                                                "description": "The member whose detail this is (any / worst)"
-                                              },
-                                              "values": {
-                                                "type": "object",
-                                                "additionalProperties": {"type": ["number", "null"]},
-                                                "description": "Each member's value, by member label (`item n` / `document n`)"
-                                              }
-                                            }
-                                          }
-                                        },
-                                        "allOf": [
-                                          {
-                                            "$comment": "generated from cv.REGISTRY — do not edit",
-                                            "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                            "properties": {
-                                              "detector": {
-                                                "enum": [
-                                                  "check_blur",
-                                                  "check_exposure",
-                                                  "detect_faces",
-                                                  "detect_sky",
-                                                  "detect_text",
-                                                  "detect_vegetation",
-                                                  "detect_water"
-                                                ]
-                                              }
-                                            },
-                                            "allOf": [
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "check_blur"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Laplacian variance)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "laplacian_variance": {
-                                                          "type": "number",
-                                                          "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "check_exposure"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "mean_intensity": {
-                                                          "type": "number",
-                                                          "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_faces"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "faces_count": {
-                                                          "type": "number",
-                                                          "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                        },
-                                                        "faces_high_count": {
-                                                          "type": "number",
-                                                          "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                        },
-                                                        "faces_low_count": {
-                                                          "type": "number",
-                                                          "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_sky"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "sky_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                        },
-                                                        "sky_px": {
-                                                          "type": "number",
-                                                          "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                        },
-                                                        "blue_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels matching the clear-blue range (unit: px)"
-                                                        },
-                                                        "grey_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                        },
-                                                        "analysed_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_text"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_text — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "dense_block_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                        },
-                                                        "dense_blocks_count": {
-                                                          "type": "number",
-                                                          "description": "Blocks above block_density (unit: count)"
-                                                        },
-                                                        "total_blocks_count": {
-                                                          "type": "number",
-                                                          "description": "Blocks the page was divided into (unit: count)"
-                                                        },
-                                                        "text_regions_count": {
-                                                          "type": "number",
-                                                          "description": "Merged text regions returned as boxes (unit: count)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_vegetation"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (HSV green masking)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "green_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                        },
-                                                        "green_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels inside the green mask (unit: px)"
-                                                        },
-                                                        "total_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels in the page (unit: px)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              },
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "detector": {"const": "detect_water"}
-                                                  },
-                                                  "required": ["detector"]
-                                                },
-                                                "then": {
-                                                  "properties": {
-                                                    "measurements": {
-                                                      "$comment": "generated from cv.features.detect_water — do not edit",
-                                                      "type": "object",
-                                                      "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                      "additionalProperties": false,
-                                                      "properties": {
-                                                        "water_ratio": {
-                                                          "type": "number",
-                                                          "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                        },
-                                                        "water_px": {
-                                                          "type": "number",
-                                                          "description": "Area of those qualifying blobs (unit: px)"
-                                                        },
-                                                        "total_px": {
-                                                          "type": "number",
-                                                          "description": "Pixels in the page (unit: px)"
-                                                        },
-                                                        "blue_blobs_count": {
-                                                          "type": "number",
-                                                          "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                        },
-                                                        "candidates_count": {
-                                                          "type": "number",
-                                                          "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                        },
-                                                        "flat_count": {
-                                                          "type": "number",
-                                                          "description": "Candidates flat enough to be water (unit: count)"
-                                                        },
-                                                        "rejected_textured_count": {
-                                                          "type": "number",
-                                                          "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          }
-                                        ]
-                                      }
-                                    ]
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      },
-                      {
-                        "if": {
-                          "properties": {
-                            "method": {"type": "null"}
-                          },
-                          "required": ["method"]
-                        },
-                        "then": {
-                          "properties": {
-                            "detail": {"type": "null"}
-                          }
-                        }
-                      }
-                    ]
-                  },
-                  "description": "By criterion name, in request order"
-                }
-              }
-            },
-            "verdict": {
-              "anyOf": [
-                {"type": "null"},
-                {"enum": ["PASS", "MARGINAL", "FAIL"]}
-              ]
-            },
-            "page_geometry": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["item", "page", "width", "height", "working_scale", "pdf_points"],
-                "properties": {
-                  "item": {"type": "integer"},
-                  "page": {"type": "integer", "description": "Equals `item`"},
-                  "width": {"type": ["integer", "null"]},
-                  "height": {"type": ["integer", "null"]},
-                  "working_scale": {"type": ["number", "null"]},
-                  "pdf_points": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2
-                      }
-                    ]
-                  }
-                }
-              },
-              "description": "One per item; nulls for an item with no page image"
-            },
-            "detector": {
-              "type": "object",
-              "description": "What the open-vocabulary detector did for the whole job",
-              "additionalProperties": false,
-              "required": [
-                "configured",
-                "url_host",
-                "min_score",
-                "timeout_seconds",
-                "max_labels_per_call",
-                "model",
-                "device",
-                "calls",
-                "labels",
-                "detections",
-                "elapsed_ms",
-                "errors",
-                "used"
-              ],
-              "properties": {
-                "configured": {"type": "boolean"},
-                "url_host": {"type": ["string", "null"]},
-                "min_score": {"type": "number"},
-                "timeout_seconds": {"type": "number"},
-                "max_labels_per_call": {"type": "integer"},
-                "model": {"type": ["string", "null"]},
-                "device": {"type": ["string", "null"]},
-                "calls": {"type": "integer", "minimum": 0},
-                "labels": {"type": "integer", "minimum": 0},
-                "detections": {"type": "integer", "minimum": 0},
-                "elapsed_ms": {"type": "number", "minimum": 0},
-                "errors": {
-                  "type": "array",
-                  "items": {"type": "string"}
-                },
-                "used": {"type": "boolean"}
-              }
-            },
-            "artifacts": {
-              "anyOf": [
-                {"type": "null"},
-                {
-                  "type": "object",
-                  "description": "The job's artifact directory",
-                  "additionalProperties": false,
-                  "required": [
-                    "dir",
-                    "files",
-                    "items",
-                    "zip_url",
-                    "total_bytes",
-                    "expires_at",
-                    "dropped",
-                    "notes"
-                  ],
-                  "properties": {
-                    "dir": {"type": "string"},
-                    "files": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
-                        "additionalProperties": false,
-                        "required": [
-                          "name",
-                          "bytes",
-                          "content_type",
-                          "url",
-                          "kind",
-                          "item",
-                          "document",
-                          "criteria"
-                        ],
-                        "properties": {
-                          "name": {"type": "string"},
-                          "bytes": {"type": "integer", "minimum": 0},
-                          "content_type": {"type": "string"},
-                          "url": {"type": "string"},
-                          "kind": {
-                            "type": "string",
-                            "description": "What the file is: base image, layer, regions, text, manifest, references"
-                          },
-                          "format": {"type": "string"},
-                          "item": {"type": ["integer", "null"]},
-                          "document": {"type": ["integer", "null"]},
-                          "criteria": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "The criteria the file belongs to"
-                          }
-                        }
-                      }
-                    },
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["item", "layers"],
-                        "properties": {
-                          "item": {"type": "integer"},
-                          "layers": {
-                            "type": "object",
-                            "description": "Layer URLs (rendered on first fetch)",
-                            "additionalProperties": false,
-                            "required": [],
-                            "properties": {
-                              "svg": {"type": "string"},
-                              "png": {"type": "string"},
-                              "preview": {"type": "string"}
-                            }
-                          }
-                        }
-                      },
-                      "description": "Each item with a page image: its combined layer URLs"
-                    },
-                    "zip_url": {"type": "string"},
-                    "total_bytes": {"type": "integer", "minimum": 0},
-                    "expires_at": {"type": "string", "format": "date-time"},
-                    "dropped": {
-                      "type": "array",
-                      "items": {"type": "string"},
-                      "description": "Files the byte cap removed"
-                    },
-                    "notes": {
-                      "type": "array",
-                      "items": {"type": "string"}
-                    }
-                  }
-                }
-              ]
-            },
-            "references": {
-              "anyOf": [
-                {"type": "null"},
-                {
-                  "type": "object",
-                  "description": "What the request's references did (§ Result shape, `references`)",
-                  "additionalProperties": false,
-                  "required": [
-                    "mode",
-                    "requested",
-                    "pool",
-                    "pool_truncated",
-                    "resolved",
-                    "inherited",
-                    "criteria",
-                    "selection",
-                    "calls",
-                    "selection_calls"
-                  ],
-                  "properties": {
-                    "mode": {"enum": ["explicit", "auto"]},
-                    "requested": {"description": "The ids (or the auto request) as sent"},
-                    "pool": {
-                      "anyOf": [
-                        {"type": "null"},
-                        {
-                          "type": "array",
-                          "items": {"type": "string"}
-                        }
-                      ]
-                    },
-                    "pool_truncated": {"type": "boolean"},
-                    "resolved": {
-                      "type": "array",
-                      "items": {"type": "string"},
-                      "description": "The ids used"
-                    },
-                    "inherited": {
-                      "type": "boolean",
-                      "description": "The criteria were inherited from the references"
-                    },
-                    "criteria": {
-                      "type": "object",
-                      "additionalProperties": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": [
-                          "matched",
-                          "matched_by",
-                          "use",
-                          "combine",
-                          "position",
-                          "examples"
-                        ],
-                        "properties": {
-                          "matched": {"type": ["string", "null"]},
-                          "matched_by": {"enum": ["criterion", "key", "name"]},
-                          "use": {"type": "boolean"},
-                          "combine": {"type": "string"},
-                          "position": {"type": "string"},
-                          "examples": {
-                            "type": "array",
-                            "items": {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": ["reference_id", "criterion", "polarity", "expected"],
-                              "properties": {
-                                "reference_id": {
-                                  "type": "string",
-                                  "pattern": "^r[0-9a-f]{12}$",
-                                  "description": "A reference's id: `r` and 12 hex characters"
-                                },
-                                "criterion": {"type": "string"},
-                                "polarity": {"type": "string"},
-                                "expected": {
-                                  "type": "object",
-                                  "additionalProperties": true,
-                                  "description": "The expected answer: {score, verdict, reason, source}"
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    },
-                    "selection": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true,
-                        "description": "One item's auto selection: {item, status: ok | failed | skipped, matches: [{id, confidence, reason}], dropped, error, reason}"
-                      }
-                    },
-                    "calls": {
-                      "type": "integer",
-                      "minimum": 0,
-                      "description": "Guided scoring calls"
-                    },
-                    "selection_calls": {"type": "integer", "minimum": 0}
-                  }
-                }
-              ]
-            },
-            "request": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["criteria", "model"],
-              "properties": {
-                "criteria": {
-                  "type": "array",
-                  "items": {
-                    "$comment": "generated from api.schemas.CriterionInput — do not edit",
-                    "additionalProperties": false,
-                    "description": "One criterion: shared fields at the top, type-specific ones in options.\n\n``options`` arrives as a plain object and is replaced, during validation,\nby the options model for ``type`` — so every consumer reads\n``c.options.hint`` on an ``llm`` criterion and never a dict.",
-                    "properties": {
-                      "name": {
-                        "description": "The criterion to evaluate; unique within the request.",
-                        "maxLength": 200,
-                        "minLength": 1,
-                        "type": "string"
-                      },
-                      "key": {
-                        "anyOf": [
-                          {"maxLength": 200, "minLength": 1, "type": "string"},
-                          {"type": "null"}
-                        ],
-                        "default": null,
-                        "description": "Optional label used ONLY to find reference examples: the criterion is guided by the reference criteria with the same key (case-insensitive), whatever either is named, and never falls back to its name. options.reference.criterion wins over it. Never shown to the model; results, depends_on and prompts stay on `name`. May repeat in a request; unique within one reference."
-                      },
-                      "type": {
-                        "default": "llm",
-                        "description": "'llm': the vision model scores it (one call per criterion). 'text': deterministic search of the text layer. 'cv': a registered OpenCV detector by name (GET /cv-detectors), with options.fallback when none matches. 'detector': the open-vocabulary detector service, using the name as its text prompt.",
-                        "enum": ["llm", "text", "cv", "detector"],
-                        "type": "string"
-                      },
-                      "weight": {
-                        "default": 1.0,
-                        "description": "Relative weight in the overall score. Default 1.",
-                        "exclusiveMinimum": 0.0,
-                        "type": "number"
-                      },
-                      "depends_on": {
-                        "anyOf": [
-                          {"type": "string"},
-                          {"type": "null"}
-                        ],
-                        "default": null,
-                        "description": "Name of another SCORED criterion that must PASS first. Until it does, this criterion is not evaluated at all; if it does not, this one is SKIPPED (no model call spent). Chains propagate."
-                      },
-                      "score": {
-                        "default": true,
-                        "description": "false = locate without judging: the criterion still produces regions but is excluded from the weighted score and the verdict, and its score / verdict / confidence are null. Refused for a criterion that cannot produce geometry.",
-                        "type": "boolean"
-                      },
-                      "options": {
-                        "default": null,
-                        "description": "Type-specific options; see GET /criterion-types."
-                      }
-                    },
-                    "required": ["name"],
-                    "type": "object"
-                  },
-                  "description": "The criteria exactly as validated"
-                },
-                "model": {"type": "string", "description": "The job's model, resolved"}
-              }
-            },
-            "usage": {
-              "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
-              "type": "object",
-              "allOf": [
-                {
-                  "properties": {
-                    "calls": {"type": "integer", "minimum": 0},
-                    "errors": {"type": "integer", "minimum": 0},
-                    "seconds": {"type": "number", "minimum": 0},
-                    "prompt_tokens": {"type": ["integer", "null"]},
-                    "cached_tokens": {"type": ["integer", "null"]},
-                    "completion_tokens": {"type": ["integer", "null"]},
-                    "reasoning_tokens": {"type": ["integer", "null"]},
-                    "total_tokens": {"type": ["integer", "null"]}
-                  }
-                }
-              ],
-              "properties": {
-                "models": {
-                  "type": "array",
-                  "items": {"type": "string"}
-                },
-                "first_call_at": {"type": ["string", "null"], "format": "date-time"},
-                "last_call_at": {"type": ["string", "null"], "format": "date-time"},
-                "usage_url": {"type": "string"}
-              },
-              "required": [
-                "calls",
-                "errors",
-                "seconds",
-                "prompt_tokens",
-                "cached_tokens",
-                "completion_tokens",
-                "reasoning_tokens",
-                "total_tokens",
-                "models",
-                "first_call_at",
-                "last_call_at",
-                "usage_url"
-              ],
-              "unevaluatedProperties": false
-            }
-          }
-        },
-        {
-          "type": "object",
-          "description": "A reference job's result: where the reference is, and the pipeline run (null when the caller supplied everything)",
-          "additionalProperties": false,
-          "required": [
-            "reference_id",
-            "status",
-            "reference_url",
-            "record_url",
-            "description",
-            "criteria",
-            "warnings",
-            "artifacts",
-            "pipeline"
-          ],
-          "properties": {
-            "reference_id": {
-              "type": "string",
-              "pattern": "^r[0-9a-f]{12}$",
-              "description": "A reference's id: `r` and 12 hex characters"
-            },
-            "status": {"const": "ready"},
-            "reference_url": {"type": "string"},
-            "record_url": {"type": "string"},
-            "description": {"type": ["string", "null"]},
-            "criteria": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["expected", "region_source", "usable"],
-                "properties": {
-                  "expected": {
-                    "anyOf": [
-                      {"type": "null"},
-                      {
-                        "type": "object",
-                        "additionalProperties": true,
-                        "description": "{score, verdict, reason, source}"
-                      }
-                    ]
-                  },
-                  "region_source": {"type": ["string", "null"]},
-                  "usable": {"type": ["boolean", "null"]}
-                }
-              }
-            },
-            "warnings": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "artifacts": {
-              "anyOf": [
-                {"type": "null"},
-                {
-                  "type": "object",
-                  "description": "The job's artifact directory",
-                  "additionalProperties": false,
-                  "required": [
-                    "dir",
-                    "files",
-                    "items",
-                    "zip_url",
-                    "total_bytes",
-                    "expires_at",
-                    "dropped",
-                    "notes"
-                  ],
-                  "properties": {
-                    "dir": {"type": "string"},
-                    "files": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
-                        "additionalProperties": false,
-                        "required": [
-                          "name",
-                          "bytes",
-                          "content_type",
-                          "url",
-                          "kind",
-                          "item",
-                          "document",
-                          "criteria"
-                        ],
-                        "properties": {
-                          "name": {"type": "string"},
-                          "bytes": {"type": "integer", "minimum": 0},
-                          "content_type": {"type": "string"},
-                          "url": {"type": "string"},
-                          "kind": {
-                            "type": "string",
-                            "description": "What the file is: base image, layer, regions, text, manifest, references"
-                          },
-                          "format": {"type": "string"},
-                          "item": {"type": ["integer", "null"]},
-                          "document": {"type": ["integer", "null"]},
-                          "criteria": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "The criteria the file belongs to"
-                          }
-                        }
-                      }
-                    },
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["item", "layers"],
-                        "properties": {
-                          "item": {"type": "integer"},
-                          "layers": {
-                            "type": "object",
-                            "description": "Layer URLs (rendered on first fetch)",
-                            "additionalProperties": false,
-                            "required": [],
-                            "properties": {
-                              "svg": {"type": "string"},
-                              "png": {"type": "string"},
-                              "preview": {"type": "string"}
-                            }
-                          }
-                        }
-                      },
-                      "description": "Each item with a page image: its combined layer URLs"
-                    },
-                    "zip_url": {"type": "string"},
-                    "total_bytes": {"type": "integer", "minimum": 0},
-                    "expires_at": {"type": "string", "format": "date-time"},
-                    "dropped": {
-                      "type": "array",
-                      "items": {"type": "string"},
-                      "description": "Files the byte cap removed"
-                    },
-                    "notes": {
-                      "type": "array",
-                      "items": {"type": "string"}
-                    }
-                  }
-                }
-              ]
-            },
-            "pipeline": {
-              "anyOf": [
-                {"type": "null"},
-                {
-                  "type": "object",
-                  "description": "An assess job's result, `schema_version: 3` (§ Result shape)",
-                  "additionalProperties": false,
-                  "required": [
-                    "schema_version",
-                    "documents",
-                    "items",
-                    "assessment",
-                    "verdict",
-                    "page_geometry",
-                    "detector",
-                    "artifacts",
-                    "references",
-                    "request"
-                  ],
-                  "properties": {
-                    "schema_version": {"const": 3},
-                    "documents": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": [
-                          "index",
-                          "filename",
-                          "kind",
-                          "pages",
-                          "items",
-                          "warnings",
-                          "document_info"
-                        ],
-                        "properties": {
-                          "index": {"type": "integer", "minimum": 0},
-                          "filename": {"type": "string"},
-                          "kind": {"enum": ["image", "pdf", "svg", "txt", "docx"]},
-                          "pages": {"type": "integer", "minimum": 1},
-                          "items": {
-                            "type": "array",
-                            "items": {"type": "integer", "minimum": 0},
-                            "description": "Its global item indices"
-                          },
-                          "warnings": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "How the document was read that is worth knowing but is not an error (an SVG's external references); [] otherwise"
-                          },
-                          "document_info": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "content_type",
-                              "size_bytes",
-                              "has_image",
-                              "native_text_chars",
-                              "ocr",
-                              "llm_text_char_budget"
-                            ],
-                            "properties": {
-                              "content_type": {"type": "string"},
-                              "size_bytes": {"type": "integer", "minimum": 0},
-                              "has_image": {
-                                "type": "boolean",
-                                "description": "Any page has an image"
-                              },
-                              "native_text_chars": {"type": "integer", "minimum": 0},
-                              "ocr": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": [
-                                  "engine",
-                                  "min_native_chars",
-                                  "layers",
-                                  "document_layers"
-                                ],
-                                "properties": {
-                                  "engine": {"type": "string"},
-                                  "min_native_chars": {"type": "integer"},
-                                  "layers": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "object",
-                                      "description": "One text layer one item's criteria asked for (`text.p{item}.<key>.json`)",
-                                      "additionalProperties": false,
-                                      "required": [
-                                        "item",
-                                        "key",
-                                        "mode",
-                                        "ran",
-                                        "source",
-                                        "chars",
-                                        "confidence",
-                                        "note"
-                                      ],
-                                      "properties": {
-                                        "item": {"type": "integer"},
-                                        "key": {
-                                          "type": "string",
-                                          "description": "The text-layer key (the OCR settings)"
-                                        },
-                                        "mode": {"enum": ["auto", "always", "never"]},
-                                        "ran": {
-                                          "type": "boolean",
-                                          "description": "Whether OCR ran for this layer"
-                                        },
-                                        "source": {
-                                          "type": "string",
-                                          "description": "native | ocr | none"
-                                        },
-                                        "chars": {"type": "integer", "minimum": 0},
-                                        "confidence": {"type": ["number", "null"]},
-                                        "note": {"type": ["string", "null"]}
-                                      }
-                                    }
-                                  },
-                                  "document_layers": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "object",
-                                      "description": "The joined text a `scope: \"document\"` search read",
-                                      "additionalProperties": false,
-                                      "required": ["key", "source", "chars", "file"],
-                                      "properties": {
-                                        "key": {"type": "string"},
-                                        "source": {"type": "string"},
-                                        "chars": {"type": "integer", "minimum": 0},
-                                        "file": {
-                                          "type": "string",
-                                          "description": "`text.d{index}.<key>.json`"
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              },
-                              "llm_text_char_budget": {
-                                "type": "integer",
-                                "description": "The job model's text budget"
-                              }
-                            }
-                          }
-                        }
-                      },
-                      "description": "One per document, in request order"
-                    },
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "One item's own weighted answer, from its per-criterion unit results (§ Scores per item, and overall)",
-                        "additionalProperties": false,
-                        "required": [
-                          "item",
-                          "document",
-                          "page",
-                          "filename",
-                          "overall_score",
-                          "overall_verdict",
-                          "complete"
-                        ],
-                        "properties": {
-                          "item": {"type": "integer", "minimum": 0},
-                          "document": {"type": "integer", "minimum": 0},
-                          "page": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Within its document"
-                          },
-                          "filename": {"type": "string"},
-                          "overall_score": {
-                            "type": ["integer", "null"],
-                            "minimum": 1,
-                            "maximum": 10
-                          },
-                          "overall_verdict": {
-                            "anyOf": [
-                              {"type": "null"},
-                              {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                            ]
-                          },
-                          "complete": {"type": "boolean"}
-                        }
-                      },
-                      "description": "One per item"
-                    },
-                    "assessment": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "overall_score",
-                        "overall_verdict",
-                        "complete",
-                        "weighted_score_breakdown",
-                        "per_criterion_scores"
-                      ],
-                      "properties": {
-                        "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                        "overall_verdict": {
-                          "anyOf": [
-                            {"type": "null"},
-                            {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                          ]
-                        },
-                        "complete": {
-                          "type": "boolean",
-                          "description": "false when any scored criterion errored"
-                        },
-                        "weighted_score_breakdown": {
-                          "anyOf": [
-                            {"type": "null"},
-                            {
-                              "type": "object",
-                              "additionalProperties": false,
-                              "required": [
-                                "formula",
-                                "total_weight",
-                                "weighted_sum",
-                                "unrounded_average",
-                                "final_score",
-                                "partial",
-                                "excluded",
-                                "per_criterion"
-                              ],
-                              "properties": {
-                                "formula": {"const": "sum(score * weight) / total_weight"},
-                                "total_weight": {"type": "number"},
-                                "weighted_sum": {"type": "number"},
-                                "unrounded_average": {"type": "number"},
-                                "final_score": {"type": "integer"},
-                                "partial": {
-                                  "type": "boolean",
-                                  "description": "Some scored criterion errored: this is the score of what succeeded"
-                                },
-                                "excluded": {
-                                  "type": "object",
-                                  "additionalProperties": {"type": "string"},
-                                  "description": "Criterion name → why it was left out"
-                                },
-                                "per_criterion": {
-                                  "type": "object",
-                                  "additionalProperties": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["score", "weight", "contribution"],
-                                    "properties": {
-                                      "score": {"type": "integer"},
-                                      "weight": {"type": "number"},
-                                      "contribution": {"type": "number"}
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          ]
-                        },
-                        "per_criterion_scores": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "object",
-                            "description": "One criterion: the same keys for every type and status (§ Result shape)",
-                            "additionalProperties": false,
-                            "required": [
-                              "status",
-                              "type",
-                              "key",
-                              "method",
-                              "scored",
-                              "score",
-                              "verdict",
-                              "confidence",
-                              "reason",
-                              "detail",
-                              "regions",
-                              "regions_truncated",
-                              "artifacts",
-                              "localization",
-                              "options_used",
-                              "error",
-                              "complete",
-                              "aggregate_used",
-                              "items"
-                            ],
-                            "properties": {
-                              "status": {
-                                "enum": ["ok", "error", "skipped"],
-                                "description": "`ok` when at least one unit answered, `error` when none did and one errored, `skipped` when every unit was skipped"
-                              },
-                              "type": {"enum": ["llm", "text", "detector", "cv"]},
-                              "key": {
-                                "type": ["string", "null"],
-                                "description": "The criterion's `key` as sent (stripped)"
-                              },
-                              "method": {
-                                "anyOf": [
-                                  {"type": "null"},
-                                  {
-                                    "enum": ["llm", "text", "detector", "cv"],
-                                    "description": "The path that answered (a cv fallback's); null when skipped by a dependency"
-                                  }
-                                ]
-                              },
-                              "scored": {
-                                "type": "boolean",
-                                "description": "The criterion's `score` flag"
-                              },
-                              "score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
-                              "verdict": {
-                                "anyOf": [
-                                  {"type": "null"},
-                                  {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                ]
-                              },
-                              "confidence": {
-                                "type": ["integer", "null"],
-                                "minimum": 0,
-                                "maximum": 100
-                              },
-                              "reason": {"type": "string"},
-                              "detail": {
-                                "description": "Structured diagnostics: its method's declared shape (GET /criterion-types `result`), or null"
-                              },
-                              "regions": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "additionalProperties": false,
-                                  "required": [
-                                    "page",
-                                    "kind",
-                                    "points",
-                                    "label",
-                                    "score",
-                                    "source",
-                                    "attrs"
-                                  ],
-                                  "properties": {
-                                    "page": {
-                                      "type": "integer",
-                                      "minimum": 0,
-                                      "description": "Its item"
-                                    },
-                                    "kind": {"enum": ["box", "polygon"]},
-                                    "points": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "array",
-                                        "items": {"type": "number"},
-                                        "minItems": 2,
-                                        "maxItems": 2
-                                      },
-                                      "description": "[[x, y], …] in original page pixels"
-                                    },
-                                    "label": {"type": "string"},
-                                    "score": {
-                                      "type": ["number", "null"],
-                                      "description": "The producer's confidence"
-                                    },
-                                    "source": {"enum": ["cv", "ocr", "pdf-text", "detector", "llm"]},
-                                    "attrs": {
-                                      "type": "object",
-                                      "additionalProperties": true,
-                                      "description": "Free-form extras per source (`common.vision.Region.attrs`): a `text` snippet, `pdf_rect`, the llm loop's `attempt` / `accepted` / `verify_score`, …"
-                                    }
-                                  }
-                                },
-                                "description": "The union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX"
-                              },
-                              "regions_truncated": {"type": "boolean"},
-                              "artifacts": {
-                                "anyOf": [
-                                  {"type": "null"},
-                                  {
-                                    "type": "object",
-                                    "description": "Per-criterion links; null when there is neither geometry nor text",
-                                    "additionalProperties": false,
-                                    "required": [],
-                                    "properties": {
-                                      "slug": {
-                                        "type": "string",
-                                        "description": "The criterion's file-name slug"
-                                      },
-                                      "regions_url": {
-                                        "type": "string",
-                                        "description": "regions.json scoped to the criterion"
-                                      },
-                                      "items": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "additionalProperties": false,
-                                          "required": ["item", "count", "layers", "attempts"],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "count": {"type": "integer", "minimum": 0},
-                                            "layers": {
-                                              "type": "object",
-                                              "description": "Layer URLs (rendered on first fetch)",
-                                              "additionalProperties": false,
-                                              "required": [],
-                                              "properties": {
-                                                "svg": {"type": "string"},
-                                                "png": {"type": "string"},
-                                                "preview": {"type": "string"}
-                                              }
-                                            },
-                                            "attempts": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "additionalProperties": false,
-                                                "required": ["attempt", "accepted"],
-                                                "properties": {
-                                                  "attempt": {"type": "integer"},
-                                                  "accepted": {"type": "boolean"},
-                                                  "svg": {"type": "string"},
-                                                  "png": {"type": "string"},
-                                                  "preview": {"type": "string"}
-                                                }
-                                              },
-                                              "description": "One per enforcement-loop attempt with a drawable box on the item"
-                                            }
-                                          }
-                                        },
-                                        "description": "Per item it found something on"
-                                      },
-                                      "text": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                          "additionalProperties": false,
-                                          "required": ["key", "url", "source", "chars"],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "document": {"type": "integer"},
-                                            "key": {"type": "string"},
-                                            "url": {"type": "string"},
-                                            "source": {"type": "string"},
-                                            "chars": {"type": "integer", "minimum": 0}
-                                          }
-                                        },
-                                        "description": "One link per text layer its units read"
-                                      }
-                                    }
-                                  }
-                                ]
-                              },
-                              "localization": {
-                                "anyOf": [
-                                  {"type": "null"},
-                                  {
-                                    "type": "object",
-                                    "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                                    "additionalProperties": false,
-                                    "required": ["attempts", "accepted_attempt", "calls"],
-                                    "properties": {
-                                      "attempts": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "attempt",
-                                            "bbox_grid",
-                                            "bbox_px",
-                                            "valid",
-                                            "accepted"
-                                          ],
-                                          "properties": {
-                                            "item": {
-                                              "type": "integer",
-                                              "description": "Present when the record merges several items"
-                                            },
-                                            "attempt": {"type": "integer", "minimum": 1},
-                                            "bbox_grid": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {
-                                                  "type": "array",
-                                                  "items": {"type": "number"},
-                                                  "minItems": 4,
-                                                  "maxItems": 4
-                                                }
-                                              ]
-                                            },
-                                            "bbox_px": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {
-                                                  "type": "array",
-                                                  "items": {"type": "number"},
-                                                  "minItems": 4,
-                                                  "maxItems": 4
-                                                }
-                                              ]
-                                            },
-                                            "valid": {"type": "boolean"},
-                                            "accepted": {"type": "boolean"},
-                                            "reject": {
-                                              "type": "string",
-                                              "description": "Why the box was rejected (the retry's feedback)"
-                                            },
-                                            "verify_score": {"type": "integer"},
-                                            "verify_reason": {"type": "string"},
-                                            "verify_partial": {"type": "boolean"},
-                                            "detector_iou": {"type": "number"},
-                                            "coarse_bbox_grid": {
-                                              "type": "array",
-                                              "items": {"type": "number"}
-                                            },
-                                            "refine_window_grid": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {
-                                                  "type": "array",
-                                                  "items": {"type": "number"}
-                                                }
-                                              ]
-                                            },
-                                            "refined": {"type": "boolean"},
-                                            "refine_reject": {"type": "string"},
-                                            "refine_mode": {"enum": ["marks", "grid"]},
-                                            "marks_shown": {"type": "integer"},
-                                            "marks_lines": {"enum": ["native", "ocr", "window"]},
-                                            "marks": {
-                                              "type": "array",
-                                              "items": {"type": "integer"}
-                                            },
-                                            "marks_fallback": {"type": "string"}
-                                          }
-                                        }
-                                      },
-                                      "accepted_attempt": {"type": ["integer", "null"]},
-                                      "calls": {"type": "integer", "minimum": 0},
-                                      "accepted": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "additionalProperties": false,
-                                          "required": ["item", "attempt"],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "attempt": {"type": "integer"}
-                                          }
-                                        },
-                                        "description": "Merged records: each accepted box"
-                                      },
-                                      "references": {
-                                        "type": "array",
-                                        "items": {
-                                          "type": "object",
-                                          "additionalProperties": false,
-                                          "required": [
-                                            "item",
-                                            "applied",
-                                            "ask_images",
-                                            "examples",
-                                            "ask",
-                                            "refine",
-                                            "verify",
-                                            "note"
-                                          ],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "applied": {"type": "boolean"},
-                                            "ask_images": {
-                                              "anyOf": [
-                                                {"type": "null"},
-                                                {"enum": ["composite", "crop"]}
-                                              ]
-                                            },
-                                            "examples": {
-                                              "type": "array",
-                                              "items": {
-                                                "type": "object",
-                                                "additionalProperties": true,
-                                                "description": "{reference_id, criterion, polarity, composite}"
-                                              }
-                                            },
-                                            "ask": {"type": "boolean"},
-                                            "refine": {"type": "boolean"},
-                                            "verify": {"type": "boolean"},
-                                            "note": {"type": ["string", "null"]}
-                                          }
-                                        },
-                                        "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                      }
-                                    }
-                                  }
-                                ]
-                              },
-                              "options_used": {
-                                "type": "object",
-                                "additionalProperties": true,
-                                "description": "Options after defaults and caps, `aggregate` resolved — the keys of the type's options (GET /criterion-types `types.<type>.defaults`)"
-                              },
-                              "error": {"type": ["string", "null"]},
-                              "complete": {
-                                "type": "boolean",
-                                "description": "false when any of its units errored"
-                              },
-                              "aggregate_used": {
-                                "type": "object",
-                                "description": "The rules applied; `pages: null` plus a `note` for a document-scope text criterion",
-                                "additionalProperties": false,
-                                "required": ["pages", "documents"],
-                                "properties": {
-                                  "pages": {"type": ["string", "null"]},
-                                  "documents": {"type": "string"},
-                                  "note": {"type": "string"}
-                                }
-                              },
-                              "items": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "description": "One unit: one item (or, document scope, one document)",
-                                  "additionalProperties": false,
-                                  "required": [
-                                    "item",
-                                    "document",
-                                    "page",
-                                    "status",
-                                    "score",
-                                    "verdict",
-                                    "confidence",
-                                    "reason",
-                                    "detail",
-                                    "error",
-                                    "regions",
-                                    "text_layer"
-                                  ],
-                                  "properties": {
-                                    "item": {
-                                      "type": ["integer", "null"],
-                                      "description": "The global item; null for a document-scope unit"
-                                    },
-                                    "document": {"type": "integer", "minimum": 0},
-                                    "page": {
-                                      "type": ["integer", "null"],
-                                      "description": "Within its document; null for a document-scope unit"
-                                    },
-                                    "items": {
-                                      "type": "array",
-                                      "items": {"type": "integer"},
-                                      "description": "Document scope: the items it searched"
-                                    },
-                                    "status": {"enum": ["ok", "error", "skipped"]},
-                                    "score": {
-                                      "type": ["integer", "null"],
-                                      "minimum": 1,
-                                      "maximum": 10
-                                    },
-                                    "verdict": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                                      ]
-                                    },
-                                    "confidence": {
-                                      "type": ["integer", "null"],
-                                      "minimum": 0,
-                                      "maximum": 100
-                                    },
-                                    "reason": {"type": "string"},
-                                    "detail": {
-                                      "description": "The criterion's method's detail (see the criterion)"
-                                    },
-                                    "error": {"type": ["string", "null"]},
-                                    "regions": {
-                                      "type": "integer",
-                                      "minimum": 0,
-                                      "description": "A COUNT of the unit's regions (the geometry is the criterion's `regions`)"
-                                    },
-                                    "text_layer": {
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "type": "object",
-                                          "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
-                                          "additionalProperties": false,
-                                          "required": ["key", "url", "source", "chars"],
-                                          "properties": {
-                                            "item": {"type": "integer"},
-                                            "document": {"type": "integer"},
-                                            "key": {"type": "string"},
-                                            "url": {"type": "string"},
-                                            "source": {"type": "string"},
-                                            "chars": {"type": "integer", "minimum": 0}
-                                          }
-                                        }
-                                      ]
-                                    },
-                                    "localization": {
-                                      "type": "object",
-                                      "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop)",
-                                      "additionalProperties": false,
-                                      "required": ["attempts", "accepted_attempt", "calls"],
-                                      "properties": {
-                                        "attempts": {
-                                          "type": "array",
-                                          "items": {
-                                            "type": "object",
-                                            "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "attempt",
-                                              "bbox_grid",
-                                              "bbox_px",
-                                              "valid",
-                                              "accepted"
-                                            ],
-                                            "properties": {
-                                              "item": {
-                                                "type": "integer",
-                                                "description": "Present when the record merges several items"
-                                              },
-                                              "attempt": {"type": "integer", "minimum": 1},
-                                              "bbox_grid": {
-                                                "anyOf": [
-                                                  {"type": "null"},
-                                                  {
-                                                    "type": "array",
-                                                    "items": {"type": "number"},
-                                                    "minItems": 4,
-                                                    "maxItems": 4
-                                                  }
-                                                ]
-                                              },
-                                              "bbox_px": {
-                                                "anyOf": [
-                                                  {"type": "null"},
-                                                  {
-                                                    "type": "array",
-                                                    "items": {"type": "number"},
-                                                    "minItems": 4,
-                                                    "maxItems": 4
-                                                  }
-                                                ]
-                                              },
-                                              "valid": {"type": "boolean"},
-                                              "accepted": {"type": "boolean"},
-                                              "reject": {
-                                                "type": "string",
-                                                "description": "Why the box was rejected (the retry's feedback)"
-                                              },
-                                              "verify_score": {"type": "integer"},
-                                              "verify_reason": {"type": "string"},
-                                              "verify_partial": {"type": "boolean"},
-                                              "detector_iou": {"type": "number"},
-                                              "coarse_bbox_grid": {
-                                                "type": "array",
-                                                "items": {"type": "number"}
-                                              },
-                                              "refine_window_grid": {
-                                                "anyOf": [
-                                                  {"type": "null"},
-                                                  {
-                                                    "type": "array",
-                                                    "items": {"type": "number"}
-                                                  }
-                                                ]
-                                              },
-                                              "refined": {"type": "boolean"},
-                                              "refine_reject": {"type": "string"},
-                                              "refine_mode": {"enum": ["marks", "grid"]},
-                                              "marks_shown": {"type": "integer"},
-                                              "marks_lines": {"enum": ["native", "ocr", "window"]},
-                                              "marks": {
-                                                "type": "array",
-                                                "items": {"type": "integer"}
-                                              },
-                                              "marks_fallback": {"type": "string"}
-                                            }
-                                          }
-                                        },
-                                        "accepted_attempt": {"type": ["integer", "null"]},
-                                        "calls": {"type": "integer", "minimum": 0},
-                                        "accepted": {
-                                          "type": "array",
-                                          "items": {
-                                            "type": "object",
-                                            "additionalProperties": false,
-                                            "required": ["item", "attempt"],
-                                            "properties": {
-                                              "item": {"type": "integer"},
-                                              "attempt": {"type": "integer"}
-                                            }
-                                          },
-                                          "description": "Merged records: each accepted box"
-                                        },
-                                        "references": {
-                                          "type": "array",
-                                          "items": {
-                                            "type": "object",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "item",
-                                              "applied",
-                                              "ask_images",
-                                              "examples",
-                                              "ask",
-                                              "refine",
-                                              "verify",
-                                              "note"
-                                            ],
-                                            "properties": {
-                                              "item": {"type": "integer"},
-                                              "applied": {"type": "boolean"},
-                                              "ask_images": {
-                                                "anyOf": [
-                                                  {"type": "null"},
-                                                  {"enum": ["composite", "crop"]}
-                                                ]
-                                              },
-                                              "examples": {
-                                                "type": "array",
-                                                "items": {
-                                                  "type": "object",
-                                                  "additionalProperties": true,
-                                                  "description": "{reference_id, criterion, polarity, composite}"
-                                                }
-                                              },
-                                              "ask": {"type": "boolean"},
-                                              "refine": {"type": "boolean"},
-                                              "verify": {"type": "boolean"},
-                                              "note": {"type": ["string", "null"]}
-                                            }
-                                          },
-                                          "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
-                                        }
-                                      }
-                                    }
-                                  }
-                                },
-                                "description": "One entry per unit"
-                              }
-                            },
-                            "allOf": [
-                              {
-                                "if": {
-                                  "properties": {
-                                    "method": {"const": "llm"}
-                                  },
-                                  "required": ["method"]
-                                },
-                                "then": {
-                                  "properties": {
-                                    "detail": {
-                                      "description": "An `llm` detail, or null (skipped, errored)",
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "aggregate": {
-                                                "properties": {
-                                                  "rule": {"const": "mean"}
-                                                },
-                                                "required": ["rule"]
-                                              }
-                                            },
-                                            "required": ["aggregate"]
-                                          },
-                                          "then": {
-                                            "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "hint",
-                                              "model",
-                                              "image_sent",
-                                              "aggregate"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": ["number", "null"],
-                                                "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                              },
-                                              "hint": {
-                                                "type": "string",
-                                                "description": "The rubric the model was asked to use"
-                                              },
-                                              "model": {
-                                                "type": "string",
-                                                "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                              },
-                                              "image_sent": {
-                                                "type": "boolean",
-                                                "description": "Whether the page image was attached (never, for a text-only model)"
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail`",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "else": {
-                                            "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `llm` criterion",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "hint",
-                                              "model",
-                                              "image_sent",
-                                              "text_sent",
-                                              "confidence"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": ["number", "null"],
-                                                "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                              },
-                                              "hint": {
-                                                "type": "string",
-                                                "description": "The rubric the model was asked to use"
-                                              },
-                                              "model": {
-                                                "type": "string",
-                                                "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                              },
-                                              "image_sent": {
-                                                "type": "boolean",
-                                                "description": "Whether the page image was attached (never, for a text-only model)"
-                                              },
-                                              "text_sent": {
-                                                "type": "object",
-                                                "description": "The text attached: `{chars, truncated, budget, source}`",
-                                                "additionalProperties": true
-                                              },
-                                              "confidence": {
-                                                "type": ["object", "null"],
-                                                "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                                "additionalProperties": true
-                                              },
-                                              "reference": {
-                                                "type": "object",
-                                                "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                                "additionalProperties": true
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "properties": {
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                              "additionalProperties": false,
-                                              "required": ["rule", "level", "from", "values"],
-                                              "properties": {
-                                                "rule": {
-                                                  "enum": ["any", "worst", "all", "mean", "sum"]
-                                                },
-                                                "level": {"enum": ["pages", "documents"]},
-                                                "from": {
-                                                  "type": ["string", "null"],
-                                                  "description": "The member whose detail this is (any / worst)"
-                                                },
-                                                "values": {
-                                                  "type": "object",
-                                                  "additionalProperties": {
-                                                    "type": ["number", "null"]
-                                                  },
-                                                  "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      ]
-                                    },
-                                    "items": {
-                                      "items": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `llm` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "hint",
-                                                    "model",
-                                                    "image_sent",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": ["number", "null"],
-                                                      "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                    },
-                                                    "hint": {
-                                                      "type": "string",
-                                                      "description": "The rubric the model was asked to use"
-                                                    },
-                                                    "model": {
-                                                      "type": "string",
-                                                      "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                    },
-                                                    "image_sent": {
-                                                      "type": "boolean",
-                                                      "description": "Whether the page image was attached (never, for a text-only model)"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `llm` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "hint",
-                                                    "model",
-                                                    "image_sent",
-                                                    "text_sent",
-                                                    "confidence"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": ["number", "null"],
-                                                      "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
-                                                    },
-                                                    "hint": {
-                                                      "type": "string",
-                                                      "description": "The rubric the model was asked to use"
-                                                    },
-                                                    "model": {
-                                                      "type": "string",
-                                                      "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
-                                                    },
-                                                    "image_sent": {
-                                                      "type": "boolean",
-                                                      "description": "Whether the page image was attached (never, for a text-only model)"
-                                                    },
-                                                    "text_sent": {
-                                                      "type": "object",
-                                                      "description": "The text attached: `{chars, truncated, budget, source}`",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "confidence": {
-                                                      "type": ["object", "null"],
-                                                      "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "reference": {
-                                                      "type": "object",
-                                                      "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              },
-                              {
-                                "if": {
-                                  "properties": {
-                                    "method": {"const": "text"}
-                                  },
-                                  "required": ["method"]
-                                },
-                                "then": {
-                                  "properties": {
-                                    "detail": {
-                                      "description": "An `text` detail, or null (skipped, errored)",
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "aggregate": {
-                                                "properties": {
-                                                  "rule": {"const": "mean"}
-                                                },
-                                                "required": ["rule"]
-                                              }
-                                            },
-                                            "required": ["aggregate"]
-                                          },
-                                          "then": {
-                                            "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "mode",
-                                              "pattern",
-                                              "case_sensitive",
-                                              "min_count",
-                                              "fuzzy_threshold",
-                                              "aggregate"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": "number",
-                                                "description": "The headline number (the mean of the members' values under `mean`)"
-                                              },
-                                              "mode": {
-                                                "type": "string",
-                                                "description": "The match mode used"
-                                              },
-                                              "pattern": {
-                                                "type": "string",
-                                                "description": "What was searched for"
-                                              },
-                                              "case_sensitive": {
-                                                "type": "boolean",
-                                                "description": "Whether matching was case-sensitive"
-                                              },
-                                              "min_count": {
-                                                "type": "integer",
-                                                "description": "Hits required to PASS"
-                                              },
-                                              "fuzzy_threshold": {
-                                                "type": ["number", "null"],
-                                                "description": "Similarity a fuzzy window must reach; null for other modes"
-                                              },
-                                              "scope": {
-                                                "type": "string",
-                                                "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                              },
-                                              "separator": {
-                                                "type": "string",
-                                                "description": "What joined the pages (present only when options.scope is document)"
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail`",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "else": {
-                                            "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `text` criterion",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "found",
-                                              "count",
-                                              "best_ratio",
-                                              "mode",
-                                              "pattern",
-                                              "snippets",
-                                              "searched_chars",
-                                              "case_sensitive",
-                                              "min_count",
-                                              "fuzzy_threshold",
-                                              "text_source"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": "number",
-                                                "description": "The headline number (the mean of the members' values under `mean`)"
-                                              },
-                                              "found": {
-                                                "type": "boolean",
-                                                "description": "Whether count reached min_count"
-                                              },
-                                              "count": {
-                                                "type": "integer",
-                                                "description": "Hits found (summed across members under `sum`)"
-                                              },
-                                              "best_ratio": {
-                                                "type": "number",
-                                                "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                              },
-                                              "mode": {
-                                                "type": "string",
-                                                "description": "The match mode used"
-                                              },
-                                              "pattern": {
-                                                "type": "string",
-                                                "description": "What was searched for"
-                                              },
-                                              "snippets": {
-                                                "type": "array",
-                                                "description": "Up to 8 context excerpts around the hits"
-                                              },
-                                              "searched_chars": {
-                                                "type": "integer",
-                                                "description": "Characters searched"
-                                              },
-                                              "case_sensitive": {
-                                                "type": "boolean",
-                                                "description": "Whether matching was case-sensitive"
-                                              },
-                                              "min_count": {
-                                                "type": "integer",
-                                                "description": "Hits required to PASS"
-                                              },
-                                              "fuzzy_threshold": {
-                                                "type": ["number", "null"],
-                                                "description": "Similarity a fuzzy window must reach; null for other modes"
-                                              },
-                                              "text_source": {
-                                                "type": "string",
-                                                "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                              },
-                                              "scope": {
-                                                "type": "string",
-                                                "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                              },
-                                              "separator": {
-                                                "type": "string",
-                                                "description": "What joined the pages (present only when options.scope is document)"
-                                              },
-                                              "items_with_hits": {
-                                                "type": "array",
-                                                "description": "Items the hits landed on (present only when options.scope is document)"
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "properties": {
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                              "additionalProperties": false,
-                                              "required": ["rule", "level", "from", "values"],
-                                              "properties": {
-                                                "rule": {
-                                                  "enum": ["any", "worst", "all", "mean", "sum"]
-                                                },
-                                                "level": {"enum": ["pages", "documents"]},
-                                                "from": {
-                                                  "type": ["string", "null"],
-                                                  "description": "The member whose detail this is (any / worst)"
-                                                },
-                                                "values": {
-                                                  "type": "object",
-                                                  "additionalProperties": {
-                                                    "type": ["number", "null"]
-                                                  },
-                                                  "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      ]
-                                    },
-                                    "items": {
-                                      "items": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `text` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "mode",
-                                                    "pattern",
-                                                    "case_sensitive",
-                                                    "min_count",
-                                                    "fuzzy_threshold",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "mode": {
-                                                      "type": "string",
-                                                      "description": "The match mode used"
-                                                    },
-                                                    "pattern": {
-                                                      "type": "string",
-                                                      "description": "What was searched for"
-                                                    },
-                                                    "case_sensitive": {
-                                                      "type": "boolean",
-                                                      "description": "Whether matching was case-sensitive"
-                                                    },
-                                                    "min_count": {
-                                                      "type": "integer",
-                                                      "description": "Hits required to PASS"
-                                                    },
-                                                    "fuzzy_threshold": {
-                                                      "type": ["number", "null"],
-                                                      "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                    },
-                                                    "scope": {
-                                                      "type": "string",
-                                                      "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                    },
-                                                    "separator": {
-                                                      "type": "string",
-                                                      "description": "What joined the pages (present only when options.scope is document)"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `text` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "found",
-                                                    "count",
-                                                    "best_ratio",
-                                                    "mode",
-                                                    "pattern",
-                                                    "snippets",
-                                                    "searched_chars",
-                                                    "case_sensitive",
-                                                    "min_count",
-                                                    "fuzzy_threshold",
-                                                    "text_source"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "found": {
-                                                      "type": "boolean",
-                                                      "description": "Whether count reached min_count"
-                                                    },
-                                                    "count": {
-                                                      "type": "integer",
-                                                      "description": "Hits found (summed across members under `sum`)"
-                                                    },
-                                                    "best_ratio": {
-                                                      "type": "number",
-                                                      "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
-                                                    },
-                                                    "mode": {
-                                                      "type": "string",
-                                                      "description": "The match mode used"
-                                                    },
-                                                    "pattern": {
-                                                      "type": "string",
-                                                      "description": "What was searched for"
-                                                    },
-                                                    "snippets": {
-                                                      "type": "array",
-                                                      "description": "Up to 8 context excerpts around the hits"
-                                                    },
-                                                    "searched_chars": {
-                                                      "type": "integer",
-                                                      "description": "Characters searched"
-                                                    },
-                                                    "case_sensitive": {
-                                                      "type": "boolean",
-                                                      "description": "Whether matching was case-sensitive"
-                                                    },
-                                                    "min_count": {
-                                                      "type": "integer",
-                                                      "description": "Hits required to PASS"
-                                                    },
-                                                    "fuzzy_threshold": {
-                                                      "type": ["number", "null"],
-                                                      "description": "Similarity a fuzzy window must reach; null for other modes"
-                                                    },
-                                                    "text_source": {
-                                                      "type": "string",
-                                                      "description": "native | ocr | none — or `mixed` when summed across members that differ"
-                                                    },
-                                                    "scope": {
-                                                      "type": "string",
-                                                      "description": "`document` when the pages were searched joined (present only when options.scope is document)"
-                                                    },
-                                                    "separator": {
-                                                      "type": "string",
-                                                      "description": "What joined the pages (present only when options.scope is document)"
-                                                    },
-                                                    "items_with_hits": {
-                                                      "type": "array",
-                                                      "description": "Items the hits landed on (present only when options.scope is document)"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              },
-                              {
-                                "if": {
-                                  "properties": {
-                                    "method": {"const": "detector"}
-                                  },
-                                  "required": ["method"]
-                                },
-                                "then": {
-                                  "properties": {
-                                    "detail": {
-                                      "description": "An `detector` detail, or null (skipped, errored)",
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "aggregate": {
-                                                "properties": {
-                                                  "rule": {"const": "mean"}
-                                                },
-                                                "required": ["rule"]
-                                              }
-                                            },
-                                            "required": ["aggregate"]
-                                          },
-                                          "then": {
-                                            "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "min_score",
-                                              "aggregate"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": "number",
-                                                "description": "The headline number (the mean of the members' values under `mean`)"
-                                              },
-                                              "min_score": {
-                                                "type": "number",
-                                                "description": "The confidence floor used"
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail`",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "else": {
-                                            "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `detector` criterion",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "detector_matches",
-                                              "best_score",
-                                              "min_score"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": "number",
-                                                "description": "The headline number (the mean of the members' values under `mean`)"
-                                              },
-                                              "detector_matches": {
-                                                "type": "integer",
-                                                "description": "Boxes found at or above min_score"
-                                              },
-                                              "best_score": {
-                                                "type": "number",
-                                                "description": "The best box's confidence, 0-1; 0 when none"
-                                              },
-                                              "min_score": {
-                                                "type": "number",
-                                                "description": "The confidence floor used"
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "properties": {
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                              "additionalProperties": false,
-                                              "required": ["rule", "level", "from", "values"],
-                                              "properties": {
-                                                "rule": {
-                                                  "enum": ["any", "worst", "all", "mean", "sum"]
-                                                },
-                                                "level": {"enum": ["pages", "documents"]},
-                                                "from": {
-                                                  "type": ["string", "null"],
-                                                  "description": "The member whose detail this is (any / worst)"
-                                                },
-                                                "values": {
-                                                  "type": "object",
-                                                  "additionalProperties": {
-                                                    "type": ["number", "null"]
-                                                  },
-                                                  "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      ]
-                                    },
-                                    "items": {
-                                      "items": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `detector` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "min_score",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "min_score": {
-                                                      "type": "number",
-                                                      "description": "The confidence floor used"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `detector` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "detector_matches",
-                                                    "best_score",
-                                                    "min_score"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "detector_matches": {
-                                                      "type": "integer",
-                                                      "description": "Boxes found at or above min_score"
-                                                    },
-                                                    "best_score": {
-                                                      "type": "number",
-                                                      "description": "The best box's confidence, 0-1; 0 when none"
-                                                    },
-                                                    "min_score": {
-                                                      "type": "number",
-                                                      "description": "The confidence floor used"
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              },
-                              {
-                                "if": {
-                                  "properties": {
-                                    "method": {"const": "cv"}
-                                  },
-                                  "required": ["method"]
-                                },
-                                "then": {
-                                  "properties": {
-                                    "detail": {
-                                      "description": "An `cv` detail, or null (skipped, errored)",
-                                      "anyOf": [
-                                        {"type": "null"},
-                                        {
-                                          "if": {
-                                            "properties": {
-                                              "aggregate": {
-                                                "properties": {
-                                                  "rule": {"const": "mean"}
-                                                },
-                                                "required": ["rule"]
-                                              }
-                                            },
-                                            "required": ["aggregate"]
-                                          },
-                                          "then": {
-                                            "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "detector",
-                                              "thresholds",
-                                              "parameters",
-                                              "image",
-                                              "aggregate"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": "number",
-                                                "description": "The headline number (the mean of the members' values under `mean`)"
-                                              },
-                                              "detector": {
-                                                "type": "string",
-                                                "description": "The OpenCV function that ran"
-                                              },
-                                              "thresholds": {
-                                                "type": "object",
-                                                "description": "The lines that decide the verdict",
-                                                "additionalProperties": true
-                                              },
-                                              "parameters": {
-                                                "type": "object",
-                                                "description": "Config values it measured with",
-                                                "additionalProperties": true
-                                              },
-                                              "image": {
-                                                "type": "object",
-                                                "description": "The working-image frame the *_px measurements are in",
-                                                "additionalProperties": true
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail`",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "else": {
-                                            "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                            "type": "object",
-                                            "description": "`detail` of a `cv` criterion",
-                                            "additionalProperties": false,
-                                            "required": [
-                                              "metric",
-                                              "value",
-                                              "detector",
-                                              "measurements",
-                                              "thresholds",
-                                              "parameters",
-                                              "image"
-                                            ],
-                                            "properties": {
-                                              "metric": {
-                                                "type": "string",
-                                                "description": "Name of the headline number"
-                                              },
-                                              "value": {
-                                                "type": "number",
-                                                "description": "The headline number (the mean of the members' values under `mean`)"
-                                              },
-                                              "detector": {
-                                                "type": "string",
-                                                "description": "The OpenCV function that ran"
-                                              },
-                                              "measurements": {
-                                                "type": "object",
-                                                "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                                "additionalProperties": true
-                                              },
-                                              "thresholds": {
-                                                "type": "object",
-                                                "description": "The lines that decide the verdict",
-                                                "additionalProperties": true
-                                              },
-                                              "parameters": {
-                                                "type": "object",
-                                                "description": "Config values it measured with",
-                                                "additionalProperties": true
-                                              },
-                                              "state": {
-                                                "type": "string",
-                                                "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                              },
-                                              "image": {
-                                                "type": "object",
-                                                "description": "The working-image frame the *_px measurements are in",
-                                                "additionalProperties": true
-                                              },
-                                              "aggregate": {
-                                                "type": "object",
-                                                "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                "additionalProperties": true
-                                              }
-                                            }
-                                          },
-                                          "properties": {
-                                            "aggregate": {
-                                              "type": "object",
-                                              "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                              "additionalProperties": false,
-                                              "required": ["rule", "level", "from", "values"],
-                                              "properties": {
-                                                "rule": {
-                                                  "enum": ["any", "worst", "all", "mean", "sum"]
-                                                },
-                                                "level": {"enum": ["pages", "documents"]},
-                                                "from": {
-                                                  "type": ["string", "null"],
-                                                  "description": "The member whose detail this is (any / worst)"
-                                                },
-                                                "values": {
-                                                  "type": "object",
-                                                  "additionalProperties": {
-                                                    "type": ["number", "null"]
-                                                  },
-                                                  "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                }
-                                              }
-                                            }
-                                          },
-                                          "allOf": [
-                                            {
-                                              "$comment": "generated from cv.REGISTRY — do not edit",
-                                              "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                              "properties": {
-                                                "detector": {
-                                                  "enum": [
-                                                    "check_blur",
-                                                    "check_exposure",
-                                                    "detect_faces",
-                                                    "detect_sky",
-                                                    "detect_text",
-                                                    "detect_vegetation",
-                                                    "detect_water"
-                                                  ]
-                                                }
-                                              },
-                                              "allOf": [
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "check_blur"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (Laplacian variance)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "laplacian_variance": {
-                                                            "type": "number",
-                                                            "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "check_exposure"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "mean_intensity": {
-                                                            "type": "number",
-                                                            "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "detect_faces"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "faces_count": {
-                                                            "type": "number",
-                                                            "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                          },
-                                                          "faces_high_count": {
-                                                            "type": "number",
-                                                            "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                          },
-                                                          "faces_low_count": {
-                                                            "type": "number",
-                                                            "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "detect_sky"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "sky_ratio": {
-                                                            "type": "number",
-                                                            "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                          },
-                                                          "sky_px": {
-                                                            "type": "number",
-                                                            "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                          },
-                                                          "blue_px": {
-                                                            "type": "number",
-                                                            "description": "Pixels matching the clear-blue range (unit: px)"
-                                                          },
-                                                          "grey_px": {
-                                                            "type": "number",
-                                                            "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                          },
-                                                          "analysed_px": {
-                                                            "type": "number",
-                                                            "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "detect_text"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.features.detect_text — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "dense_block_ratio": {
-                                                            "type": "number",
-                                                            "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                          },
-                                                          "dense_blocks_count": {
-                                                            "type": "number",
-                                                            "description": "Blocks above block_density (unit: count)"
-                                                          },
-                                                          "total_blocks_count": {
-                                                            "type": "number",
-                                                            "description": "Blocks the page was divided into (unit: count)"
-                                                          },
-                                                          "text_regions_count": {
-                                                            "type": "number",
-                                                            "description": "Merged text regions returned as boxes (unit: count)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "detect_vegetation"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (HSV green masking)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "green_ratio": {
-                                                            "type": "number",
-                                                            "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                          },
-                                                          "green_px": {
-                                                            "type": "number",
-                                                            "description": "Pixels inside the green mask (unit: px)"
-                                                          },
-                                                          "total_px": {
-                                                            "type": "number",
-                                                            "description": "Pixels in the page (unit: px)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                {
-                                                  "if": {
-                                                    "properties": {
-                                                      "detector": {"const": "detect_water"}
-                                                    },
-                                                    "required": ["detector"]
-                                                  },
-                                                  "then": {
-                                                    "properties": {
-                                                      "measurements": {
-                                                        "$comment": "generated from cv.features.detect_water — do not edit",
-                                                        "type": "object",
-                                                        "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                        "additionalProperties": false,
-                                                        "properties": {
-                                                          "water_ratio": {
-                                                            "type": "number",
-                                                            "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                          },
-                                                          "water_px": {
-                                                            "type": "number",
-                                                            "description": "Area of those qualifying blobs (unit: px)"
-                                                          },
-                                                          "total_px": {
-                                                            "type": "number",
-                                                            "description": "Pixels in the page (unit: px)"
-                                                          },
-                                                          "blue_blobs_count": {
-                                                            "type": "number",
-                                                            "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                          },
-                                                          "candidates_count": {
-                                                            "type": "number",
-                                                            "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                          },
-                                                          "flat_count": {
-                                                            "type": "number",
-                                                            "description": "Candidates flat enough to be water (unit: count)"
-                                                          },
-                                                          "rejected_textured_count": {
-                                                            "type": "number",
-                                                            "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              ]
-                                            }
-                                          ]
-                                        }
-                                      ]
-                                    },
-                                    "items": {
-                                      "items": {
-                                        "properties": {
-                                          "detail": {
-                                            "description": "An `cv` detail, or null (skipped, errored)",
-                                            "anyOf": [
-                                              {"type": "null"},
-                                              {
-                                                "if": {
-                                                  "properties": {
-                                                    "aggregate": {
-                                                      "properties": {
-                                                        "rule": {"const": "mean"}
-                                                      },
-                                                      "required": ["rule"]
-                                                    }
-                                                  },
-                                                  "required": ["aggregate"]
-                                                },
-                                                "then": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "detector",
-                                                    "thresholds",
-                                                    "parameters",
-                                                    "image",
-                                                    "aggregate"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "detector": {
-                                                      "type": "string",
-                                                      "description": "The OpenCV function that ran"
-                                                    },
-                                                    "thresholds": {
-                                                      "type": "object",
-                                                      "description": "The lines that decide the verdict",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "parameters": {
-                                                      "type": "object",
-                                                      "description": "Config values it measured with",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "image": {
-                                                      "type": "object",
-                                                      "description": "The working-image frame the *_px measurements are in",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail`",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "else": {
-                                                  "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
-                                                  "type": "object",
-                                                  "description": "`detail` of a `cv` criterion",
-                                                  "additionalProperties": false,
-                                                  "required": [
-                                                    "metric",
-                                                    "value",
-                                                    "detector",
-                                                    "measurements",
-                                                    "thresholds",
-                                                    "parameters",
-                                                    "image"
-                                                  ],
-                                                  "properties": {
-                                                    "metric": {
-                                                      "type": "string",
-                                                      "description": "Name of the headline number"
-                                                    },
-                                                    "value": {
-                                                      "type": "number",
-                                                      "description": "The headline number (the mean of the members' values under `mean`)"
-                                                    },
-                                                    "detector": {
-                                                      "type": "string",
-                                                      "description": "The OpenCV function that ran"
-                                                    },
-                                                    "measurements": {
-                                                      "type": "object",
-                                                      "description": "Everything the detector counted — its keys: GET /cv-detectors",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "thresholds": {
-                                                      "type": "object",
-                                                      "description": "The lines that decide the verdict",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "parameters": {
-                                                      "type": "object",
-                                                      "description": "Config values it measured with",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "state": {
-                                                      "type": "string",
-                                                      "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
-                                                    },
-                                                    "image": {
-                                                      "type": "object",
-                                                      "description": "The working-image frame the *_px measurements are in",
-                                                      "additionalProperties": true
-                                                    },
-                                                    "aggregate": {
-                                                      "type": "object",
-                                                      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
-                                                      "additionalProperties": true
-                                                    }
-                                                  }
-                                                },
-                                                "properties": {
-                                                  "aggregate": {
-                                                    "type": "object",
-                                                    "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
-                                                    "additionalProperties": false,
-                                                    "required": ["rule", "level", "from", "values"],
-                                                    "properties": {
-                                                      "rule": {
-                                                        "enum": [
-                                                          "any",
-                                                          "worst",
-                                                          "all",
-                                                          "mean",
-                                                          "sum"
-                                                        ]
-                                                      },
-                                                      "level": {"enum": ["pages", "documents"]},
-                                                      "from": {
-                                                        "type": ["string", "null"],
-                                                        "description": "The member whose detail this is (any / worst)"
-                                                      },
-                                                      "values": {
-                                                        "type": "object",
-                                                        "additionalProperties": {
-                                                          "type": ["number", "null"]
-                                                        },
-                                                        "description": "Each member's value, by member label (`item n` / `document n`)"
-                                                      }
-                                                    }
-                                                  }
-                                                },
-                                                "allOf": [
-                                                  {
-                                                    "$comment": "generated from cv.REGISTRY — do not edit",
-                                                    "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
-                                                    "properties": {
-                                                      "detector": {
-                                                        "enum": [
-                                                          "check_blur",
-                                                          "check_exposure",
-                                                          "detect_faces",
-                                                          "detect_sky",
-                                                          "detect_text",
-                                                          "detect_vegetation",
-                                                          "detect_water"
-                                                        ]
-                                                      }
-                                                    },
-                                                    "allOf": [
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "check_blur"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.quality.check_blur — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Laplacian variance)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "laplacian_variance": {
-                                                                  "type": "number",
-                                                                  "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "check_exposure"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.quality.check_exposure — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Mean pixel intensity)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "mean_intensity": {
-                                                                  "type": "number",
-                                                                  "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_faces"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_faces — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (OpenCV Haar cascade)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "faces_count": {
-                                                                  "type": "number",
-                                                                  "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
-                                                                },
-                                                                "faces_high_count": {
-                                                                  "type": "number",
-                                                                  "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
-                                                                },
-                                                                "faces_low_count": {
-                                                                  "type": "number",
-                                                                  "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_sky"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_sky — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "sky_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
-                                                                },
-                                                                "sky_px": {
-                                                                  "type": "number",
-                                                                  "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
-                                                                },
-                                                                "blue_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels matching the clear-blue range (unit: px)"
-                                                                },
-                                                                "grey_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels matching the overcast-grey range (unit: px)"
-                                                                },
-                                                                "analysed_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_text"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_text — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Sobel edge density per block)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "dense_block_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
-                                                                },
-                                                                "dense_blocks_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blocks above block_density (unit: count)"
-                                                                },
-                                                                "total_blocks_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blocks the page was divided into (unit: count)"
-                                                                },
-                                                                "text_regions_count": {
-                                                                  "type": "number",
-                                                                  "description": "Merged text regions returned as boxes (unit: count)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {
-                                                              "const": "detect_vegetation"
-                                                            }
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_vegetation — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (HSV green masking)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "green_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of the page's pixels inside the green mask (unit: ratio)"
-                                                                },
-                                                                "green_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels inside the green mask (unit: px)"
-                                                                },
-                                                                "total_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels in the page (unit: px)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      },
-                                                      {
-                                                        "if": {
-                                                          "properties": {
-                                                            "detector": {"const": "detect_water"}
-                                                          },
-                                                          "required": ["detector"]
-                                                        },
-                                                        "then": {
-                                                          "properties": {
-                                                            "measurements": {
-                                                              "$comment": "generated from cv.features.detect_water — do not edit",
-                                                              "type": "object",
-                                                              "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
-                                                              "additionalProperties": false,
-                                                              "properties": {
-                                                                "water_ratio": {
-                                                                  "type": "number",
-                                                                  "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
-                                                                },
-                                                                "water_px": {
-                                                                  "type": "number",
-                                                                  "description": "Area of those qualifying blobs (unit: px)"
-                                                                },
-                                                                "total_px": {
-                                                                  "type": "number",
-                                                                  "description": "Pixels in the page (unit: px)"
-                                                                },
-                                                                "blue_blobs_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blue/teal blobs found, of any size (unit: count)"
-                                                                },
-                                                                "candidates_count": {
-                                                                  "type": "number",
-                                                                  "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
-                                                                },
-                                                                "flat_count": {
-                                                                  "type": "number",
-                                                                  "description": "Candidates flat enough to be water (unit: count)"
-                                                                },
-                                                                "rejected_textured_count": {
-                                                                  "type": "number",
-                                                                  "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    ]
-                                                  }
-                                                ]
-                                              }
-                                            ]
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              },
-                              {
-                                "if": {
-                                  "properties": {
-                                    "method": {"type": "null"}
-                                  },
-                                  "required": ["method"]
-                                },
-                                "then": {
-                                  "properties": {
-                                    "detail": {"type": "null"}
-                                  }
-                                }
-                              }
-                            ]
-                          },
-                          "description": "By criterion name, in request order"
-                        }
-                      }
-                    },
-                    "verdict": {
-                      "anyOf": [
-                        {"type": "null"},
-                        {"enum": ["PASS", "MARGINAL", "FAIL"]}
-                      ]
-                    },
-                    "page_geometry": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": [
-                          "item",
-                          "page",
-                          "width",
-                          "height",
-                          "working_scale",
-                          "pdf_points"
-                        ],
-                        "properties": {
-                          "item": {"type": "integer"},
-                          "page": {"type": "integer", "description": "Equals `item`"},
-                          "width": {"type": ["integer", "null"]},
-                          "height": {"type": ["integer", "null"]},
-                          "working_scale": {"type": ["number", "null"]},
-                          "pdf_points": {
-                            "anyOf": [
-                              {"type": "null"},
-                              {
-                                "type": "array",
-                                "items": {"type": "number"},
-                                "minItems": 2,
-                                "maxItems": 2
-                              }
-                            ]
-                          }
-                        }
-                      },
-                      "description": "One per item; nulls for an item with no page image"
-                    },
-                    "detector": {
-                      "type": "object",
-                      "description": "What the open-vocabulary detector did for the whole job",
-                      "additionalProperties": false,
-                      "required": [
-                        "configured",
-                        "url_host",
-                        "min_score",
-                        "timeout_seconds",
-                        "max_labels_per_call",
-                        "model",
-                        "device",
-                        "calls",
-                        "labels",
-                        "detections",
-                        "elapsed_ms",
-                        "errors",
-                        "used"
-                      ],
-                      "properties": {
-                        "configured": {"type": "boolean"},
-                        "url_host": {"type": ["string", "null"]},
-                        "min_score": {"type": "number"},
-                        "timeout_seconds": {"type": "number"},
-                        "max_labels_per_call": {"type": "integer"},
-                        "model": {"type": ["string", "null"]},
-                        "device": {"type": ["string", "null"]},
-                        "calls": {"type": "integer", "minimum": 0},
-                        "labels": {"type": "integer", "minimum": 0},
-                        "detections": {"type": "integer", "minimum": 0},
-                        "elapsed_ms": {"type": "number", "minimum": 0},
-                        "errors": {
-                          "type": "array",
-                          "items": {"type": "string"}
-                        },
-                        "used": {"type": "boolean"}
-                      }
-                    },
-                    "artifacts": {
-                      "anyOf": [
-                        {"type": "null"},
-                        {
-                          "type": "object",
-                          "description": "The job's artifact directory",
-                          "additionalProperties": false,
-                          "required": [
-                            "dir",
-                            "files",
-                            "items",
-                            "zip_url",
-                            "total_bytes",
-                            "expires_at",
-                            "dropped",
-                            "notes"
-                          ],
-                          "properties": {
-                            "dir": {"type": "string"},
-                            "files": {
-                              "type": "array",
-                              "items": {
-                                "type": "object",
-                                "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
-                                "additionalProperties": false,
-                                "required": [
-                                  "name",
-                                  "bytes",
-                                  "content_type",
-                                  "url",
-                                  "kind",
-                                  "item",
-                                  "document",
-                                  "criteria"
-                                ],
-                                "properties": {
-                                  "name": {"type": "string"},
-                                  "bytes": {"type": "integer", "minimum": 0},
-                                  "content_type": {"type": "string"},
-                                  "url": {"type": "string"},
-                                  "kind": {
-                                    "type": "string",
-                                    "description": "What the file is: base image, layer, regions, text, manifest, references"
-                                  },
-                                  "format": {"type": "string"},
-                                  "item": {"type": ["integer", "null"]},
-                                  "document": {"type": ["integer", "null"]},
-                                  "criteria": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "The criteria the file belongs to"
-                                  }
-                                }
-                              }
-                            },
-                            "items": {
-                              "type": "array",
-                              "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["item", "layers"],
-                                "properties": {
-                                  "item": {"type": "integer"},
-                                  "layers": {
-                                    "type": "object",
-                                    "description": "Layer URLs (rendered on first fetch)",
-                                    "additionalProperties": false,
-                                    "required": [],
-                                    "properties": {
-                                      "svg": {"type": "string"},
-                                      "png": {"type": "string"},
-                                      "preview": {"type": "string"}
-                                    }
-                                  }
-                                }
-                              },
-                              "description": "Each item with a page image: its combined layer URLs"
-                            },
-                            "zip_url": {"type": "string"},
-                            "total_bytes": {"type": "integer", "minimum": 0},
-                            "expires_at": {"type": "string", "format": "date-time"},
-                            "dropped": {
-                              "type": "array",
-                              "items": {"type": "string"},
-                              "description": "Files the byte cap removed"
-                            },
-                            "notes": {
-                              "type": "array",
-                              "items": {"type": "string"}
-                            }
-                          }
-                        }
-                      ]
-                    },
-                    "references": {
-                      "anyOf": [
-                        {"type": "null"},
-                        {
-                          "type": "object",
-                          "description": "What the request's references did (§ Result shape, `references`)",
-                          "additionalProperties": false,
-                          "required": [
-                            "mode",
-                            "requested",
-                            "pool",
-                            "pool_truncated",
-                            "resolved",
-                            "inherited",
-                            "criteria",
-                            "selection",
-                            "calls",
-                            "selection_calls"
-                          ],
-                          "properties": {
-                            "mode": {"enum": ["explicit", "auto"]},
-                            "requested": {"description": "The ids (or the auto request) as sent"},
-                            "pool": {
-                              "anyOf": [
-                                {"type": "null"},
-                                {
-                                  "type": "array",
-                                  "items": {"type": "string"}
-                                }
-                              ]
-                            },
-                            "pool_truncated": {"type": "boolean"},
-                            "resolved": {
-                              "type": "array",
-                              "items": {"type": "string"},
-                              "description": "The ids used"
-                            },
-                            "inherited": {
-                              "type": "boolean",
-                              "description": "The criteria were inherited from the references"
-                            },
-                            "criteria": {
-                              "type": "object",
-                              "additionalProperties": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": [
-                                  "matched",
-                                  "matched_by",
-                                  "use",
-                                  "combine",
-                                  "position",
-                                  "examples"
-                                ],
-                                "properties": {
-                                  "matched": {"type": ["string", "null"]},
-                                  "matched_by": {"enum": ["criterion", "key", "name"]},
-                                  "use": {"type": "boolean"},
-                                  "combine": {"type": "string"},
-                                  "position": {"type": "string"},
-                                  "examples": {
-                                    "type": "array",
-                                    "items": {
-                                      "type": "object",
-                                      "additionalProperties": false,
-                                      "required": [
-                                        "reference_id",
-                                        "criterion",
-                                        "polarity",
-                                        "expected"
-                                      ],
-                                      "properties": {
-                                        "reference_id": {
-                                          "type": "string",
-                                          "pattern": "^r[0-9a-f]{12}$",
-                                          "description": "A reference's id: `r` and 12 hex characters"
-                                        },
-                                        "criterion": {"type": "string"},
-                                        "polarity": {"type": "string"},
-                                        "expected": {
-                                          "type": "object",
-                                          "additionalProperties": true,
-                                          "description": "The expected answer: {score, verdict, reason, source}"
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            },
-                            "selection": {
-                              "type": "array",
-                              "items": {
-                                "type": "object",
-                                "additionalProperties": true,
-                                "description": "One item's auto selection: {item, status: ok | failed | skipped, matches: [{id, confidence, reason}], dropped, error, reason}"
-                              }
-                            },
-                            "calls": {
-                              "type": "integer",
-                              "minimum": 0,
-                              "description": "Guided scoring calls"
-                            },
-                            "selection_calls": {"type": "integer", "minimum": 0}
-                          }
-                        }
-                      ]
-                    },
-                    "request": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["criteria", "model"],
-                      "properties": {
-                        "criteria": {
-                          "type": "array",
-                          "items": {
-                            "$comment": "generated from api.schemas.CriterionInput — do not edit",
-                            "additionalProperties": false,
-                            "description": "One criterion: shared fields at the top, type-specific ones in options.\n\n``options`` arrives as a plain object and is replaced, during validation,\nby the options model for ``type`` — so every consumer reads\n``c.options.hint`` on an ``llm`` criterion and never a dict.",
-                            "properties": {
-                              "name": {
-                                "description": "The criterion to evaluate; unique within the request.",
-                                "maxLength": 200,
-                                "minLength": 1,
-                                "type": "string"
-                              },
-                              "key": {
-                                "anyOf": [
-                                  {"maxLength": 200, "minLength": 1, "type": "string"},
-                                  {"type": "null"}
-                                ],
-                                "default": null,
-                                "description": "Optional label used ONLY to find reference examples: the criterion is guided by the reference criteria with the same key (case-insensitive), whatever either is named, and never falls back to its name. options.reference.criterion wins over it. Never shown to the model; results, depends_on and prompts stay on `name`. May repeat in a request; unique within one reference."
-                              },
-                              "type": {
-                                "default": "llm",
-                                "description": "'llm': the vision model scores it (one call per criterion). 'text': deterministic search of the text layer. 'cv': a registered OpenCV detector by name (GET /cv-detectors), with options.fallback when none matches. 'detector': the open-vocabulary detector service, using the name as its text prompt.",
-                                "enum": ["llm", "text", "cv", "detector"],
-                                "type": "string"
-                              },
-                              "weight": {
-                                "default": 1.0,
-                                "description": "Relative weight in the overall score. Default 1.",
-                                "exclusiveMinimum": 0.0,
-                                "type": "number"
-                              },
-                              "depends_on": {
-                                "anyOf": [
-                                  {"type": "string"},
-                                  {"type": "null"}
-                                ],
-                                "default": null,
-                                "description": "Name of another SCORED criterion that must PASS first. Until it does, this criterion is not evaluated at all; if it does not, this one is SKIPPED (no model call spent). Chains propagate."
-                              },
-                              "score": {
-                                "default": true,
-                                "description": "false = locate without judging: the criterion still produces regions but is excluded from the weighted score and the verdict, and its score / verdict / confidence are null. Refused for a criterion that cannot produce geometry.",
-                                "type": "boolean"
-                              },
-                              "options": {
-                                "default": null,
-                                "description": "Type-specific options; see GET /criterion-types."
-                              }
-                            },
-                            "required": ["name"],
-                            "type": "object"
-                          },
-                          "description": "The criteria exactly as validated"
-                        },
-                        "model": {"type": "string", "description": "The job's model, resolved"}
-                      }
-                    },
-                    "usage": {
-                      "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
-                      "type": "object",
-                      "allOf": [
-                        {
-                          "properties": {
-                            "calls": {"type": "integer", "minimum": 0},
-                            "errors": {"type": "integer", "minimum": 0},
-                            "seconds": {"type": "number", "minimum": 0},
-                            "prompt_tokens": {"type": ["integer", "null"]},
-                            "cached_tokens": {"type": ["integer", "null"]},
-                            "completion_tokens": {"type": ["integer", "null"]},
-                            "reasoning_tokens": {"type": ["integer", "null"]},
-                            "total_tokens": {"type": ["integer", "null"]}
-                          }
-                        }
-                      ],
-                      "properties": {
-                        "models": {
-                          "type": "array",
-                          "items": {"type": "string"}
-                        },
-                        "first_call_at": {"type": ["string", "null"], "format": "date-time"},
-                        "last_call_at": {"type": ["string", "null"], "format": "date-time"},
-                        "usage_url": {"type": "string"}
-                      },
-                      "required": [
-                        "calls",
-                        "errors",
-                        "seconds",
-                        "prompt_tokens",
-                        "cached_tokens",
-                        "completion_tokens",
-                        "reasoning_tokens",
-                        "total_tokens",
-                        "models",
-                        "first_call_at",
-                        "last_call_at",
-                        "usage_url"
-                      ],
-                      "unevaluatedProperties": false
-                    }
-                  }
-                }
-              ]
-            },
-            "usage": {
-              "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
-              "type": "object",
-              "allOf": [
-                {
-                  "properties": {
-                    "calls": {"type": "integer", "minimum": 0},
-                    "errors": {"type": "integer", "minimum": 0},
-                    "seconds": {"type": "number", "minimum": 0},
-                    "prompt_tokens": {"type": ["integer", "null"]},
-                    "cached_tokens": {"type": ["integer", "null"]},
-                    "completion_tokens": {"type": ["integer", "null"]},
-                    "reasoning_tokens": {"type": ["integer", "null"]},
-                    "total_tokens": {"type": ["integer", "null"]}
-                  }
-                }
-              ],
-              "properties": {
-                "models": {
-                  "type": "array",
-                  "items": {"type": "string"}
-                },
-                "first_call_at": {"type": ["string", "null"], "format": "date-time"},
-                "last_call_at": {"type": ["string", "null"], "format": "date-time"},
-                "usage_url": {"type": "string"}
-              },
-              "required": [
-                "calls",
-                "errors",
-                "seconds",
-                "prompt_tokens",
-                "cached_tokens",
-                "completion_tokens",
-                "reasoning_tokens",
-                "total_tokens",
-                "models",
-                "first_call_at",
-                "last_call_at",
-                "usage_url"
-              ],
-              "unevaluatedProperties": false
-            }
-          }
-        }
-      ],
-      "description": "Set when the job completed: the assessment (an assess job) or the reference it built"
-    },
-    "error": {"type": ["string", "null"], "description": "Why a failed job failed"}
-  }
-}
+{"$ref": "#/$defs/classifier_job"}
 ```
+
+Uses: [`classifier_job`](#def-classifier_job), [`job_base`](#def-job_base), [`job_id`](#def-job_id), [`job_metadata`](#def-job_metadata), [`assess_result`](#def-assess_result), [`reference_result`](#def-reference_result), [`reference_id`](#def-reference_id), [`progress`](#def-progress), [`document_entry`](#def-document_entry), [`item_row`](#def-item_row), [`breakdown`](#def-breakdown), [`criterion_entry`](#def-criterion_entry), [`job_artifacts`](#def-job_artifacts), [`references_summary`](#def-references_summary), [`criterion_input`](#def-criterion_input), [`job_usage_block`](#def-job_usage_block), [`progress_stage`](#def-progress_stage), [`ocr_layer`](#def-ocr_layer), [`document_layer`](#def-document_layer), [`region`](#def-region), [`criterion_artifacts`](#def-criterion_artifacts), [`localization`](#def-localization), [`unit_entry`](#def-unit_entry), [`llm_detail`](#def-llm_detail), [`text_detail`](#def-text_detail), [`detector_detail`](#def-detector_detail), [`cv_detail`](#def-cv_detail), [`file_label`](#def-file_label), [`layer_links`](#def-layer_links), [`usage_totals_fields`](#def-usage_totals_fields), [`text_link`](#def-text_link), [`box_attempt`](#def-box_attempt), [`detail_llm_mean`](#def-detail_llm_mean), [`detail_llm`](#def-detail_llm), [`aggregate_block`](#def-aggregate_block), [`detail_text_mean`](#def-detail_text_mean), [`detail_text`](#def-detail_text), [`detail_detector_mean`](#def-detail_detector_mean), [`detail_detector`](#def-detail_detector), [`detail_cv_mean`](#def-detail_cv_mean), [`detail_cv`](#def-detail_cv), [`cv_measurements`](#def-cv_measurements), [`measurements_check_blur`](#def-measurements_check_blur), [`measurements_check_exposure`](#def-measurements_check_exposure), [`measurements_detect_faces`](#def-measurements_detect_faces), [`measurements_detect_sky`](#def-measurements_detect_sky), [`measurements_detect_text`](#def-measurements_detect_text), [`measurements_detect_vegetation`](#def-measurements_detect_vegetation), [`measurements_detect_water`](#def-measurements_detect_water) — too large to show inlined (over 64 KiB), so its `$ref`s are kept; each definition is shown once under [Definitions](#definitions).
 
 ## `GET /v1/classifier/jobs/:jobId/progress`
 
@@ -15655,6 +2714,2315 @@ Response `200` (`application/json`):
         "unevaluatedProperties": false
       }
     }
+  }
+}
+```
+
+## Definitions
+
+The definitions (`#/$defs/<name>`) that the schemas above too large to show inlined (over 64 KiB) point to, each shown once, with its own `$ref`s kept. Each such schema's `Uses:` line lists the ones it reaches.
+
+### <a id="def-aggregate_block"></a>`aggregate_block`
+
+```json
+{
+  "type": "object",
+  "description": "`detail.aggregate`: how several members were combined (`AGGREGATE_BLOCK`)",
+  "additionalProperties": false,
+  "required": ["rule", "level", "from", "values"],
+  "properties": {
+    "rule": {"enum": ["any", "worst", "all", "mean", "sum"]},
+    "level": {"enum": ["pages", "documents"]},
+    "from": {
+      "type": ["string", "null"],
+      "description": "The member whose detail this is (any / worst)"
+    },
+    "values": {
+      "type": "object",
+      "additionalProperties": {"type": ["number", "null"]},
+      "description": "Each member's value, by member label (`item n` / `document n`)"
+    }
+  }
+}
+```
+
+### <a id="def-assess_result"></a>`assess_result`
+
+```json
+{
+  "type": "object",
+  "description": "An assess job's result, `schema_version: 3` (§ Result shape)",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "documents",
+    "items",
+    "assessment",
+    "verdict",
+    "page_geometry",
+    "detector",
+    "artifacts",
+    "references",
+    "request"
+  ],
+  "properties": {
+    "schema_version": {"const": 3},
+    "documents": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/document_entry"},
+      "description": "One per document, in request order"
+    },
+    "items": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/item_row"},
+      "description": "One per item"
+    },
+    "assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "overall_score",
+        "overall_verdict",
+        "complete",
+        "weighted_score_breakdown",
+        "per_criterion_scores"
+      ],
+      "properties": {
+        "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
+        "overall_verdict": {
+          "anyOf": [
+            {"type": "null"},
+            {"enum": ["PASS", "MARGINAL", "FAIL"]}
+          ]
+        },
+        "complete": {"type": "boolean", "description": "false when any scored criterion errored"},
+        "weighted_score_breakdown": {
+          "anyOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/breakdown"}
+          ]
+        },
+        "per_criterion_scores": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/criterion_entry"},
+          "description": "By criterion name, in request order"
+        }
+      }
+    },
+    "verdict": {
+      "anyOf": [
+        {"type": "null"},
+        {"enum": ["PASS", "MARGINAL", "FAIL"]}
+      ]
+    },
+    "page_geometry": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "page", "width", "height", "working_scale", "pdf_points"],
+        "properties": {
+          "item": {"type": "integer"},
+          "page": {"type": "integer", "description": "Equals `item`"},
+          "width": {"type": ["integer", "null"]},
+          "height": {"type": ["integer", "null"]},
+          "working_scale": {"type": ["number", "null"]},
+          "pdf_points": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 2,
+                "maxItems": 2
+              }
+            ]
+          }
+        }
+      },
+      "description": "One per item; nulls for an item with no page image"
+    },
+    "detector": {
+      "type": "object",
+      "description": "What the open-vocabulary detector did for the whole job",
+      "additionalProperties": false,
+      "required": [
+        "configured",
+        "url_host",
+        "min_score",
+        "timeout_seconds",
+        "max_labels_per_call",
+        "model",
+        "device",
+        "calls",
+        "labels",
+        "detections",
+        "elapsed_ms",
+        "errors",
+        "used"
+      ],
+      "properties": {
+        "configured": {"type": "boolean"},
+        "url_host": {"type": ["string", "null"]},
+        "min_score": {"type": "number"},
+        "timeout_seconds": {"type": "number"},
+        "max_labels_per_call": {"type": "integer"},
+        "model": {"type": ["string", "null"]},
+        "device": {"type": ["string", "null"]},
+        "calls": {"type": "integer", "minimum": 0},
+        "labels": {"type": "integer", "minimum": 0},
+        "detections": {"type": "integer", "minimum": 0},
+        "elapsed_ms": {"type": "number", "minimum": 0},
+        "errors": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "used": {"type": "boolean"}
+      }
+    },
+    "artifacts": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/job_artifacts"}
+      ]
+    },
+    "references": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/references_summary"}
+      ]
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criteria", "model"],
+      "properties": {
+        "criteria": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/criterion_input"},
+          "description": "The criteria exactly as validated"
+        },
+        "model": {"type": "string", "description": "The job's model, resolved"}
+      }
+    },
+    "usage": {"$ref": "#/$defs/job_usage_block"}
+  }
+}
+```
+
+### <a id="def-box_attempt"></a>`box_attempt`
+
+```json
+{
+  "type": "object",
+  "description": "One box-loop attempt (`llm.boxes.BoxAttempt.as_dict`): keys that never applied are left out",
+  "additionalProperties": false,
+  "required": ["attempt", "bbox_grid", "bbox_px", "valid", "accepted"],
+  "properties": {
+    "item": {
+      "type": "integer",
+      "description": "The unit's item: present exactly when the record merges several items or documents"
+    },
+    "attempt": {"type": "integer", "minimum": 1},
+    "bbox_grid": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 4,
+          "maxItems": 4
+        }
+      ]
+    },
+    "bbox_px": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 4,
+          "maxItems": 4
+        }
+      ]
+    },
+    "valid": {"type": "boolean"},
+    "accepted": {"type": "boolean"},
+    "reject": {"type": "string", "description": "Why the box was rejected (the retry's feedback)"},
+    "verify_score": {"type": "integer"},
+    "verify_reason": {"type": "string"},
+    "verify_partial": {"type": "boolean"},
+    "detector_iou": {"type": "number"},
+    "coarse_bbox_grid": {
+      "type": "array",
+      "items": {"type": "number"}
+    },
+    "refine_window_grid": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"type": "number"}
+        }
+      ]
+    },
+    "refined": {"type": "boolean"},
+    "refine_reject": {"type": "string"},
+    "refine_mode": {"enum": ["marks", "grid"]},
+    "marks_shown": {"type": "integer"},
+    "marks_lines": {"enum": ["native", "ocr", "window"]},
+    "marks": {
+      "type": "array",
+      "items": {"type": "integer"}
+    },
+    "marks_fallback": {"type": "string"}
+  }
+}
+```
+
+### <a id="def-breakdown"></a>`breakdown`
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "formula",
+    "total_weight",
+    "weighted_sum",
+    "unrounded_average",
+    "final_score",
+    "partial",
+    "excluded",
+    "per_criterion"
+  ],
+  "properties": {
+    "formula": {"const": "sum(score * weight) / total_weight"},
+    "total_weight": {"type": "number"},
+    "weighted_sum": {"type": "number"},
+    "unrounded_average": {"type": "number"},
+    "final_score": {"type": "integer"},
+    "partial": {
+      "type": "boolean",
+      "description": "Some scored criterion errored: this is the score of what succeeded"
+    },
+    "excluded": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "description": "Criterion name → why it was left out"
+    },
+    "per_criterion": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["score", "weight", "contribution"],
+        "properties": {
+          "score": {"type": "integer"},
+          "weight": {"type": "number"},
+          "contribution": {"type": "number"}
+        }
+      }
+    }
+  }
+}
+```
+
+### <a id="def-classifier_job"></a>`classifier_job`
+
+```json
+{
+  "description": "One job: the shared `common.jobs` `JobBase` with the classifier's metadata and result",
+  "allOf": [
+    {"$ref": "#/$defs/job_base"}
+  ],
+  "properties": {
+    "job_id": {"$ref": "#/$defs/job_id"},
+    "phase": {
+      "enum": ["staging", "pending", "processing", "completed", "failed", "cancelled"],
+      "description": "`staging` (being written) → `pending` (queued) → `processing` → `completed` | `failed` | `cancelled`"
+    },
+    "metadata": {"$ref": "#/$defs/job_metadata"},
+    "result": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/assess_result"},
+        {"$ref": "#/$defs/reference_result"}
+      ],
+      "description": "Set when the job completed: the assessment (an assess job) or the reference it built"
+    },
+    "error": {"type": ["string", "null"], "description": "Why a failed job failed"}
+  }
+}
+```
+
+### <a id="def-classifier_jobs"></a>`classifier_jobs`
+
+```json
+{
+  "description": "The 20 most recently updated jobs, finished ones included (PostgresRegistry.list_all)",
+  "allOf": [
+    {"$ref": "#/$defs/jobs_list_response"}
+  ],
+  "properties": {
+    "jobs": {
+      "items": {"$ref": "#/$defs/classifier_job"}
+    },
+    "max_concurrent": {"type": "null", "description": "The registry tracks no ceiling"},
+    "available": {"type": "null"}
+  },
+  "required": ["max_concurrent", "available"]
+}
+```
+
+### <a id="def-criterion_artifacts"></a>`criterion_artifacts`
+
+```json
+{
+  "type": "object",
+  "description": "Per-criterion links; null when there is neither geometry nor text",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "slug": {"type": "string", "description": "The criterion's file-name slug"},
+    "regions_url": {"type": "string", "description": "regions.json scoped to the criterion"},
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "count", "layers", "attempts"],
+        "properties": {
+          "item": {"type": "integer"},
+          "count": {"type": "integer", "minimum": 0},
+          "layers": {"$ref": "#/$defs/layer_links"},
+          "attempts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["attempt", "accepted"],
+              "properties": {
+                "attempt": {"type": "integer"},
+                "accepted": {"type": "boolean"},
+                "svg": {"type": "string"},
+                "png": {"type": "string"},
+                "preview": {"type": "string"}
+              }
+            },
+            "description": "One per enforcement-loop attempt with a drawable box on the item"
+          }
+        }
+      },
+      "description": "Per item it found something on"
+    },
+    "text": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/text_link"},
+      "description": "One link per text layer its units read"
+    }
+  }
+}
+```
+
+### <a id="def-criterion_entry"></a>`criterion_entry`
+
+```json
+{
+  "type": "object",
+  "description": "One criterion: the same keys for every type and status (§ Result shape)",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "type",
+    "key",
+    "method",
+    "scored",
+    "score",
+    "verdict",
+    "confidence",
+    "reason",
+    "detail",
+    "regions",
+    "regions_truncated",
+    "artifacts",
+    "localization",
+    "options_used",
+    "error",
+    "complete",
+    "aggregate_used",
+    "items"
+  ],
+  "properties": {
+    "status": {
+      "enum": ["ok", "error", "skipped"],
+      "description": "`ok` when at least one unit answered, `error` when none did and one errored, `skipped` when every unit was skipped"
+    },
+    "type": {"enum": ["llm", "text", "detector", "cv"]},
+    "key": {"type": ["string", "null"], "description": "The criterion's `key` as sent (stripped)"},
+    "method": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "enum": ["llm", "text", "detector", "cv"],
+          "description": "The path that answered (a cv fallback's); null when skipped by a dependency"
+        }
+      ]
+    },
+    "scored": {"type": "boolean", "description": "The criterion's `score` flag"},
+    "score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
+    "verdict": {
+      "anyOf": [
+        {"type": "null"},
+        {"enum": ["PASS", "MARGINAL", "FAIL"]}
+      ]
+    },
+    "confidence": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+    "reason": {"type": "string"},
+    "detail": {
+      "description": "Structured diagnostics: its method's declared shape (GET /criterion-types `result`), or null"
+    },
+    "regions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/region"},
+      "description": "The union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX"
+    },
+    "regions_truncated": {"type": "boolean"},
+    "artifacts": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/criterion_artifacts"}
+      ]
+    },
+    "localization": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/localization"}
+      ]
+    },
+    "options_used": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Options after defaults and caps, `aggregate` resolved — the keys of the type's options (GET /criterion-types `types.<type>.defaults`)"
+    },
+    "error": {"type": ["string", "null"]},
+    "complete": {"type": "boolean", "description": "false when any of its units errored"},
+    "aggregate_used": {
+      "type": "object",
+      "description": "The rules applied; `pages: null` plus a `note` for a document-scope text criterion",
+      "additionalProperties": false,
+      "required": ["pages", "documents"],
+      "properties": {
+        "pages": {"type": ["string", "null"]},
+        "documents": {"type": "string"},
+        "note": {"type": "string"}
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/unit_entry"},
+      "description": "One entry per unit"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "method": {"const": "llm"}
+        },
+        "required": ["method"]
+      },
+      "then": {
+        "properties": {
+          "detail": {"$ref": "#/$defs/llm_detail"},
+          "items": {
+            "items": {
+              "properties": {
+                "detail": {"$ref": "#/$defs/llm_detail"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {"const": "text"}
+        },
+        "required": ["method"]
+      },
+      "then": {
+        "properties": {
+          "detail": {"$ref": "#/$defs/text_detail"},
+          "items": {
+            "items": {
+              "properties": {
+                "detail": {"$ref": "#/$defs/text_detail"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {"const": "detector"}
+        },
+        "required": ["method"]
+      },
+      "then": {
+        "properties": {
+          "detail": {"$ref": "#/$defs/detector_detail"},
+          "items": {
+            "items": {
+              "properties": {
+                "detail": {"$ref": "#/$defs/detector_detail"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {"const": "cv"}
+        },
+        "required": ["method"]
+      },
+      "then": {
+        "properties": {
+          "detail": {"$ref": "#/$defs/cv_detail"},
+          "items": {
+            "items": {
+              "properties": {
+                "detail": {"$ref": "#/$defs/cv_detail"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {"type": "null"}
+        },
+        "required": ["method"]
+      },
+      "then": {
+        "properties": {
+          "detail": {"type": "null"}
+        }
+      }
+    }
+  ]
+}
+```
+
+### <a id="def-criterion_input"></a>`criterion_input`
+
+```json
+{
+  "$comment": "generated from api.schemas.CriterionInput — do not edit",
+  "additionalProperties": false,
+  "description": "One criterion: shared fields at the top, type-specific ones in options.\n\n``options`` arrives as a plain object and is replaced, during validation,\nby the options model for ``type`` — so every consumer reads\n``c.options.hint`` on an ``llm`` criterion and never a dict.",
+  "properties": {
+    "name": {
+      "description": "The criterion to evaluate; unique within the request.",
+      "maxLength": 200,
+      "minLength": 1,
+      "type": "string"
+    },
+    "key": {
+      "anyOf": [
+        {"maxLength": 200, "minLength": 1, "type": "string"},
+        {"type": "null"}
+      ],
+      "default": null,
+      "description": "Optional label used ONLY to find reference examples: the criterion is guided by the reference criteria with the same key (case-insensitive), whatever either is named, and never falls back to its name. options.reference.criterion wins over it. Never shown to the model; results, depends_on and prompts stay on `name`. May repeat in a request; unique within one reference."
+    },
+    "type": {
+      "default": "llm",
+      "description": "'llm': the vision model scores it (one call per criterion). 'text': deterministic search of the text layer. 'cv': a registered OpenCV detector by name (GET /cv-detectors), with options.fallback when none matches. 'detector': the open-vocabulary detector service, using the name as its text prompt.",
+      "enum": ["llm", "text", "cv", "detector"],
+      "type": "string"
+    },
+    "weight": {
+      "default": 1.0,
+      "description": "Relative weight in the overall score. Default 1.",
+      "exclusiveMinimum": 0.0,
+      "type": "number"
+    },
+    "depends_on": {
+      "anyOf": [
+        {"type": "string"},
+        {"type": "null"}
+      ],
+      "default": null,
+      "description": "Name of another SCORED criterion that must PASS first. Until it does, this criterion is not evaluated at all; if it does not, this one is SKIPPED (no model call spent). Chains propagate."
+    },
+    "score": {
+      "default": true,
+      "description": "false = locate without judging: the criterion still produces regions but is excluded from the weighted score and the verdict, and its score / verdict / confidence are null. Refused for a criterion that cannot produce geometry.",
+      "type": "boolean"
+    },
+    "options": {"default": null, "description": "Type-specific options; see GET /criterion-types."}
+  },
+  "required": ["name"],
+  "type": "object"
+}
+```
+
+### <a id="def-cv_detail"></a>`cv_detail`
+
+```json
+{
+  "description": "An `cv` detail, or null (skipped, errored)",
+  "anyOf": [
+    {"type": "null"},
+    {
+      "if": {
+        "properties": {
+          "aggregate": {
+            "properties": {
+              "rule": {"const": "mean"}
+            },
+            "required": ["rule"]
+          }
+        },
+        "required": ["aggregate"]
+      },
+      "then": {"$ref": "#/$defs/detail_cv_mean"},
+      "else": {"$ref": "#/$defs/detail_cv"},
+      "properties": {
+        "aggregate": {"$ref": "#/$defs/aggregate_block"}
+      },
+      "allOf": [
+        {"$ref": "#/$defs/cv_measurements"}
+      ]
+    }
+  ]
+}
+```
+
+### <a id="def-cv_measurements"></a>`cv_measurements`
+
+```json
+{
+  "$comment": "generated from cv.REGISTRY — do not edit",
+  "description": "A cv `detail`'s `measurements` are its own detector's (GET /cv-detectors).",
+  "properties": {
+    "detector": {
+      "enum": [
+        "check_blur",
+        "check_exposure",
+        "detect_faces",
+        "detect_sky",
+        "detect_text",
+        "detect_vegetation",
+        "detect_water"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "check_blur"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_check_blur"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "check_exposure"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_check_exposure"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "detect_faces"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_detect_faces"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "detect_sky"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_detect_sky"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "detect_text"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_detect_text"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "detect_vegetation"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_detect_vegetation"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "detector": {"const": "detect_water"}
+        },
+        "required": ["detector"]
+      },
+      "then": {
+        "properties": {
+          "measurements": {"$ref": "#/$defs/measurements_detect_water"}
+        }
+      }
+    }
+  ]
+}
+```
+
+### <a id="def-detail_cv"></a>`detail_cv`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['cv'] — do not edit",
+  "type": "object",
+  "description": "`detail` of a `cv` criterion",
+  "additionalProperties": false,
+  "required": ["metric", "value", "detector", "measurements", "thresholds", "parameters", "image"],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": "number",
+      "description": "The headline number (the mean of the members' values under `mean`)"
+    },
+    "detector": {"type": "string", "description": "The OpenCV function that ran"},
+    "measurements": {
+      "type": "object",
+      "description": "Everything the detector counted — its keys: GET /cv-detectors",
+      "additionalProperties": true
+    },
+    "thresholds": {
+      "type": "object",
+      "description": "The lines that decide the verdict",
+      "additionalProperties": true
+    },
+    "parameters": {
+      "type": "object",
+      "description": "Config values it measured with",
+      "additionalProperties": true
+    },
+    "state": {
+      "type": "string",
+      "description": "A categorical outcome — its values: GET /cv-detectors (present only when the detector declares states)"
+    },
+    "image": {
+      "type": "object",
+      "description": "The working-image frame the *_px measurements are in",
+      "additionalProperties": true
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_cv_mean"></a>`detail_cv_mean`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['cv'], the stable keys a `mean` keeps — do not edit",
+  "type": "object",
+  "description": "`detail` of a `cv` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
+  "additionalProperties": false,
+  "required": ["metric", "value", "detector", "thresholds", "parameters", "image", "aggregate"],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": "number",
+      "description": "The headline number (the mean of the members' values under `mean`)"
+    },
+    "detector": {"type": "string", "description": "The OpenCV function that ran"},
+    "thresholds": {
+      "type": "object",
+      "description": "The lines that decide the verdict",
+      "additionalProperties": true
+    },
+    "parameters": {
+      "type": "object",
+      "description": "Config values it measured with",
+      "additionalProperties": true
+    },
+    "image": {
+      "type": "object",
+      "description": "The working-image frame the *_px measurements are in",
+      "additionalProperties": true
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail`",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_detector"></a>`detail_detector`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['detector'] — do not edit",
+  "type": "object",
+  "description": "`detail` of a `detector` criterion",
+  "additionalProperties": false,
+  "required": ["metric", "value", "detector_matches", "best_score", "min_score"],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": "number",
+      "description": "The headline number (the mean of the members' values under `mean`)"
+    },
+    "detector_matches": {"type": "integer", "description": "Boxes found at or above min_score"},
+    "best_score": {"type": "number", "description": "The best box's confidence, 0-1; 0 when none"},
+    "min_score": {"type": "number", "description": "The confidence floor used"},
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_detector_mean"></a>`detail_detector_mean`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['detector'], the stable keys a `mean` keeps — do not edit",
+  "type": "object",
+  "description": "`detail` of a `detector` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
+  "additionalProperties": false,
+  "required": ["metric", "value", "min_score", "aggregate"],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": "number",
+      "description": "The headline number (the mean of the members' values under `mean`)"
+    },
+    "min_score": {"type": "number", "description": "The confidence floor used"},
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail`",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_llm"></a>`detail_llm`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['llm'] — do not edit",
+  "type": "object",
+  "description": "`detail` of a `llm` criterion",
+  "additionalProperties": false,
+  "required": ["metric", "value", "hint", "model", "image_sent", "text_sent", "confidence"],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": ["number", "null"],
+      "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
+    },
+    "hint": {"type": "string", "description": "The rubric the model was asked to use"},
+    "model": {
+      "type": "string",
+      "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
+    },
+    "image_sent": {
+      "type": "boolean",
+      "description": "Whether the page image was attached (never, for a text-only model)"
+    },
+    "text_sent": {
+      "type": "object",
+      "description": "The text attached: `{chars, truncated, budget, source}`",
+      "additionalProperties": true
+    },
+    "confidence": {
+      "type": ["object", "null"],
+      "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
+      "additionalProperties": true
+    },
+    "reference": {
+      "type": "object",
+      "description": "What the request's references did for this unit: `{applied, mode, combine, examples: [{reference_id, criterion, expected, polarity, region, call}], calls: [{call, images, score, verdict, confidence, verdict_probability, reason, chosen, error}], position: null | {status, iou, center_offset, min_iou, max_offset, reference_id, capped_from}, note}` (present only when the request listed `references` (applied: false when no example matched))",
+      "additionalProperties": true
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_llm_mean"></a>`detail_llm_mean`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
+  "type": "object",
+  "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
+  "additionalProperties": false,
+  "required": ["metric", "value", "hint", "model", "image_sent", "aggregate"],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": ["number", "null"],
+      "description": "The model's score, 1-10 — null for a `score: false` criterion, whose judgement is not reported"
+    },
+    "hint": {"type": "string", "description": "The rubric the model was asked to use"},
+    "model": {
+      "type": "string",
+      "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
+    },
+    "image_sent": {
+      "type": "boolean",
+      "description": "Whether the page image was attached (never, for a text-only model)"
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail`",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_text"></a>`detail_text`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['text'] — do not edit",
+  "type": "object",
+  "description": "`detail` of a `text` criterion",
+  "additionalProperties": false,
+  "required": [
+    "metric",
+    "value",
+    "found",
+    "count",
+    "best_ratio",
+    "mode",
+    "pattern",
+    "snippets",
+    "searched_chars",
+    "case_sensitive",
+    "min_count",
+    "fuzzy_threshold",
+    "text_source"
+  ],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": "number",
+      "description": "The headline number (the mean of the members' values under `mean`)"
+    },
+    "found": {"type": "boolean", "description": "Whether count reached min_count"},
+    "count": {"type": "integer", "description": "Hits found (summed across members under `sum`)"},
+    "best_ratio": {
+      "type": "number",
+      "description": "Best similarity seen, 0-1 — 1.0 for a literal/regex hit"
+    },
+    "mode": {"type": "string", "description": "The match mode used"},
+    "pattern": {"type": "string", "description": "What was searched for"},
+    "snippets": {"type": "array", "description": "Up to 8 context excerpts around the hits"},
+    "searched_chars": {"type": "integer", "description": "Characters searched"},
+    "case_sensitive": {"type": "boolean", "description": "Whether matching was case-sensitive"},
+    "min_count": {"type": "integer", "description": "Hits required to PASS"},
+    "fuzzy_threshold": {
+      "type": ["number", "null"],
+      "description": "Similarity a fuzzy window must reach; null for other modes"
+    },
+    "text_source": {
+      "type": "string",
+      "description": "native | ocr | none — or `mixed` when summed across members that differ"
+    },
+    "scope": {
+      "type": "string",
+      "description": "`document` when the pages were searched joined (present only when options.scope is document)"
+    },
+    "separator": {
+      "type": "string",
+      "description": "What joined the pages (present only when options.scope is document)"
+    },
+    "items_with_hits": {
+      "type": "array",
+      "description": "Items the hits landed on (present only when options.scope is document)"
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail` (present only when the criterion ran on more than one item or document)",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detail_text_mean"></a>`detail_text_mean`
+
+```json
+{
+  "$comment": "generated from analysis.result_specs.specs()['text'], the stable keys a `mean` keeps — do not edit",
+  "type": "object",
+  "description": "`detail` of a `text` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
+  "additionalProperties": false,
+  "required": [
+    "metric",
+    "value",
+    "mode",
+    "pattern",
+    "case_sensitive",
+    "min_count",
+    "fuzzy_threshold",
+    "aggregate"
+  ],
+  "properties": {
+    "metric": {"type": "string", "description": "Name of the headline number"},
+    "value": {
+      "type": "number",
+      "description": "The headline number (the mean of the members' values under `mean`)"
+    },
+    "mode": {"type": "string", "description": "The match mode used"},
+    "pattern": {"type": "string", "description": "What was searched for"},
+    "case_sensitive": {"type": "boolean", "description": "Whether matching was case-sensitive"},
+    "min_count": {"type": "integer", "description": "Hits required to PASS"},
+    "fuzzy_threshold": {
+      "type": ["number", "null"],
+      "description": "Similarity a fuzzy window must reach; null for other modes"
+    },
+    "scope": {
+      "type": "string",
+      "description": "`document` when the pages were searched joined (present only when options.scope is document)"
+    },
+    "separator": {
+      "type": "string",
+      "description": "What joined the pages (present only when options.scope is document)"
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "How several members were combined — see `aggregate_detail`",
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+### <a id="def-detector_detail"></a>`detector_detail`
+
+```json
+{
+  "description": "An `detector` detail, or null (skipped, errored)",
+  "anyOf": [
+    {"type": "null"},
+    {
+      "if": {
+        "properties": {
+          "aggregate": {
+            "properties": {
+              "rule": {"const": "mean"}
+            },
+            "required": ["rule"]
+          }
+        },
+        "required": ["aggregate"]
+      },
+      "then": {"$ref": "#/$defs/detail_detector_mean"},
+      "else": {"$ref": "#/$defs/detail_detector"},
+      "properties": {
+        "aggregate": {"$ref": "#/$defs/aggregate_block"}
+      }
+    }
+  ]
+}
+```
+
+### <a id="def-document_entry"></a>`document_entry`
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["index", "filename", "kind", "pages", "items", "warnings", "document_info"],
+  "properties": {
+    "index": {"type": "integer", "minimum": 0},
+    "filename": {"type": "string"},
+    "kind": {"enum": ["image", "pdf", "svg", "txt", "docx"]},
+    "pages": {"type": "integer", "minimum": 1},
+    "items": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "description": "Its global item indices"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "How the document was read that is worth knowing but is not an error (an SVG's external references); [] otherwise"
+    },
+    "document_info": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_type",
+        "size_bytes",
+        "has_image",
+        "native_text_chars",
+        "ocr",
+        "llm_text_char_budget"
+      ],
+      "properties": {
+        "content_type": {"type": "string"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "has_image": {"type": "boolean", "description": "Any page has an image"},
+        "native_text_chars": {"type": "integer", "minimum": 0},
+        "ocr": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["engine", "min_native_chars", "layers", "document_layers"],
+          "properties": {
+            "engine": {"type": "string"},
+            "min_native_chars": {"type": "integer"},
+            "layers": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/ocr_layer"}
+            },
+            "document_layers": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/document_layer"}
+            }
+          }
+        },
+        "llm_text_char_budget": {"type": "integer", "description": "The job model's text budget"}
+      }
+    }
+  }
+}
+```
+
+### <a id="def-document_layer"></a>`document_layer`
+
+```json
+{
+  "type": "object",
+  "description": "The joined text a `scope: \"document\"` search read",
+  "additionalProperties": false,
+  "required": ["key", "source", "chars", "file"],
+  "properties": {
+    "key": {"type": "string"},
+    "source": {"type": "string"},
+    "chars": {"type": "integer", "minimum": 0},
+    "file": {"type": "string", "description": "`text.d{index}.<key>.json`"}
+  }
+}
+```
+
+### <a id="def-file_label"></a>`file_label`
+
+```json
+{
+  "type": "object",
+  "description": "One file of the artifact directory, labelled (`regions.artifacts.FileLabeler`); `format` only for a layer or a text file",
+  "additionalProperties": false,
+  "required": ["name", "bytes", "content_type", "url", "kind", "item", "document", "criteria"],
+  "properties": {
+    "name": {"type": "string"},
+    "bytes": {"type": "integer", "minimum": 0},
+    "content_type": {"type": "string"},
+    "url": {"type": "string"},
+    "kind": {
+      "type": "string",
+      "description": "What the file is: base image, layer, regions, text, manifest, references"
+    },
+    "format": {"type": "string"},
+    "item": {"type": ["integer", "null"]},
+    "document": {"type": ["integer", "null"]},
+    "criteria": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "The criteria the file belongs to"
+    }
+  }
+}
+```
+
+### <a id="def-item_row"></a>`item_row`
+
+```json
+{
+  "type": "object",
+  "description": "One item's own weighted answer, from its per-criterion unit results (§ Scores per item, and overall)",
+  "additionalProperties": false,
+  "required": [
+    "item",
+    "document",
+    "page",
+    "filename",
+    "overall_score",
+    "overall_verdict",
+    "complete"
+  ],
+  "properties": {
+    "item": {"type": "integer", "minimum": 0},
+    "document": {"type": "integer", "minimum": 0},
+    "page": {"type": "integer", "minimum": 0, "description": "Within its document"},
+    "filename": {"type": "string"},
+    "overall_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
+    "overall_verdict": {
+      "anyOf": [
+        {"type": "null"},
+        {"enum": ["PASS", "MARGINAL", "FAIL"]}
+      ]
+    },
+    "complete": {"type": "boolean"}
+  }
+}
+```
+
+### <a id="def-job_artifacts"></a>`job_artifacts`
+
+```json
+{
+  "type": "object",
+  "description": "The job's artifact directory",
+  "additionalProperties": false,
+  "required": ["dir", "files", "items", "zip_url", "total_bytes", "expires_at", "dropped", "notes"],
+  "properties": {
+    "dir": {"type": "string"},
+    "files": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/file_label"}
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "layers"],
+        "properties": {
+          "item": {"type": "integer"},
+          "layers": {"$ref": "#/$defs/layer_links"}
+        }
+      },
+      "description": "Each item with a page image: its combined layer URLs"
+    },
+    "zip_url": {"type": "string"},
+    "total_bytes": {"type": "integer", "minimum": 0},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "dropped": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Files the byte cap removed"
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}
+```
+
+### <a id="def-job_base"></a>`job_base`
+
+```json
+{
+  "$comment": "generated from common.jobs.model.JobBase — do not edit",
+  "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+  "properties": {
+    "job_id": {"type": "string"},
+    "phase": {"type": "string"},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "elapsed_seconds": {"type": "number"},
+    "metadata": {"additionalProperties": true, "type": "object"},
+    "result": {
+      "anyOf": [
+        {"additionalProperties": true, "type": "object"},
+        {"type": "null"}
+      ],
+      "default": null
+    },
+    "error": {
+      "anyOf": [
+        {"type": "string"},
+        {"type": "null"}
+      ],
+      "default": null
+    }
+  },
+  "required": ["job_id", "phase", "created_at", "updated_at", "elapsed_seconds", "metadata"],
+  "type": "object",
+  "additionalProperties": false
+}
+```
+
+### <a id="def-job_id"></a>`job_id`
+
+```json
+{"type": "string", "pattern": "^[0-9a-f]{12}$", "description": "A job's id: 12 hex characters"}
+```
+
+### <a id="def-job_metadata"></a>`job_metadata`
+
+```json
+{
+  "type": "object",
+  "description": "`ClassifierMetadata` (left-out keys when unset) plus the progress snapshot",
+  "additionalProperties": false,
+  "required": ["type", "request_id"],
+  "properties": {
+    "type": {
+      "enum": ["assess", "reference", "compare", "locate"],
+      "description": "assess (POST /assess) or reference (the creation job POST /references queues); a row written by an older container may still say compare or locate (the worker fails it)"
+    },
+    "request_id": {
+      "type": "string",
+      "description": "The correlation id of the request that queued the job"
+    },
+    "reference_id": {
+      "type": "string",
+      "pattern": "^r[0-9a-f]{12}$",
+      "description": "A reference job: the reference it builds"
+    },
+    "references": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/reference_id"},
+      "description": "An assess job: the reference ids it reads"
+    },
+    "progress": {"$ref": "#/$defs/progress"}
+  }
+}
+```
+
+### <a id="def-job_usage_block"></a>`job_usage_block`
+
+```json
+{
+  "description": "What the job's model requests cost: GET /jobs/{id}/usage's `totals`, plus `usage_url` (added after the runner returns; left out when the read failed)",
+  "type": "object",
+  "allOf": [
+    {"$ref": "#/$defs/usage_totals_fields"}
+  ],
+  "properties": {
+    "models": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "first_call_at": {"type": ["string", "null"], "format": "date-time"},
+    "last_call_at": {"type": ["string", "null"], "format": "date-time"},
+    "usage_url": {"type": "string"}
+  },
+  "required": [
+    "calls",
+    "errors",
+    "seconds",
+    "prompt_tokens",
+    "cached_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+    "models",
+    "first_call_at",
+    "last_call_at",
+    "usage_url"
+  ],
+  "unevaluatedProperties": false
+}
+```
+
+### <a id="def-JobBase"></a>`JobBase`
+
+```json
+{
+  "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+  "properties": {
+    "job_id": {"type": "string"},
+    "phase": {"type": "string"},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "elapsed_seconds": {"type": "number"},
+    "metadata": {"additionalProperties": true, "type": "object"},
+    "result": {
+      "anyOf": [
+        {"additionalProperties": true, "type": "object"},
+        {"type": "null"}
+      ],
+      "default": null
+    },
+    "error": {
+      "anyOf": [
+        {"type": "string"},
+        {"type": "null"}
+      ],
+      "default": null
+    }
+  },
+  "required": ["job_id", "phase", "created_at", "updated_at", "elapsed_seconds", "metadata"],
+  "type": "object",
+  "additionalProperties": false
+}
+```
+
+### <a id="def-jobs_list_response"></a>`jobs_list_response`
+
+```json
+{
+  "$comment": "generated from common.jobs.model.JobsListResponse — do not edit",
+  "description": "Response body for ``GET /jobs``.\n\n``max_concurrent`` and ``available`` are populated by backends that have\na concurrency ceiling (like the in-memory backend fronted by a port pool);\npersistent backends leave them ``None``.",
+  "properties": {
+    "active_count": {"type": "integer"},
+    "jobs": {
+      "items": {"$ref": "#/$defs/JobBase"},
+      "type": "array"
+    },
+    "max_concurrent": {
+      "anyOf": [
+        {"type": "integer"},
+        {"type": "null"}
+      ],
+      "default": null
+    },
+    "available": {
+      "anyOf": [
+        {"type": "integer"},
+        {"type": "null"}
+      ],
+      "default": null
+    }
+  },
+  "required": ["active_count", "jobs"],
+  "type": "object",
+  "additionalProperties": false
+}
+```
+
+### <a id="def-layer_links"></a>`layer_links`
+
+```json
+{
+  "type": "object",
+  "description": "Layer URLs (rendered on first fetch)",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "svg": {"type": "string"},
+    "png": {"type": "string"},
+    "preview": {"type": "string"}
+  }
+}
+```
+
+### <a id="def-llm_detail"></a>`llm_detail`
+
+```json
+{
+  "description": "An `llm` detail, or null (skipped, errored)",
+  "anyOf": [
+    {"type": "null"},
+    {
+      "if": {
+        "properties": {
+          "aggregate": {
+            "properties": {
+              "rule": {"const": "mean"}
+            },
+            "required": ["rule"]
+          }
+        },
+        "required": ["aggregate"]
+      },
+      "then": {"$ref": "#/$defs/detail_llm_mean"},
+      "else": {"$ref": "#/$defs/detail_llm"},
+      "properties": {
+        "aggregate": {"$ref": "#/$defs/aggregate_block"}
+      }
+    }
+  ]
+}
+```
+
+### <a id="def-localization"></a>`localization`
+
+```json
+{
+  "description": "The llm enforcement loop's record; `{attempts: [], accepted_attempt: null, calls: 0}` when it did not run (§ The LLM enforcement loop). With one item it is that item's record verbatim; with several (pages of a document, or documents) it is merged",
+  "oneOf": [
+    {
+      "type": "object",
+      "description": "One unit's record (a single item): attempts untagged, `accepted_attempt` the accepted attempt's number or null, no `accepted`",
+      "additionalProperties": false,
+      "required": ["attempts", "accepted_attempt", "calls"],
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {"$ref": "#/$defs/box_attempt"},
+              {
+                "not": {"required": ["item"]}
+              }
+            ]
+          }
+        },
+        "accepted_attempt": {"type": ["integer", "null"]},
+        "calls": {"type": "integer", "minimum": 0},
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "item",
+              "applied",
+              "ask_images",
+              "examples",
+              "ask",
+              "refine",
+              "verify",
+              "note"
+            ],
+            "properties": {
+              "item": {"type": "integer"},
+              "applied": {"type": "boolean"},
+              "ask_images": {
+                "anyOf": [
+                  {"type": "null"},
+                  {"enum": ["composite", "crop"]}
+                ]
+              },
+              "examples": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "{reference_id, criterion, polarity, composite}"
+                }
+              },
+              "ask": {"type": "boolean"},
+              "refine": {"type": "boolean"},
+              "verify": {"type": "boolean"},
+              "note": {"type": ["string", "null"]}
+            }
+          },
+          "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "description": "Merged across several items (a document's pages) or documents: every attempt tagged with its `item`, `accepted_attempt` null, `accepted` listing each accepted box",
+      "additionalProperties": false,
+      "required": ["attempts", "accepted_attempt", "accepted", "calls"],
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {"$ref": "#/$defs/box_attempt"},
+              {"required": ["item"]}
+            ]
+          }
+        },
+        "accepted_attempt": {"type": "null"},
+        "accepted": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["item", "attempt"],
+            "properties": {
+              "item": {"type": "integer"},
+              "attempt": {"type": "integer"}
+            }
+          },
+          "description": "Each accepted box, by item and that item's attempt number"
+        },
+        "calls": {"type": "integer", "minimum": 0},
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "item",
+              "applied",
+              "ask_images",
+              "examples",
+              "ask",
+              "refine",
+              "verify",
+              "note"
+            ],
+            "properties": {
+              "item": {"type": "integer"},
+              "applied": {"type": "boolean"},
+              "ask_images": {
+                "anyOf": [
+                  {"type": "null"},
+                  {"enum": ["composite", "crop"]}
+                ]
+              },
+              "examples": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "{reference_id, criterion, polarity, composite}"
+                }
+              },
+              "ask": {"type": "boolean"},
+              "refine": {"type": "boolean"},
+              "verify": {"type": "boolean"},
+              "note": {"type": ["string", "null"]}
+            }
+          },
+          "description": "What the loop was shown, one entry per unit whose loop ran (only with references and a guide)"
+        }
+      }
+    }
+  ]
+}
+```
+
+### <a id="def-measurements_check_blur"></a>`measurements_check_blur`
+
+```json
+{
+  "$comment": "generated from cv.quality.check_blur — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (Laplacian variance)",
+  "additionalProperties": false,
+  "properties": {
+    "laplacian_variance": {
+      "type": "number",
+      "description": "Variance of the Laplacian of the greyscale page — higher is sharper (unit: variance)"
+    }
+  }
+}
+```
+
+### <a id="def-measurements_check_exposure"></a>`measurements_check_exposure`
+
+```json
+{
+  "$comment": "generated from cv.quality.check_exposure — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (Mean pixel intensity)",
+  "additionalProperties": false,
+  "properties": {
+    "mean_intensity": {
+      "type": "number",
+      "description": "Mean greyscale value of the page, 0 (black) to 255 (white) (unit: intensity)"
+    }
+  }
+}
+```
+
+### <a id="def-measurements_detect_faces"></a>`measurements_detect_faces`
+
+```json
+{
+  "$comment": "generated from cv.features.detect_faces — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (OpenCV Haar cascade)",
+  "additionalProperties": false,
+  "properties": {
+    "faces_count": {
+      "type": "number",
+      "description": "Faces the score is based on: the strict pass's, else the loose pass's (unit: count)"
+    },
+    "faces_high_count": {
+      "type": "number",
+      "description": "Faces found by the strict pass (min_neighbors_high); null when unavailable (unit: count)"
+    },
+    "faces_low_count": {
+      "type": "number",
+      "description": "Faces found by the loose pass (min_neighbors_low); null when it did not run (unit: count)"
+    }
+  }
+}
+```
+
+### <a id="def-measurements_detect_sky"></a>`measurements_detect_sky`
+
+```json
+{
+  "$comment": "generated from cv.features.detect_sky — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (Upper-region blue/grey analysis)",
+  "additionalProperties": false,
+  "properties": {
+    "sky_ratio": {
+      "type": "number",
+      "description": "Share of the analysed top band that is sky-coloured (unit: ratio)"
+    },
+    "sky_px": {
+      "type": "number",
+      "description": "Sky-coloured pixels in the band (blue or grey) (unit: px)"
+    },
+    "blue_px": {"type": "number", "description": "Pixels matching the clear-blue range (unit: px)"},
+    "grey_px": {
+      "type": "number",
+      "description": "Pixels matching the overcast-grey range (unit: px)"
+    },
+    "analysed_px": {
+      "type": "number",
+      "description": "Pixels in the top band (top_fraction of the page) (unit: px)"
+    }
+  }
+}
+```
+
+### <a id="def-measurements_detect_text"></a>`measurements_detect_text`
+
+```json
+{
+  "$comment": "generated from cv.features.detect_text — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (Sobel edge density per block)",
+  "additionalProperties": false,
+  "properties": {
+    "dense_block_ratio": {
+      "type": "number",
+      "description": "Share of blocks whose edge density is above block_density (unit: ratio)"
+    },
+    "dense_blocks_count": {
+      "type": "number",
+      "description": "Blocks above block_density (unit: count)"
+    },
+    "total_blocks_count": {
+      "type": "number",
+      "description": "Blocks the page was divided into (unit: count)"
+    },
+    "text_regions_count": {
+      "type": "number",
+      "description": "Merged text regions returned as boxes (unit: count)"
+    }
+  }
+}
+```
+
+### <a id="def-measurements_detect_vegetation"></a>`measurements_detect_vegetation`
+
+```json
+{
+  "$comment": "generated from cv.features.detect_vegetation — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (HSV green masking)",
+  "additionalProperties": false,
+  "properties": {
+    "green_ratio": {
+      "type": "number",
+      "description": "Share of the page's pixels inside the green mask (unit: ratio)"
+    },
+    "green_px": {"type": "number", "description": "Pixels inside the green mask (unit: px)"},
+    "total_px": {"type": "number", "description": "Pixels in the page (unit: px)"}
+  }
+}
+```
+
+### <a id="def-measurements_detect_water"></a>`measurements_detect_water`
+
+```json
+{
+  "$comment": "generated from cv.features.detect_water — do not edit",
+  "type": "object",
+  "description": "`measurements` of the detector (Blue/teal hue + flat-texture)",
+  "additionalProperties": false,
+  "properties": {
+    "water_ratio": {
+      "type": "number",
+      "description": "Share of the page in blue blobs that passed the flat-texture test (unit: ratio)"
+    },
+    "water_px": {"type": "number", "description": "Area of those qualifying blobs (unit: px)"},
+    "total_px": {"type": "number", "description": "Pixels in the page (unit: px)"},
+    "blue_blobs_count": {
+      "type": "number",
+      "description": "Blue/teal blobs found, of any size (unit: count)"
+    },
+    "candidates_count": {
+      "type": "number",
+      "description": "Blobs large enough to test (min_contour_area_px) (unit: count)"
+    },
+    "flat_count": {
+      "type": "number",
+      "description": "Candidates flat enough to be water (unit: count)"
+    },
+    "rejected_textured_count": {
+      "type": "number",
+      "description": "Candidates rejected as too textured — a blue car, a shirt (unit: count)"
+    }
+  }
+}
+```
+
+### <a id="def-ocr_layer"></a>`ocr_layer`
+
+```json
+{
+  "type": "object",
+  "description": "One text layer one item's criteria asked for (`text.p{item}.<key>.json`)",
+  "additionalProperties": false,
+  "required": ["item", "key", "mode", "ran", "source", "chars", "confidence", "note"],
+  "properties": {
+    "item": {"type": "integer"},
+    "key": {"type": "string", "description": "The text-layer key (the OCR settings)"},
+    "mode": {"enum": ["auto", "always", "never"]},
+    "ran": {"type": "boolean", "description": "Whether OCR ran for this layer"},
+    "source": {"type": "string", "description": "native | ocr | none"},
+    "chars": {"type": "integer", "minimum": 0},
+    "confidence": {"type": ["number", "null"]},
+    "note": {"type": ["string", "null"]}
+  }
+}
+```
+
+### <a id="def-progress"></a>`progress`
+
+```json
+{
+  "type": "object",
+  "description": "How far along the job is (`common.jobs.progress`): the snapshot, flushed about once a second (§ Progress)",
+  "additionalProperties": false,
+  "required": [
+    "state",
+    "percent",
+    "stage",
+    "stage_title",
+    "label",
+    "index",
+    "length",
+    "attempt",
+    "seq",
+    "updated_at",
+    "stages"
+  ],
+  "properties": {
+    "state": {"enum": ["queued", "running", "done", "failed", "cancelled"]},
+    "percent": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "0-100, held just under 100 while the job runs"
+    },
+    "stage": {"type": ["string", "null"], "description": "The current stage's name"},
+    "stage_title": {"type": ["string", "null"]},
+    "label": {"type": ["string", "null"], "description": "What is happening now"},
+    "index": {"type": "integer", "minimum": 0, "description": "Units done in the current stage"},
+    "length": {"type": "integer", "minimum": 0, "description": "Units in the current stage"},
+    "attempt": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Which run of the job (a requeue is the next)"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The snapshot's sequence number in the job's history"
+    },
+    "updated_at": {"type": "string", "format": "date-time"},
+    "stages": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/progress_stage"}
+    }
+  }
+}
+```
+
+### <a id="def-progress_stage"></a>`progress_stage`
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "title", "weight", "index", "length"],
+  "properties": {
+    "name": {"type": "string"},
+    "title": {"type": "string"},
+    "weight": {"type": "number", "minimum": 0},
+    "index": {"type": "integer", "minimum": 0},
+    "length": {"type": "integer", "minimum": 0}
+  }
+}
+```
+
+### <a id="def-reference_id"></a>`reference_id`
+
+```json
+{
+  "type": "string",
+  "pattern": "^r[0-9a-f]{12}$",
+  "description": "A reference's id: `r` and 12 hex characters"
+}
+```
+
+### <a id="def-reference_result"></a>`reference_result`
+
+```json
+{
+  "type": "object",
+  "description": "A reference job's result: where the reference is, and the pipeline run (null when the caller supplied everything)",
+  "additionalProperties": false,
+  "required": [
+    "reference_id",
+    "status",
+    "reference_url",
+    "record_url",
+    "description",
+    "criteria",
+    "warnings",
+    "artifacts",
+    "pipeline"
+  ],
+  "properties": {
+    "reference_id": {"$ref": "#/$defs/reference_id"},
+    "status": {"const": "ready"},
+    "reference_url": {"type": "string"},
+    "record_url": {"type": "string"},
+    "description": {"type": ["string", "null"]},
+    "criteria": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expected", "region_source", "usable"],
+        "properties": {
+          "expected": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "{score, verdict, reason, source}"
+              }
+            ]
+          },
+          "region_source": {"type": ["string", "null"]},
+          "usable": {"type": ["boolean", "null"]}
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "artifacts": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/job_artifacts"}
+      ]
+    },
+    "pipeline": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/assess_result"}
+      ]
+    },
+    "usage": {"$ref": "#/$defs/job_usage_block"}
+  }
+}
+```
+
+### <a id="def-references_summary"></a>`references_summary`
+
+```json
+{
+  "type": "object",
+  "description": "What the request's references did (§ Result shape, `references`)",
+  "additionalProperties": false,
+  "required": [
+    "mode",
+    "requested",
+    "pool",
+    "pool_truncated",
+    "resolved",
+    "inherited",
+    "criteria",
+    "selection",
+    "calls",
+    "selection_calls"
+  ],
+  "properties": {
+    "mode": {"enum": ["explicit", "auto"]},
+    "requested": {"description": "The ids (or the auto request) as sent"},
+    "pool": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      ]
+    },
+    "pool_truncated": {"type": "boolean"},
+    "resolved": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "The ids used"
+    },
+    "inherited": {
+      "type": "boolean",
+      "description": "The criteria were inherited from the references"
+    },
+    "criteria": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["matched", "matched_by", "use", "combine", "position", "examples"],
+        "properties": {
+          "matched": {"type": ["string", "null"]},
+          "matched_by": {"enum": ["criterion", "key", "name"]},
+          "use": {"type": "boolean"},
+          "combine": {"type": "string"},
+          "position": {"type": "string"},
+          "examples": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["reference_id", "criterion", "polarity", "expected"],
+              "properties": {
+                "reference_id": {"$ref": "#/$defs/reference_id"},
+                "criterion": {"type": "string"},
+                "polarity": {"type": "string"},
+                "expected": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "The expected answer: {score, verdict, reason, source}"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "selection": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "One item's auto selection: {item, status: ok | failed | skipped, matches: [{id, confidence, reason}], dropped, error, reason}"
+      }
+    },
+    "calls": {"type": "integer", "minimum": 0, "description": "Guided scoring calls"},
+    "selection_calls": {"type": "integer", "minimum": 0}
+  }
+}
+```
+
+### <a id="def-region"></a>`region`
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["page", "kind", "points", "label", "score", "source", "attrs"],
+  "properties": {
+    "page": {"type": "integer", "minimum": 0, "description": "Its item"},
+    "kind": {"enum": ["box", "polygon"]},
+    "points": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"type": "number"},
+        "minItems": 2,
+        "maxItems": 2
+      },
+      "description": "[[x, y], …] in original page pixels"
+    },
+    "label": {"type": "string"},
+    "score": {"type": ["number", "null"], "description": "The producer's confidence"},
+    "source": {"enum": ["cv", "ocr", "pdf-text", "detector", "llm"]},
+    "attrs": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Free-form extras per source (`common.vision.Region.attrs`): a `text` snippet, `pdf_rect`, the llm loop's `attempt` / `accepted` / `verify_score`, …"
+    }
+  }
+}
+```
+
+### <a id="def-text_detail"></a>`text_detail`
+
+```json
+{
+  "description": "An `text` detail, or null (skipped, errored)",
+  "anyOf": [
+    {"type": "null"},
+    {
+      "if": {
+        "properties": {
+          "aggregate": {
+            "properties": {
+              "rule": {"const": "mean"}
+            },
+            "required": ["rule"]
+          }
+        },
+        "required": ["aggregate"]
+      },
+      "then": {"$ref": "#/$defs/detail_text_mean"},
+      "else": {"$ref": "#/$defs/detail_text"},
+      "properties": {
+        "aggregate": {"$ref": "#/$defs/aggregate_block"}
+      }
+    }
+  ]
+}
+```
+
+### <a id="def-text_link"></a>`text_link`
+
+```json
+{
+  "type": "object",
+  "description": "A text layer a unit read (`text.p{n}.<key>.json` / `text.d{i}.<key>.json`)",
+  "additionalProperties": false,
+  "required": ["key", "url", "source", "chars"],
+  "properties": {
+    "item": {"type": "integer"},
+    "document": {"type": "integer"},
+    "key": {"type": "string"},
+    "url": {"type": "string"},
+    "source": {"type": "string"},
+    "chars": {"type": "integer", "minimum": 0}
+  }
+}
+```
+
+### <a id="def-unit_entry"></a>`unit_entry`
+
+```json
+{
+  "type": "object",
+  "description": "One unit: one item (or, document scope, one document)",
+  "additionalProperties": false,
+  "required": [
+    "item",
+    "document",
+    "page",
+    "status",
+    "score",
+    "verdict",
+    "confidence",
+    "reason",
+    "detail",
+    "error",
+    "regions",
+    "text_layer"
+  ],
+  "properties": {
+    "item": {
+      "type": ["integer", "null"],
+      "description": "The global item; null for a document-scope unit"
+    },
+    "document": {"type": "integer", "minimum": 0},
+    "page": {
+      "type": ["integer", "null"],
+      "description": "Within its document; null for a document-scope unit"
+    },
+    "items": {
+      "type": "array",
+      "items": {"type": "integer"},
+      "description": "Document scope: the items it searched"
+    },
+    "status": {"enum": ["ok", "error", "skipped"]},
+    "score": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
+    "verdict": {
+      "anyOf": [
+        {"type": "null"},
+        {"enum": ["PASS", "MARGINAL", "FAIL"]}
+      ]
+    },
+    "confidence": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+    "reason": {"type": "string"},
+    "detail": {"description": "The criterion's method's detail (see the criterion)"},
+    "error": {"type": ["string", "null"]},
+    "regions": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "A COUNT of the unit's regions (the geometry is the criterion's `regions`)"
+    },
+    "text_layer": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/text_link"}
+      ]
+    },
+    "localization": {"$ref": "#/$defs/localization"}
+  }
+}
+```
+
+### <a id="def-usage_totals_fields"></a>`usage_totals_fields`
+
+```json
+{
+  "properties": {
+    "calls": {"type": "integer", "minimum": 0},
+    "errors": {"type": "integer", "minimum": 0},
+    "seconds": {"type": "number", "minimum": 0},
+    "prompt_tokens": {"type": ["integer", "null"]},
+    "cached_tokens": {"type": ["integer", "null"]},
+    "completion_tokens": {"type": ["integer", "null"]},
+    "reasoning_tokens": {"type": ["integer", "null"]},
+    "total_tokens": {"type": ["integer", "null"]}
   }
 }
 ```

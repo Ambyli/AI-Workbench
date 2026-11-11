@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -483,6 +484,147 @@ def test_render_service_check_then_write(tmp_path):
     render.render_service(path)
     (folder / "SVC.md").write_bytes((folder / "SVC.md").read_bytes().replace(b"SVC_SCHEMAS.md)", b"X.md)"))
     assert [p.name for p in render.render_service(path, check=True)] == ["SVC.md"]
+
+
+# -- blocks too large to inline -------------------------------------------------------------------
+
+# `outer` -> `big` -> `leaf` (ten times): inlining repeats `leaf`, so a block
+# reaching `big` is large inlined and small with its $refs; `small` is tiny.
+BIG_DEFS = {
+    "outer": {**OBJ, "title": "Outer", "properties": {"big": {"$ref": "#/$defs/big"}, "also": {"$ref": "#/$defs/leaf"}}},
+    "big": {**OBJ, "properties": {f"p{i}": {"$ref": "#/$defs/leaf"} for i in range(10)}},
+    "leaf": {"type": "string", "title": "Leaf", "description": "x" * 200},
+    "small": {"type": "integer"},
+}
+BIG_LIMIT = 1000
+
+
+def _big_endpoints() -> Dict[str, Any]:
+    def ok(ref: str) -> Dict[str, Any]:
+        return {"responses": {"200": {"content_type": "application/json", "schema": {"$ref": f"#/$defs/{ref}"}}}}
+    return {"GET /a": ok("outer"), "GET /b": ok("big"), "GET /c": ok("small")}
+
+
+def _big_collection() -> Dict[str, Any]:
+    collection = _collection(_item("a", "GET", "/a", description="A."), _item("b", "GET", "/b"),
+                             _item("c", "GET", "/c"))
+    collection["info"]["description"] = "A test collection.\n\n**Error bodies.** The generic ones."
+    return collection
+
+
+def test_a_block_over_the_limit_keeps_its_refs(monkeypatch):
+    schema = schemas.standalone({"$ref": "#/$defs/outer"}, BIG_DEFS)
+    inlined = render.format_json(render.display_schema(schema))
+    size = len(inlined.encode("utf-8"))
+    assert size > BIG_LIMIT
+    monkeypatch.setattr(render, "INLINE_LIMIT", size)               # at the limit: inlined, as before
+    assert render.shown(schema) == render.Shown(inlined)
+    assert render.schema_block(schema) == f"```json\n{inlined}\n```"
+    monkeypatch.setattr(render, "INLINE_LIMIT", size - 1)           # one byte over: $refs kept
+    view = render.shown(schema)
+    assert view.text == '{"$ref": "#/$defs/outer"}'
+    assert view.uses == ("outer", "big", "leaf")                    # breadth first, transitively, each once
+    assert set(view.defs) == {"outer", "big", "leaf"} and "small" not in view.defs
+    assert render.display_definition(view.defs["outer"]) == {
+        **OBJ, "properties": {"big": {"$ref": "#/$defs/big"}, "also": {"$ref": "#/$defs/leaf"}}}   # no title
+    md = render.schema_block(schema)
+    assert md.startswith('```json\n{"$ref": "#/$defs/outer"}\n```\n\nUses: [`outer`](#def-outer), '
+                         '[`big`](#def-big), [`leaf`](#def-leaf) — too large to show inlined')
+    assert md.endswith("each definition is shown once under [Definitions](#definitions).")
+    pm = render.schema_block(schema, postman_copy=True)
+    assert "Uses: `outer`, `big`, `leaf` — " in pm and "(#def-" not in pm
+    assert pm.endswith("under *Schema definitions* at the end of the collection's description.")
+
+
+def test_definitions_section_lists_each_reached_definition_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(render, "INLINE_LIMIT", BIG_LIMIT)
+    path = _service(tmp_path, "svc", _big_collection(), _big_endpoints(), defs=BIG_DEFS, doc="SVC.md")
+    sf = schemas.load_schemas(path)
+    assert list(render.definitions(sf)) == ["big", "leaf", "outer"]  # `small`: only an inlined block uses it
+    text = render.schemas_markdown(sf)
+    headings = [line for line in text.splitlines() if line.startswith("#")]
+    assert headings[-5:] == ["## `GET /c`", "## Definitions", '### <a id="def-big"></a>`big`',
+                             '### <a id="def-leaf"></a>`leaf`', '### <a id="def-outer"></a>`outer`']
+    endpoints, definitions = text.split("\n## Definitions\n")
+    assert endpoints.count("Uses: ") == 2 and "[`outer`]" not in endpoints.split("## `GET /b`")[1]
+    assert '"type": "integer"' in endpoints.split("## `GET /c`")[1]                 # under the limit: inlined
+    assert definitions.count('"description": "' + "x" * 200) == 1                    # `leaf` once, in its own block
+    assert '"title"' not in text
+    links = set(re.findall(r"\]\(#(def-[^)]+)\)", text))
+    anchors = set(re.findall(r'<a id="(def-[^"]+)"></a>', text))
+    assert links == anchors == {"def-outer", "def-big", "def-leaf"}
+    monkeypatch.setattr(render, "INLINE_LIMIT", 64 * 1024)
+    assert "## Definitions" not in render.schemas_markdown(sf)                       # none over: no section
+
+
+def test_postman_definitions_section_is_idempotent_and_keeps_the_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(render, "INLINE_LIMIT", BIG_LIMIT)
+    sf = schemas.load_schemas(_service(tmp_path, "svc", _big_collection(), _big_endpoints(), defs=BIG_DEFS))
+    collection = _big_collection()
+    note = postman.get_description(collection["info"])
+    assert render.apply_to_collection(collection, sf) == 4          # three items + info.description
+    info = postman.get_description(collection["info"])
+    assert info.startswith(note + "\n\n#### Schema definitions\n\nGenerated from `svc.schemas.json`")
+    assert [line for line in info.splitlines() if line.startswith("##### ")] == [
+        "##### `big`", "##### `leaf`", "##### `outer`"]
+    first = postman.get_description(next(postman.requests(collection)).request)
+    assert first.startswith("A.\n\n#### Schemas\n\nResponse `200` (`application/json`):\n\n"
+                            '```json\n{"$ref": "#/$defs/outer"}\n```\n\nUses: `outer`, `big`, `leaf` — ')
+    again = json.loads(json.dumps(collection))
+    assert render.apply_to_collection(again, sf) == 0 and again == collection
+    # Nothing over the limit any more: the section goes, the note stays as it was.
+    monkeypatch.setattr(render, "INLINE_LIMIT", 64 * 1024)
+    assert render.apply_to_collection(collection, sf) == 3
+    assert postman.get_description(collection["info"]) == note
+    assert "Uses:" not in json.dumps(collection)
+    # The {"content": ...} form of a description is kept.
+    monkeypatch.setattr(render, "INLINE_LIMIT", BIG_LIMIT)
+    rich = _big_collection()
+    rich["info"]["description"] = {"content": note, "type": "text/markdown"}
+    render.apply_to_collection(rich, sf)
+    assert rich["info"]["description"]["type"] == "text/markdown"
+    assert rich["info"]["description"]["content"] == info
+
+
+def test_render_check_catches_a_stale_or_missing_definitions_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(render, "INLINE_LIMIT", BIG_LIMIT)
+    path = _service(tmp_path, "svc", _big_collection(), _big_endpoints(), defs=BIG_DEFS, doc="SVC.md")
+    folder = path.parent
+    (folder / "SVC.md").write_text("# Svc\n", encoding="utf-8")
+    render.render_service(path)
+    assert render.render_service(path, check=True) == []
+    sibling, collection_path = folder / "SVC_SCHEMAS.md", folder / "svc.postman_collection.json"
+    good_md, good_collection = sibling.read_bytes(), collection_path.read_bytes()
+    for broken in (good_md.split(b"\n## Definitions\n")[0] + b"\n",                 # missing
+                   good_md.replace(b'"x', b'"y', 1)):                                # stale
+        sibling.write_bytes(broken)
+        assert [p.name for p in render.render_service(path, check=True)] == ["SVC_SCHEMAS.md"]
+    sibling.write_bytes(good_md)
+    data = json.loads(good_collection)
+    note = postman.get_description(data["info"])
+    for broken in (render.strip_section(note, render.POSTMAN_DEFINITIONS_HEADING),   # missing
+                   note.replace("##### `leaf`", "##### `leaves`")):                  # stale
+        data["info"]["description"] = broken
+        collection_path.write_text(postman.dumps(data), encoding="utf-8")
+        assert [p.name for p in render.render_service(path, check=True)] == ["svc.postman_collection.json"]
+    # A definition reached by nothing over the limit any more: both sections go stale.
+    collection_path.write_bytes(good_collection)
+    monkeypatch.setattr(render, "INLINE_LIMIT", 64 * 1024)
+    assert sorted(p.name for p in render.render_service(path, check=True)) == [
+        "SVC_SCHEMAS.md", "svc.postman_collection.json"]
+
+
+def test_definitions_refuse_one_name_for_two_shapes(tmp_path, monkeypatch):
+    monkeypatch.setattr(render, "INLINE_LIMIT", BIG_LIMIT)
+    endpoints = _big_endpoints()
+    # A generated schema's own $defs may reuse a name the file defines differently.
+    endpoints["GET /c"]["responses"]["200"]["schema"] = {
+        "$ref": "#/$defs/big", "$defs": {"big": BIG_DEFS["big"],
+                                         "leaf": {"type": "string", "description": "y" * 200}}}
+    sf = schemas.load_schemas(_service(tmp_path, "svc", _big_collection(), endpoints, defs=BIG_DEFS))
+    with pytest.raises(ValueError, match="definition 'leaf' differs between GET /a response 200 and "
+                                         "GET /c response 200; rename one"):
+        render.definitions(sf)
 
 
 # ---------------------------------------------------------------------------

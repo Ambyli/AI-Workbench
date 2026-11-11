@@ -19,7 +19,11 @@ For each ``ai/<stack>/<stem>.postman_collection.json``:
      defaults); an item listed in ``invalid_examples`` must FAIL instead;
   5. **the rendered copies are current** -- ``scripts/api_schemas.py render
      --check``: the ``#### Schemas`` sections in the collection, the
-     endpoint doc's link block and its ``*_SCHEMAS.md`` (stale or missing);
+     endpoint doc's link block and its ``*_SCHEMAS.md`` (stale or missing),
+     including the definitions of blocks too large to inline (the
+     ``## Definitions`` section of ``*_SCHEMAS.md``, the ``#### Schema
+     definitions`` section of the collection's ``info.description``), whose
+     every ``Uses:`` link must land on one of them;
   6. **the rollout ratchet** -- a collection in ``PENDING`` skips 1 and 4,
      and the test fails once a pending collection is complete, so the set
      only shrinks (it goes when it is empty).
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import pathlib
 from collections import OrderedDict
 from typing import Dict, List
@@ -234,6 +239,24 @@ def test_our_objects_state_additional_properties(path):
 def test_rendered_copies_are_current(path):
     stale = [p.relative_to(ROOT).as_posix() for p in render.render_service(path, check=True)]
     assert stale == [], f"run: uv run --no-sync python scripts/api_schemas.py render {_stem(path)}"
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=_ids(SCHEMA_FILES))
+def test_definitions_sections_match_the_blocks_over_the_limit(path):
+    sf = schemas.load_schemas(path)
+    names = list(render.definitions(sf))
+    info = postman.get_description(postman.load(sf.collection_path)["info"])
+    in_postman = re.findall(r"^##### `(.+)`$", info.split(render.POSTMAN_DEFINITIONS_HEADING + "\n", 1)[-1], re.M) \
+        if render.POSTMAN_DEFINITIONS_HEADING + "\n" in info else []
+    assert in_postman == names, "the collection's #### Schema definitions section is stale"
+    if sf.schemas_doc_path is None:
+        return
+    text = postman.read_text(sf.schemas_doc_path)
+    anchors = re.findall(r'^### <a id="([^"]+)"></a>`', text, re.M)
+    assert anchors == [render.anchor(n) for n in names], "the ## Definitions section is stale"
+    assert len(set(anchors)) == len(anchors)
+    links = set(re.findall(r"\]\(#(def-[^)]+)\)", text))
+    assert links == set(anchors), "every Uses: link lands on a definition, and every definition is used"
 
 
 def test_render_check_through_the_script():

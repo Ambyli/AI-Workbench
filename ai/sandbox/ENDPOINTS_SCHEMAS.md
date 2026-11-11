@@ -22,7 +22,7 @@ Response `200` (`application/json`):
 
 ## `POST /v1/sandbox/run`
 
-A field validator's refusal (a file over SANDBOX_MAX_FILE_BYTES, a payload over SANDBOX_MAX_PAYLOAD_BYTES, a reserved `env` key, a malformed `session_id` / `chat_id`) is FastAPI's 422; 429 the pool is full; 500 a Docker spawn error.
+A field validator's refusal (a file over SANDBOX_MAX_FILE_BYTES, a payload over SANDBOX_MAX_PAYLOAD_BYTES, a reserved `env` key, a malformed `session_id` / `chat_id`, a negative `ttl_seconds`) is FastAPI's 422; 429 the pool is full; 500 a Docker spawn error.
 
 Request body (`application/json`):
 
@@ -51,11 +51,11 @@ Request body (`application/json`):
     },
     "ttl_seconds": {
       "anyOf": [
-        {"type": "integer"},
+        {"minimum": 0, "type": "integer"},
         {"type": "null"}
       ],
       "default": null,
-      "description": "Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+      "description": "Idle TTL in seconds. Omit, null or 0 for SANDBOX_DEFAULT_TTL_SECONDS; a negative value is refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
     },
     "session_id": {
       "anyOf": [
@@ -343,7 +343,7 @@ Response `504` (`application/json`) — the container did not answer its readine
 
 ## `POST /v1/sandbox/create`
 
-The body is `RunResponse`, so the `warming` / `duplicate_create_prevented` / `chat_id` keys `create` computes are on the MCP tool's payload only. 400 an unknown `runtime` or an `entrypoint` on a runtime that takes none; 422 a malformed `chat_id` or a reserved `env` key; 429 the pool is full; 500 a spawn error.
+The body is `RunResponse`, so the `warming` / `duplicate_create_prevented` / `chat_id` keys `create` computes are on the MCP tool's payload only. 400 an unknown `runtime` or an `entrypoint` on a runtime that takes none; 422 a malformed `chat_id`, a reserved `env` key or a negative `ttl_seconds`; 429 the pool is full; 500 a spawn error.
 
 Request body (`application/json`):
 
@@ -361,7 +361,7 @@ Request body (`application/json`):
     },
     "ttl_seconds": {
       "anyOf": [
-        {"type": "integer"},
+        {"minimum": 0, "type": "integer"},
         {"type": "null"}
       ],
       "default": null
@@ -972,6 +972,32 @@ Response `200` (`application/json`):
         ]
       },
       "description": "Without `paths`: every regular file under /app (path + size); with `paths`: each one's content, binary as base64, a missing one with `error`"
+    }
+  }
+}
+```
+
+Response `409` (`application/json`) — the session's container is gone (get_files never respawns):
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["detail"],
+  "properties": {
+    "detail": {
+      "type": "object",
+      "description": "The registry says running but the container is gone, and the call does not respawn",
+      "additionalProperties": false,
+      "required": ["error", "session_id", "hint"],
+      "properties": {
+        "error": {"const": "sandbox container is gone"},
+        "session_id": {
+          "type": "string",
+          "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+        },
+        "hint": {"type": "string"}
+      }
     }
   }
 }
@@ -2112,6 +2138,32 @@ Response `404` (`application/json`):
 }
 ```
 
+Response `409` (`application/json`) — the session's container is gone (exec never respawns):
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["detail"],
+  "properties": {
+    "detail": {
+      "type": "object",
+      "description": "The registry says running but the container is gone, and the call does not respawn",
+      "additionalProperties": false,
+      "required": ["error", "session_id", "hint"],
+      "properties": {
+        "error": {"const": "sandbox container is gone"},
+        "session_id": {
+          "type": "string",
+          "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+        },
+        "hint": {"type": "string"}
+      }
+    }
+  }
+}
+```
+
 ## `DELETE /v1/sandbox/session/:sandboxSessionId`
 
 Idempotent: an unknown or expired session is a 204 too. 400 an invalid `session_id`.
@@ -2176,7 +2228,7 @@ Response `200` (`application/json`):
         "active_count": {"type": "integer"},
         "jobs": {
           "items": {
-            "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"cleaning_up\"``;\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+            "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
             "properties": {
               "job_id": {"type": "string"},
               "phase": {"type": "string"},
@@ -2239,7 +2291,7 @@ Response `200` (`application/json`):
         "allOf": [
           {
             "$comment": "generated from common.jobs.model.JobBase — do not edit",
-            "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"cleaning_up\"``;\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+            "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
             "properties": {
               "job_id": {"type": "string"},
               "phase": {"type": "string"},
@@ -2366,7 +2418,7 @@ Response `200` (`application/json`):
   "allOf": [
     {
       "$comment": "generated from common.jobs.model.JobBase — do not edit",
-      "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"cleaning_up\"``;\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+      "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
       "properties": {
         "job_id": {"type": "string"},
         "phase": {"type": "string"},
@@ -2576,7 +2628,7 @@ Response `200` (`application/json`):
 
 ## `POST /v1/sandbox/tool/run`
 
-`recreate_if_gone` is always true and the rewrite guard is off (`overwrite=true`): the Tool Server's only tool is `run`. Errors are JSON, not HTML; 422 a field validator's refusal (size caps, reserved `env` key, malformed `chat_id`), 429 the pool is full, 500 a spawn error.
+`recreate_if_gone` is always true and the rewrite guard is off (`overwrite=true`): the Tool Server's only tool is `run`. Errors are JSON, not HTML; 422 a field validator's refusal (size caps, reserved `env` key, malformed `chat_id`, a negative `ttl_seconds`), 429 the pool is full, 500 a spawn error.
 
 Request body (`application/json`):
 
@@ -2605,7 +2657,7 @@ Request body (`application/json`):
     },
     "ttl_seconds": {
       "anyOf": [
-        {"type": "integer"},
+        {"minimum": 0, "type": "integer"},
         {"type": "null"}
       ],
       "default": null
@@ -3096,7 +3148,7 @@ Arguments (`params.arguments` of `tools/call`):
         {"type": "null"}
       ],
       "default": null,
-      "description": "Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+      "description": "Idle TTL in seconds. Omit, null or 0 for the default (SANDBOX_DEFAULT_TTL_SECONDS); a negative value is refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
     },
     "entrypoint": {
       "anyOf": [
@@ -4282,6 +4334,32 @@ Result (`result.structuredContent`):
         "status": {"type": "integer", "description": "The HTTP status the operation raised"},
         "error": {"type": "string", "description": "The plain detail"}
       }
+    },
+    {
+      "type": "object",
+      "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+      "additionalProperties": false,
+      "required": ["ok", "status", "error", "session_id", "detail"],
+      "properties": {
+        "ok": {"const": false},
+        "status": {"type": "integer", "description": "The HTTP status the operation raised"},
+        "error": {"type": "string", "description": "`detail.error`"},
+        "session_id": {"type": ["string", "null"], "description": "`detail.session_id`"},
+        "detail": {
+          "type": "object",
+          "description": "The registry says running but the container is gone, and the call does not respawn",
+          "additionalProperties": false,
+          "required": ["error", "session_id", "hint"],
+          "properties": {
+            "error": {"const": "sandbox container is gone"},
+            "session_id": {
+              "type": "string",
+              "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+            },
+            "hint": {"type": "string"}
+          }
+        }
+      }
     }
   ]
 }
@@ -4388,18 +4466,36 @@ Result (`result.structuredContent`):
         "error": {"type": "string", "description": "`detail.error`"},
         "session_id": {"type": ["string", "null"], "description": "`detail.session_id`"},
         "detail": {
-          "type": "object",
-          "description": "exec / preview: no running sandbox for this `session_id`",
-          "additionalProperties": false,
-          "required": ["error", "session_id", "hint"],
-          "properties": {
-            "error": {"const": "no running sandbox for this session"},
-            "session_id": {
-              "type": "string",
-              "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+          "anyOf": [
+            {
+              "type": "object",
+              "description": "exec / preview: no running sandbox for this `session_id`",
+              "additionalProperties": false,
+              "required": ["error", "session_id", "hint"],
+              "properties": {
+                "error": {"const": "no running sandbox for this session"},
+                "session_id": {
+                  "type": "string",
+                  "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+                },
+                "hint": {"type": "string"}
+              }
             },
-            "hint": {"type": "string"}
-          }
+            {
+              "type": "object",
+              "description": "The registry says running but the container is gone, and the call does not respawn",
+              "additionalProperties": false,
+              "required": ["error", "session_id", "hint"],
+              "properties": {
+                "error": {"const": "sandbox container is gone"},
+                "session_id": {
+                  "type": "string",
+                  "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+                },
+                "hint": {"type": "string"}
+              }
+            }
+          ]
         }
       }
     }
@@ -4689,7 +4785,7 @@ Arguments (`params.arguments` of `tools/call`):
         {"type": "null"}
       ],
       "default": null,
-      "description": "Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+      "description": "Idle TTL in seconds. Omit, null or 0 for the default (SANDBOX_DEFAULT_TTL_SECONDS); a negative value is refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
     },
     "session_id": {
       "anyOf": [

@@ -96,12 +96,12 @@ Field semantics:
 | `runtime` | string | yes | One of `static`, `python`, `node`. See [`runtimes.py`](runner/runtimes.py) for the current registry. |
 | `files` | `{ path: str \| {encoding, content} }` | no | Map of relative paths → contents. Values are either UTF-8 strings, or `{"encoding": "base64", "content": "..."}` for binary payloads (images, PDFs, wheels). On the first call: the initial file set. On a follow-up: an overlay — paths listed here overwrite files in the running container, unlisted files are preserved. Absolute paths and `..` are rejected. Per-file cap: `SANDBOX_MAX_FILE_BYTES`; total cap: `SANDBOX_MAX_PAYLOAD_BYTES`. |
 | `entrypoint` | string | no | Shell command that must bind to port `80`. Leave `null` for the runtime's default. Ignored on follow-up calls — the entrypoint is fixed at spawn time. |
-| `ttl_seconds` | int | no | Idle lifetime. Server clamps to `SANDBOX_HARD_TTL_SECONDS` (3600). Defaults to `SANDBOX_DEFAULT_TTL_SECONDS` (900). |
+| `ttl_seconds` | int | no | Idle lifetime in seconds. Omitted, `null` or `0`: `SANDBOX_DEFAULT_TTL_SECONDS` (900). A negative value is a 422 (`TTL_SECONDS_MIN` is 0). Server clamps to `SANDBOX_HARD_TTL_SECONDS` (3600). |
 | `session_id` | string | no | Persistent handle across turns. Regex `^[A-Za-z0-9_-]{1,64}$`. Omit on first call — the server generates one. |
 | `deletes` | `[path, …]` | no | Relative paths under `/app` to remove. Same sanitization as `files`. Ignored on the first call. |
 | `env` | `{str: str}` | no | Process env vars set inside the container. Immutable after spawn (self-heal replays the recorded env). Reserved keys (`HTTP_PROXY`, `PYTHONUNBUFFERED`, `TERM`, etc.) are rejected. |
 | `recreate_if_gone` | bool | no | Default `true` for backward compat with `POST /run`. If the session's container is gone, silently respawn. Set `false` to force the caller to reason about self-heal explicitly (recommended for direct `write_files` calls, but `/run` keeps the historical default). |
-| `chat_id` | string | no | Chat/conversation id, `^[A-Za-z0-9_.:-]{1,128}$`. When set and **no** `session_id` is given, the runner reuses this chat's existing running container (overlay path) instead of spawning a second one — so repeated `/run` calls in one chat update the same preview even if the caller lost the `session_id`. A fresh spawn records the `chat_id` so the next call converges. |
+| `chat_id` | string | no | Chat/conversation id, `^[A-Za-z0-9_.:@-]{1,128}$`. When set and **no** `session_id` is given, the runner reuses this chat's existing running container (overlay path) instead of spawning a second one — so repeated `/run` calls in one chat update the same preview even if the caller lost the `session_id`. A fresh spawn records the `chat_id` so the next call converges. |
 | `overwrite` | bool | no | Default `false`. Follow-up (overlay) calls only: the same rewrite guard as `POST /session/{id}/files` — a listed path that already exists as a text file of 30+ lines and keeps ≥ 50 % of its lines is refused with `409 rewrite_of_existing_file` unless this is `true`. A fresh spawn has nothing to guard. `/tool/run` always passes `true`. |
 
 **Response (200):**
@@ -246,11 +246,11 @@ Reserve an empty warming container of the chosen runtime. Backs the `sandbox.cre
 }
 ```
 
-`chat_id` (optional, `^[A-Za-z0-9_.:-]{1,128}$`) scopes **one sandbox per chat**. When a live sandbox already exists for this `chat_id` — in `spawning`, `starting`, or `running` phase — the runner does **not** spawn a second container: it returns that existing session with `reused: true` and `duplicate_create_prevented: true`, and consumes no concurrency slot. This is enforced atomically by the partial UNIQUE index `jobs_chat_id_active_uniq`, so even two `create`s racing within the same millisecond can't double-spawn — one INSERT wins, the other is turned into the "return the winner" response. Pass the chat/conversation id here on every `create` for that chat and a chat can never leak multiple containers by calling create twice (e.g. after its `session_id` scrolled out of context). Omit it to keep the old always-spawn behavior.
+`chat_id` (optional, `^[A-Za-z0-9_.:@-]{1,128}$`) scopes **one sandbox per chat**. When a live sandbox already exists for this `chat_id` — in `spawning`, `starting`, or `running` phase — the runner does **not** spawn a second container: it returns that existing session (`reused: true` over HTTP; the `create` MCP tool also says `duplicate_create_prevented: true`), and consumes no concurrency slot. This is enforced atomically by the partial UNIQUE index `jobs_chat_id_active_uniq`, so even two `create`s racing within the same millisecond can't double-spawn — one INSERT wins, the other is turned into the "return the winner" response. Pass the chat/conversation id here on every `create` for that chat and a chat can never leak multiple containers by calling create twice (e.g. after its `session_id` scrolled out of context). Omit it to keep the old always-spawn behavior.
 
-**Response (200):** same shape as `POST /run`, plus `chat_id` and `duplicate_create_prevented` (echoed on the MCP tool's structured payload). `startup_output` may already carry a Streamlit "You can now view your Streamlit app…" line because the warming file has been running long enough for the dev server to bind port 80.
+**Response (200):** the same `RunResponse` as `POST /run` — `{sandbox_id, session_id, url, expires_at, reused, runtime, startup_output, app_status, recreated}`. The `warming`, `duplicate_create_prevented` and `chat_id` keys `create` computes are **not** in the HTTP body (`RunResponse` drops them); only the `create` MCP tool's structured payload carries them. Over HTTP a duplicate shows as `reused: true` with the existing `sandbox_id` / `session_id` and `app_status.note` `existing sandbox for chat (phase=…)`. `startup_output` may already carry a Streamlit "You can now view your Streamlit app…" line because the warming file has been running long enough for the dev server to bind port 80.
 
-**Errors:** same status codes as `POST /run` (400 unknown runtime / custom entrypoint on static, 422 malformed `chat_id`, 429 pool full, 504 warming container didn't bind port 80). Note: a duplicate create is **not** an error — it returns 200 with the existing session.
+**Errors:** same status codes as `POST /run` (400 unknown runtime / custom entrypoint on static, 409 the chat's reservation failed, 422 malformed `chat_id` / reserved `env` key / negative `ttl_seconds`, 429 pool full, 504 warming container didn't bind port 80). Note: a duplicate create is **not** an error — it returns 200 with the existing session.
 
 ---
 
@@ -366,7 +366,7 @@ Read files back from the running sandbox's `/app`. Backs `sandbox.get_files`.
 
 Binary content is base64-encoded — same shape you can round-trip into `POST /session/{id}/files`. A truncated text file is cut on a UTF-8 character boundary, so it stays text. Missing paths get an `error: "not found"` entry rather than raising; a directory path gets `error: "<path> is a directory."`. For source code a model is about to change, [`GET /session/{id}/file`](#get-sessionsession_idfile) (numbered line windows) is the better read.
 
-**Errors:** 400 on invalid session_id, 404 on no running sandbox.
+**Errors:** 400 on invalid session_id, 404 on no running sandbox, 409 `sandbox container is gone` (a structured `detail`: `error`, `session_id`, `hint`) when the registry says running but the container is gone — get_files never respawns; `write_files` with `recreate_if_gone: true` brings the session back.
 
 ---
 
@@ -407,7 +407,7 @@ Field semantics:
 
 Output keeps the LAST 8 KB (`EXEC_MAX_OUTPUT_BYTES`), cut forward to a UTF-8 character boundary; `truncated: true` means earlier output was dropped — the error at the end of a long build or test run is what survives. The HTTP response echoes `command`; the `exec` MCP tool does not — its text shows only the command's first line (≤ 120 chars, `+N more lines`) and its `structured_content` drops `command` and `output`. See [`SANDBOX.md § Runtime introspection (exec)`](SANDBOX.md#runtime-introspection-exec) for the state-drift, allowlist, and interactivity caveats.
 
-**Errors:** 400 on invalid session_id, empty command, or unsafe `working_dir`; 404 on no running sandbox.
+**Errors:** 400 on invalid session_id, empty command, or unsafe `working_dir`; 404 on no running sandbox; 409 `sandbox container is gone` (structured `detail`, as for `GET /session/{id}/files`) when its container is gone — exec never respawns.
 
 ---
 
@@ -733,7 +733,8 @@ curl http://localhost:8012/jobs
 | `spawning` | Container being created via docker.sock. |
 | `starting` | Container started, readiness probe running. |
 | `running` | Sandbox ready and serving on `sandbox-proxy`. |
-| `expired` | Reaper tore it down at hard-TTL. |
+| `expired` | Reaper tore it down (hard or idle TTL), or a self-heal respawn replaced its gone container. |
+| `closed` | `close` / `DELETE /session/{id}` tore it down and released its slot. |
 | `failed` | Spawn or readiness failed. `error` field is populated. |
 | `cancelled` | `cancel()` was called (not surfaced via HTTP today — placeholder). |
 
@@ -807,7 +808,7 @@ Fields:
 | Field | Required | Notes |
 |---|---|---|
 | `level` | yes | One of `error`, `warn`, `log`, `info`, `debug`. Anything else is dropped. |
-| `ts` | yes | Epoch milliseconds. Non-numeric values are replaced with the runner's own clock. |
+| `ts` | no | Epoch milliseconds. Missing or non-numeric: the runner's own clock. |
 | `message` | yes | Free-form string. Multi-line messages are folded onto one line; use `stack` for the full trace. |
 | `source` | no | Script URL or filename (from `window.onerror`). |
 | `line`, `col` | no | Location within `source`. Rendered as `(at source:line:col)` on the log line. |
@@ -853,7 +854,7 @@ Twelve tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 | `list_sessions` | `GET /sessions` | Enumerate live sandboxes |
 | `run` | `POST /run` (with `recreate_if_gone=true`) | One-shot: create + update + preview |
 
-**Failure returns.** When the runner raises a 400 (static lint failed), 404 (session not found), 409 (container gone without `recreate_if_gone`, `rewrite_of_existing_file`, an `edit_file` refusal), 504 (readiness failure with logs), or similar, the MCP wrapper catches the HTTPException and formats the detail dict into a diagnostic string — for `edit_file` that includes the numbered closest text of a not-found `old_string`. The tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call the tool again with the same `session_id` to retry.
+**Failure returns.** When the runner raises a 400 (static lint failed), 404 (session not found), 409 (container gone — `write_files` without `recreate_if_gone`, `read_file`, `edit_file`, `get_files`, `exec`; `rewrite_of_existing_file`; an `edit_file` refusal), 504 (readiness failure with logs), or similar, the MCP wrapper catches the HTTPException and formats the detail dict into a diagnostic string — for `edit_file` that includes the numbered closest text of a not-found `old_string`. The tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call the tool again with the same `session_id` to retry.
 
 **Argument validation.** The MCP adapters in `app.py` build the same pydantic models the HTTP routes use (`RunRequest`, `CreateRequest`, `WriteFilesRequest`, `EditFileRequest`), so the per-file / payload caps, reserved env keys and id regexes apply on the MCP path exactly as on HTTP. A size cap comes back as `failed: payload too large` (413), anything else as `failed: invalid arguments` (422), with the validator's message.
 
@@ -861,14 +862,15 @@ Twelve tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 
 **Structured payload highlights:**
 
-- `create` / `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, app_status, reused, recreated, chat_id, duplicate_create_prevented}` — `duplicate_create_prevented: true` means a chat_id was supplied and matched a live sandbox, so this response is the existing session, not a new spawn
+- `create` → `{ok, session_id, sandbox_id, url, expires_at, runtime, startup_output, app_status, reused, recreated, warming, duplicate_create_prevented, chat_id}` — `duplicate_create_prevented: true` means a chat_id was supplied and matched a live sandbox, so this response is the existing session, not a new spawn; `warming` is true while that container is still starting
+- `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, startup_output, app_status, reused, recreated, download_url, iframe_html}`, plus `warming`, `duplicate_create_prevented` and `chat_id` when it hands back the chat's still-warming sandbox (another call for the same `chat_id` won the spawn race)
 - `write_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag); a refused rewrite is `{ok: false, status: 409, error: "rewrite of existing file", detail: {kind: "rewrite_of_existing_file", files: [{path, similarity, changed_lines, old_lines, new_lines, identical}], message, hint}}`
 - `read_file` → `{ok, session_id, sandbox_id, path, start_line, end_line, total_lines, truncated}` — the numbered lines are in the text only
 - `edit_file` → `{ok, session_id, sandbox_id, url, expires_at, runtime, path, replacements, start_line, end_line, match_lines, total_lines, startup_output, app_status, recreated: false}` — the snippet is in the text only; a refusal is `{ok: false, status, error, session_id, detail: {kind, tool: "edit_file", path, message, hint, …kind-specific fields}}`
 - `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding?, truncated?, error?}, …]}` — with `paths`, file contents are in the text only (no `content` in the structured payload)
 - `get_logs` → `{ok, session_id, sandbox_id, lines_requested, logs, empty?}`
 - `exec` → `{ok, session_id, sandbox_id, exit_code, duration_ms, truncated, timed_out}` — the output is in the text only, and the text echoes just the command's first line
-- `preview` → `{ok, session_id, sandbox_id, url, iframe_html, download_url}`
+- `preview` → `{ok, session_id, sandbox_id, url, expires_at, runtime, download_url, iframe_html}`
 - `close` → `{ok, session_id, sandbox_id?, was_running}`
 - `list_sessions` → `{ok, count, sessions: [...]}`
 
@@ -989,7 +991,7 @@ OpenWebUI fetches `GET /tool/openapi.json` to discover the tool schema, then cal
 
 ### `GET /tool/openapi.json`
 
-Auto-generated OpenAPI 3.0 schema. Used by OpenWebUI at Tool-Server registration time.
+Auto-generated by FastAPI — an OpenAPI 3.1 document (`"openapi": "3.1.0"`). Used by OpenWebUI at Tool-Server registration time.
 
 **Request:**
 ```bash
@@ -1026,7 +1028,7 @@ Access-Control-Expose-Headers: Content-Disposition
 
 **How the URL renders:** the outer OpenWebUI iframe is sandboxed with `allow-scripts allow-downloads` by default. The inner `<iframe src="http://sandbox-proxy/...">` is a nested iframe that loads the actual sandbox output. Because OpenWebUI's outer sandbox defaults to `allowSameOrigin=OFF`, dynamic auto-resizing via the `postMessage` height reporter would require a script inside the sandbox app itself — which we don't control. The iframe uses a fixed `height:600px` as a pragmatic default.
 
-**Errors:** same status codes as `POST /run` (`400` unknown runtime, `413` payload too large, `429` pool full, `500` spawn failure, `504` readiness timeout). Errors return JSON rather than HTML.
+**Errors:** as `POST /run`, minus the follow-up refusals (`recreate_if_gone` is always true, the rewrite guard is off): `400` invalid `session_id` / unknown runtime / an entrypoint on static / static lint, `409` the chat's reservation failed, `422` request validation (a file over `SANDBOX_MAX_FILE_BYTES` or a payload over `SANDBOX_MAX_PAYLOAD_BYTES` — FastAPI's 422, not a 413 — a reserved `env` key, a malformed `chat_id`, a negative `ttl_seconds`), `429` pool full, `500` spawn failure, `504` readiness timeout. Errors return JSON rather than HTML.
 
 ### `GET /tool/get_runtime_types`
 

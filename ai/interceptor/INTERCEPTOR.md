@@ -802,24 +802,33 @@ Every `/capture` invocation gets a 12-char hex `job_id` and shows up in `GET /jo
 
 ```json
 {
-  "max_concurrent": 8,
   "active_count": 2,
-  "available": 6,
   "jobs": [
     {
       "job_id": "a3f2b1c9d4e5",
-      "profile": "roofix",
-      "url": "https://roofix.io/project/1234x5678",
-      "started_at": "2026-07-29T15:00:00.123456+00:00",
+      "phase": "capturing",
+      "created_at": "2026-07-29T15:00:00.123456+00:00",
+      "updated_at": "2026-07-29T15:00:00.418302+00:00",
       "elapsed_seconds": 12.4,
-      "port": 9224,
-      "used_base_profile": true,
-      "temp_dir": null,
-      "phase": "capturing"
+      "metadata": {
+        "profile": "roofix",
+        "url": "https://roofix.io/project/1234x5678",
+        "port": 9224,
+        "used_base_profile": true,
+        "temp_dir": null,
+        "actions_done": null,
+        "actions_total": null
+      },
+      "result": null,
+      "error": null
     }
-  ]
+  ],
+  "max_concurrent": 8,
+  "available": 6
 }
 ```
+
+Each job is the shared `common.jobs` `JobBase` (`JobsListResponse` around them): `created_at` / `updated_at` are ISO-8601 UTC (`updated_at` moves on every phase or metadata change), `elapsed_seconds` counts from registration, and the capture's own fields sit under `metadata` (`InterceptorMetadata`: `temp_dir` is the slow path's profile copy, `actions_done` / `actions_total` are set only when the request carries `page_script` / `actions`). `result` and `error` are always `null` — an in-memory job leaves the registry when it completes. Full schema: [`INTERCEPTOR_SCHEMAS.md`](INTERCEPTOR_SCHEMAS.md).
 
 **`GET /jobs/{job_id}`** — same shape as one element of `jobs[]`, or **HTTP 404** if the id isn't currently in flight. Completed captures aren't retained — a 404 means either the id never existed or the capture finished.
 

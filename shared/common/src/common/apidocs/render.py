@@ -27,6 +27,18 @@ NAMED ``title`` stays -- and 2-space JSON in which a value holding only
 scalars (``{"type": "string"}``, ``["id", "version"]``) stays on one line
 when it fits in 100 columns.
 
+**Too large to inline** (:func:`shown`): a block whose fully inlined display
+exceeds :data:`INLINE_LIMIT` bytes keeps its ``$ref`` pointers instead (still
+without ``title`` keywords, and without ``$defs``), followed by a ``Uses:``
+line naming every definition it reaches, transitively. Each such definition
+is shown ONCE per service, with its own ``$ref`` pointers kept
+(:func:`definitions`): in a final ``## Definitions`` section of the
+``*_SCHEMAS.md`` (one ``### `<name>``` subsection each, anchored
+``def-<name>``, which the ``Uses:`` lines link to) and in a final
+``#### Schema definitions`` section of the collection's ``info.description``
+(after the error-bodies note, replaced on every render). Only definitions an
+over-limit block reaches are listed; a service with none has neither section.
+
 Every output keeps its file's newline style. :func:`render_service` does
 one service -- the collection, the doc's block, the sibling file -- and
 reports what changed (a missing sibling counts); ``check=True`` writes
@@ -38,18 +50,35 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import Any, Dict, List, Mapping, Optional
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from . import postman
-from .schemas import Body, Endpoint, SchemaFile, def_name, inline_refs, load_schemas, transform
+from .schemas import Body, Endpoint, SchemaFile, def_name, inline_refs, load_schemas, refs, transform
 
 SECTION_HEADING = "#### Schemas"
 BEGIN = "<!-- api-schemas:begin -->"
 END = "<!-- api-schemas:end -->"
 LINK_HEADING = "## Request and response schemas"
+DEFINITIONS_HEADING = "## Definitions"                  # the end of *_SCHEMAS.md
+POSTMAN_DEFINITIONS_HEADING = "#### Schema definitions"  # the end of the collection's info.description
+
+# A schema block whose fully inlined display (format_json(display_schema(...)),
+# UTF-8) is larger than this keeps its $refs, and the definitions it reaches
+# are shown once per service instead. 64 KiB: every block today is under
+# 36 KB except the classifier's two job responses (~400 KB each, being 50
+# definitions inlined many times over), so the limit only catches blocks
+# that inlining blows up, with room for the others to grow.
+INLINE_LIMIT = 64 * 1024
 
 
 # -- display ----------------------------------------------------------------------------
+
+
+def _drop_title(node: Dict[str, Any]) -> Dict[str, Any]:
+    node.pop("title", None)
+    return node
 
 
 def display_schema(schema: Any) -> Any:
@@ -66,13 +95,81 @@ def display_schema(schema: Any) -> Any:
             raise KeyError(ref)
         return defs[name]
 
-    inlined = inline_refs(body, lookup)
+    return transform(inline_refs(body, lookup), _drop_title)
 
-    def drop_title(node: Dict[str, Any]) -> Dict[str, Any]:
-        node.pop("title", None)
-        return node
 
-    return transform(inlined, drop_title)
+def display_definition(schema: Any) -> Any:
+    """A definition (or an over-limit block) as it is shown: its ``$ref``s
+    kept, ``title`` keywords dropped, no ``$defs``."""
+    if not isinstance(schema, dict):
+        return schema
+    return transform({k: v for k, v in schema.items() if k != "$defs"}, _drop_title)
+
+
+def reached(schema: Any, defs: Mapping[str, Any]) -> List[str]:
+    """The names of the ``defs`` that ``schema`` reaches through ``$ref``,
+    transitively, breadth first (what it names itself comes first), each
+    once. ``schema``'s own ``$defs`` are not walked into."""
+    body = {k: v for k, v in schema.items() if k != "$defs"} if isinstance(schema, dict) else schema
+    order: List[str] = []
+    queue = [def_name(r) for r in refs(body)]
+    while queue:
+        name = queue.pop(0)
+        if name is None or name in order or name not in defs:
+            continue
+        order.append(name)
+        queue.extend(def_name(r) for r in refs(defs[name]))
+    return order
+
+
+@dataclass(frozen=True)
+class Shown:
+    """How one schema block is displayed: ``text`` is its JSON; ``uses``
+    is empty when it is inlined, else the definitions it reaches (in
+    :func:`reached` order), which ``defs`` holds."""
+
+    text: str
+    uses: Tuple[str, ...] = ()
+    defs: Mapping[str, Any] = field(default_factory=dict)
+
+
+def shown(schema: Any) -> Shown:
+    """``schema`` (standalone) fully inlined, or -- when that is over
+    :data:`INLINE_LIMIT` bytes -- with its ``$ref``s kept."""
+    inlined = format_json(display_schema(schema))
+    if not isinstance(schema, dict) or len(inlined.encode("utf-8")) <= INLINE_LIMIT:
+        return Shown(inlined)
+    defs = schema.get("$defs") or {}
+    uses = tuple(reached(schema, defs))
+    return Shown(format_json(display_definition(schema)), uses, {name: defs[name] for name in uses})
+
+
+def definitions(schema_file: SchemaFile) -> Dict[str, Any]:
+    """Every definition an over-limit block of ``schema_file`` reaches, by
+    name, sorted ignoring case -- what the Definitions sections show.
+    Raises ValueError when two blocks reach different definitions under one
+    name (only a generated schema's own ``$defs`` or a ``same_as`` borrowing
+    from another file can do that: rename one)."""
+    found: Dict[str, Any] = {}
+    first: Dict[str, str] = {}
+    for key, endpoint in schema_file.endpoints.items():
+        for label, schema in endpoint.schemas():
+            for name, sub in shown(schema).defs.items():
+                if name in found and found[name] != sub:
+                    raise ValueError(f"{schema_file.path.name}: definition {name!r} differs between "
+                                     f"{first[name]} and {key} {label}; rename one")
+                if name not in found:
+                    found[name], first[name] = sub, f"{key} {label}"
+    return dict(sorted(found.items(), key=lambda kv: (kv[0].lower(), kv[0])))
+
+
+def anchor(name: str) -> str:
+    """The HTML id of a definition's subsection in ``*_SCHEMAS.md``."""
+    return "def-" + re.sub(r"[^A-Za-z0-9_-]", "-", name)
+
+
+def _limit_text() -> str:
+    return f"{INLINE_LIMIT // 1024} KiB" if INLINE_LIMIT % 1024 == 0 else f"{INLINE_LIMIT} bytes"
 
 
 LINE_WIDTH = 100
@@ -107,8 +204,27 @@ def format_json(value: Any, *, indent: int = 0, prefix: int = 0) -> str:
     return "[\n" + ",\n".join(pad + format_json(item, indent=indent + 2) for item in value) + "\n" + " " * indent + "]"
 
 
-def schema_block(schema: Any) -> str:
-    return "```json\n" + format_json(display_schema(schema)) + "\n```"
+def _fenced(text: str) -> str:
+    return "```json\n" + text + "\n```"
+
+
+def schema_block(schema: Any, *, postman_copy: bool = False) -> str:
+    """A standalone schema as a fenced ``json`` block -- plus, when it is
+    over :data:`INLINE_LIMIT` (:func:`shown`), the ``Uses:`` line naming the
+    definitions it reaches: linked to their ``### `<name>``` anchors in the
+    ``*_SCHEMAS.md`` copy, pointing to the collection's description in the
+    Postman one (``postman_copy``)."""
+    view = shown(schema)
+    block = _fenced(view.text)
+    if not view.uses:
+        return block
+    why = f"too large to show inlined (over {_limit_text()}), so its `$ref`s are kept"
+    if postman_copy:
+        names = ", ".join(f"`{name}`" for name in view.uses)
+        return (f"{block}\n\nUses: {names} — {why}; each definition is shown once under "
+                f"*Schema definitions* at the end of the collection's description.")
+    names = ", ".join(f"[`{name}`](#{anchor(name)})" for name in view.uses)
+    return f"{block}\n\nUses: {names} — {why}; each definition is shown once under [Definitions](#definitions)."
 
 
 def _line(label: str, body: Body) -> str:
@@ -118,9 +234,15 @@ def _line(label: str, body: Body) -> str:
     return head + (":" if body.schema is not None else ".")
 
 
-def endpoint_markdown(endpoint: Endpoint) -> str:
-    """One endpoint's schemas as Markdown (no heading)."""
+def endpoint_markdown(endpoint: Endpoint, *, postman_copy: bool = False) -> str:
+    """One endpoint's schemas as Markdown (no heading); ``postman_copy``
+    for the collection's copy (it only changes an over-limit block's
+    ``Uses:`` line)."""
     parts: List[str] = []
+
+    def block(schema: Any) -> str:
+        return schema_block(endpoint.standalone(schema), postman_copy=postman_copy)
+
     if endpoint.same_as:
         parts.append(f"Same as `{endpoint.source}`.")
     if endpoint.description:
@@ -128,22 +250,42 @@ def endpoint_markdown(endpoint: Endpoint) -> str:
     if endpoint.is_mcp:
         entry = endpoint.entry
         if "arguments" in entry:
-            parts += ["Arguments (`params.arguments` of `tools/call`):",
-                      schema_block(endpoint.standalone(entry["arguments"]))]
+            parts += ["Arguments (`params.arguments` of `tools/call`):", block(entry["arguments"])]
         if "params" in entry:
-            parts += ["Params (`params`):", schema_block(endpoint.standalone(entry["params"]))]
+            parts += ["Params (`params`):", block(entry["params"])]
         label = "Result (`result.structuredContent`):" if "arguments" in entry else "Result (`result`):"
-        parts += [label, schema_block(endpoint.standalone(entry["result"]))]
+        parts += [label, block(entry["result"])]
     else:
         for body in endpoint.requests():
             parts.append(_line("Request body", body))
             if body.schema is not None:
-                parts.append(schema_block(endpoint.standalone(body.schema)))
+                parts.append(block(body.schema))
         for status, body in endpoint.responses().items():
             parts.append(_line(f"Response `{status}`", body))
             if body.schema is not None:
-                parts.append(schema_block(endpoint.standalone(body.schema)))
+                parts.append(block(body.schema))
     return "\n\n".join(parts)
+
+
+def _definition_blocks(defs: Mapping[str, Any], heading: str) -> List[str]:
+    parts: List[str] = []
+    for name, sub in defs.items():
+        parts.append(heading.format(name=name, anchor=anchor(name)))
+        parts.append(_fenced(format_json(display_definition(sub))))
+    return parts
+
+
+def definitions_markdown(schema_file: SchemaFile) -> str:
+    """The ``## Definitions`` section that ends ``*_SCHEMAS.md``; "" when
+    no block is over the limit."""
+    defs = definitions(schema_file)
+    if not defs:
+        return ""
+    intro = (f"The definitions (`#/$defs/<name>`) that the schemas above too large to show inlined (over "
+             f"{_limit_text()}) point to, each shown once, with its own `$ref`s kept. Each such schema's "
+             "`Uses:` line lists the ones it reaches.")
+    return "\n\n".join([DEFINITIONS_HEADING, intro,
+                        *_definition_blocks(defs, '### <a id="{anchor}"></a>`{name}`')])
 
 
 # -- Postman ----------------------------------------------------------------------------------
@@ -151,7 +293,7 @@ def endpoint_markdown(endpoint: Endpoint) -> str:
 
 def postman_section(endpoint: Endpoint) -> str:
     """The ``#### Schemas`` section of an endpoint's first item."""
-    return f"{SECTION_HEADING}\n\n{endpoint_markdown(endpoint)}"
+    return f"{SECTION_HEADING}\n\n{endpoint_markdown(endpoint, postman_copy=True)}"
 
 
 def sibling_section(first: postman.Request) -> str:
@@ -159,24 +301,39 @@ def sibling_section(first: postman.Request) -> str:
     return f"{SECTION_HEADING}\n\nSee *{first.label}*, the first request of this endpoint."
 
 
-def strip_section(description: str) -> str:
-    """``description`` without its final ``#### Schemas`` section."""
-    if description.startswith(SECTION_HEADING + "\n"):
+def postman_definitions_section(schema_file: SchemaFile) -> str:
+    """The ``#### Schema definitions`` section that ends the collection's
+    ``info.description``; "" when no block is over the limit."""
+    defs = definitions(schema_file)
+    if not defs:
         return ""
-    at = description.rfind("\n\n" + SECTION_HEADING + "\n")
+    intro = (f"Generated from `{schema_file.path.name}` by `scripts/api_schemas.py render` — never edit it. The "
+             f"definitions (`#/$defs/<name>`) that the schemas too large to show inlined (over {_limit_text()}) "
+             "point to, each shown once, with its own `$ref`s kept. Each such schema's `Uses:` line lists the "
+             "ones it reaches.")
+    return "\n\n".join([POSTMAN_DEFINITIONS_HEADING, intro, *_definition_blocks(defs, "##### `{name}`")])
+
+
+def strip_section(description: str, heading: str = SECTION_HEADING) -> str:
+    """``description`` without its final ``heading`` section (by default
+    ``#### Schemas``)."""
+    if description.startswith(heading + "\n"):
+        return ""
+    at = description.rfind("\n\n" + heading + "\n")
     return description if at < 0 else description[:at]
 
 
-def _with_section(description: str, section: str) -> str:
-    base = strip_section(description)
+def _with_section(description: str, section: str, heading: str = SECTION_HEADING) -> str:
+    base = strip_section(description, heading)
     if not section:
         return base
     return f"{base}\n\n{section}" if base else section
 
 
 def apply_to_collection(collection: Dict[str, Any], schema_file: SchemaFile) -> int:
-    """Write every item's section into ``collection`` (in place). Returns
-    how many descriptions changed."""
+    """Write every item's section, and the ``info.description``'s
+    definitions section, into ``collection`` (in place). Returns how many
+    descriptions changed."""
     first: Dict[str, postman.Request] = {}
     changed = 0
     for req in postman.requests(collection):
@@ -194,6 +351,12 @@ def apply_to_collection(collection: Dict[str, Any], schema_file: SchemaFile) -> 
         if new != old:
             postman.set_description(req.request, new)
             changed += 1
+    info = collection.setdefault("info", {})
+    old = postman.get_description(info)
+    new = _with_section(old, postman_definitions_section(schema_file), POSTMAN_DEFINITIONS_HEADING)
+    if new != old:
+        postman.set_description(info, new)
+        changed += 1
     return changed
 
 
@@ -202,7 +365,8 @@ def apply_to_collection(collection: Dict[str, Any], schema_file: SchemaFile) -> 
 
 def schemas_markdown(schema_file: SchemaFile) -> str:
     """The whole ``<doc stem>_SCHEMAS.md`` (LF line ends, trailing newline):
-    a title, where it comes from, one ``##`` section per endpoint."""
+    a title, where it comes from, one ``##`` section per endpoint, and the
+    ``## Definitions`` section when a block is over the limit."""
     name = schema_file.path.name
     header = (f"Generated from [`{name}`]({name}) by `uv run --no-sync python scripts/api_schemas.py render` "
               "(root `CLAUDE.md` § Postman collections) — edit that file, never this one; an entry whose "
@@ -216,6 +380,9 @@ def schemas_markdown(schema_file: SchemaFile) -> str:
     for key, endpoint in schema_file.endpoints.items():
         parts.append(f"## `{key}`")
         parts.append(endpoint_markdown(endpoint))
+    defs = definitions_markdown(schema_file)
+    if defs:
+        parts.append(defs)
     return "\n\n".join(parts) + "\n"
 
 

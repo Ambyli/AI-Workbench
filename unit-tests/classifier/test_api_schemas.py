@@ -387,6 +387,19 @@ def test_the_box_loop(schema_file, monkeypatch):
     pdf = (DOCS / "invoice_two_page.pdf").read_bytes()
     several = check_result(schema_file, _run([_doc(pdf, "inv.pdf")], [criterion]))
     assert "accepted" in _entries(several)["has solar panels"]["localization"]
+    # Several single-page DOCUMENTS merge like the pages of one: every attempt
+    # tagged with its item, `accepted` naming each accepted box (the schema's
+    # merged branch requires both, so the old untagged / empty shape fails).
+    _boxes(monkeypatch, [{"bbox": GOOD_BOX}, {"score": 9, "reason": "a"},
+                         {"bbox": [400, 200, 600, 400]}, {"score": 9, "reason": "b"}])
+    documents = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [criterion]))
+    loc = _entries(documents)["has solar panels"]["localization"]
+    assert sorted({a["item"] for a in loc["attempts"]}) == [0, 1], loc["attempts"]
+    assert loc["accepted"] == [{"item": 0, "attempt": 1}, {"item": 1, "attempt": 1}], loc["accepted"]
+    assert loc["accepted_attempt"] is None
+    old_shape = {**loc, "attempts": [{k: v for k, v in a.items() if k != "item"} for a in loc["attempts"]]}
+    assert schemas.validate(schemas.standalone({"$ref": "#/$defs/localization"}, schema_file.defs), old_shape), \
+        "an untagged merged record must fail the schema"
 
 
 def _guided_plan(name: str) -> dict:

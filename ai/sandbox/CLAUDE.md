@@ -32,7 +32,7 @@ Also in the root `CLAUDE.md` § Cross-folder rules — read the named entry ther
 One line each; full detail in `.env.example` (`SANDBOX_*` block) and `SANDBOX.md § Configuration`.
 
 - `SANDBOX_MAX_CONCURRENT` (`8`) — running sandboxes at once; `429` past it. ~512 MB RAM + 1 CPU each.
-- `SANDBOX_DEFAULT_TTL_SECONDS` (`900`) — default idle TTL; a model may ask shorter, never past the hard TTL.
+- `SANDBOX_DEFAULT_TTL_SECONDS` (`900`) — default idle TTL; a model may ask shorter (`ttl_seconds` 0 / omitted = this default, negative refused — `TTL_SECONDS_MIN`), never past the hard TTL.
 - `SANDBOX_IDLE_TTL_SECONDS` (empty — inherits the default TTL) — reaper's idle threshold on `last_used_at`; keep it ≤ the hard TTL.
 - `SANDBOX_HARD_TTL_SECONDS` (`3600`) — absolute lifetime; reaper sweeps every 60 s.
 - `SANDBOX_EGRESS_ALLOWLIST` (empty) — additive to `tinyproxy.filter`; prefer the filter file.

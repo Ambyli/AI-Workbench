@@ -1319,7 +1319,7 @@ Response `200` (`application/json`):
 
 Deletes the row, its artifact directory, its model-usage rows and its progress history; a running job stops like a cancel. 404 no such job.
 
-Response `204`: no body — no body.
+Response `204`: no body.
 
 ## `POST /v1/classifier/references`
 
@@ -2076,7 +2076,7 @@ Response `200` (`application/json`):
 
 404 no such reference; 409 a queued or running job reads it.
 
-Response `204`: no body — no body.
+Response `204`: no body.
 
 ## `GET /v1/classifier/jobs/:jobId/artifacts`
 
@@ -2281,7 +2281,7 @@ Response `200` (`application/zip`) — Every file on disk, streamed; `Content-Di
 
 Removes the directory; the job row stays. 404 an unknown job, or one with no directory.
 
-Response `204`: no body — no body.
+Response `204`: no body.
 
 ## `GET /v1/classifier/jobs/:jobId/usage`
 

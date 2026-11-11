@@ -2168,7 +2168,7 @@ Response `409` (`application/json`) — the session's container is gone (exec ne
 
 Idempotent: an unknown or expired session is a 204 too. 400 an invalid `session_id`.
 
-Response `204`: no body — no body.
+Response `204`: no body.
 
 ## `GET /v1/sandbox/session/:sandboxSessionId/download`
 
@@ -2550,7 +2550,7 @@ Response `200` (`application/json`):
 
 Stops the container, deletes the row, releases the slot if it held one. 404 no such sandbox.
 
-Response `204`: no body — no body.
+Response `204`: no body.
 
 ## `POST /v1/sandbox/internal/browser-log/:sandboxId`
 
@@ -2592,7 +2592,7 @@ Request body (`application/json`):
 }
 ```
 
-Response `204`: no body — no body.
+Response `204`: no body.
 
 ## `GET /v1/sandbox/tool/openapi.json`
 

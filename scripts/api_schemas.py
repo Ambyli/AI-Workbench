@@ -24,8 +24,9 @@ one canonical JSON form. The logic is ``common.apidocs``.
     import-openapi <openapi.json> --endpoint "<METHOD> <path>" [...]
         Print schemas-file entries for those operations of an upstream
         OpenAPI document (refs inlined, OpenAPI 3.0 ``nullable`` turned into
-        a ``null`` type, FastAPI's 422 left out) -- a starting point for an
-        upstream server's subset, to be trimmed by hand. Paths as the OpenAPI
+        a ``null`` type, FastAPI's 422 left out; a status answering several
+        media types becomes a list of bodies, JSON first) -- a starting point
+        for an upstream server's subset, to be trimmed by hand. Paths as the OpenAPI
         document writes them (``/files/serve/{path}``); keys are printed in
         the collection's ``:name`` form.
 
@@ -141,8 +142,10 @@ def openapi_entry(document: Dict[str, Any], method: str, path: str, source: str)
         if not media_types:
             responses[str(status)] = {}
             continue
-        ctype = "application/json" if "application/json" in media_types else next(iter(media_types))
-        responses[str(status)] = _body(media_types[ctype], lookup, ctype)
+        # JSON first when present; several media types become a list, one body each.
+        order = sorted(media_types, key=lambda ctype: ctype != "application/json")
+        bodies = [_body(media_types[ctype], lookup, ctype) for ctype in order]
+        responses[str(status)] = bodies[0] if len(bodies) == 1 else bodies
     entry["responses"] = responses
     return entry
 

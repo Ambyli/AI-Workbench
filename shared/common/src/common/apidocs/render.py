@@ -227,10 +227,21 @@ def schema_block(schema: Any, *, postman_copy: bool = False) -> str:
     return f"{block}\n\nUses: {names} — {why}; each definition is shown once under [Definitions](#definitions)."
 
 
+_NO_BODY = re.compile(r"^no body\s*(?:[.:;,—–-]+\s*|$)", re.I)
+
+
 def _line(label: str, body: Body) -> str:
-    head = f"{label} (`{body.content_type}`)" if body.content_type else f"{label}: no body"
-    if body.description:
-        head += f" — {body.description}"
+    """``Response `200` (`application/json`) — <description>:`` -- a body
+    with no content type reads ``…: no body``, and a description of its own
+    that starts with "no body" is not made to say it twice."""
+    description = body.description or ""
+    if body.content_type:
+        head = f"{label} (`{body.content_type}`)"
+    else:
+        head = f"{label}: no body"
+        description = _NO_BODY.sub("", description, count=1).strip()
+    if description:
+        head += f" — {description}"
     return head + (":" if body.schema is not None else ".")
 
 
@@ -260,7 +271,7 @@ def endpoint_markdown(endpoint: Endpoint, *, postman_copy: bool = False) -> str:
             parts.append(_line("Request body", body))
             if body.schema is not None:
                 parts.append(block(body.schema))
-        for status, body in endpoint.responses().items():
+        for status, body in endpoint.all_responses():
             parts.append(_line(f"Response `{status}`", body))
             if body.schema is not None:
                 parts.append(block(body.schema))

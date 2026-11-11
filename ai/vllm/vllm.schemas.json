@@ -7,7 +7,6 @@
       "type": "object",
       "additionalProperties": true,
       "$comment": "vLLM ChatCompletionResponse (open subset); the same shape from llama-server and LiteLLM",
-      "description": "`stream` false or absent: the whole answer, `application/json`",
       "required": [
         "id",
         "object",
@@ -121,7 +120,6 @@
       "type": "object",
       "additionalProperties": true,
       "$comment": "vLLM ChatCompletionStreamResponse (open subset); the same shape from llama-server and LiteLLM",
-      "description": "`stream: true`: the body is `text/event-stream`, and each `data:` line carries one of these; the stream ends with `data: [DONE]`",
       "required": [
         "id",
         "object",
@@ -728,8 +726,7 @@
             "additionalProperties": true,
             "required": [
               "index",
-              "text",
-              "finish_reason"
+              "text"
             ],
             "properties": {
               "index": {
@@ -742,7 +739,8 @@
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "Set on the choice's last fragment when streaming"
               },
               "logprobs": {
                 "type": [
@@ -916,7 +914,7 @@
     },
     "POST /v1/chat/completions": {
       "$comment": "OpenAI Chat Completions (vLLM ChatCompletionRequest / ChatCompletionResponse / ChatCompletionStreamResponse). vLLM: request fields checked against the box's GET /openapi.json (muse-glimmer, v0.29.0), which declares no 200 bodies, so the response shapes come from vllm/entrypoints/openai/{models,chat_completion,completion}/ and vllm/entrypoints/serve/engine/protocol.py at the v0.29.0 tag (the same field names at v0.27.1); vllm/vllm-openai:v0.29.0 (qwen3.6, vllm-qwen-vl, muse-glimmer) and v0.27.1 (qwen3.8, qwen3.8-solo). Also served by llama.cpp llama-server: ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2, a moving tag) and Unsloth's b10796-mix-659e406 / b10840-mix-d5c17a0 builds (tools/server/README.md at those tags) and by LiteLLM v1.95.0 (docker.litellm.ai/berriai/litellm:v1.95.0), whose entries point here (same_as). An image-tag bump on any of them re-checks it.",
-      "description": "The OpenAI Chat Completions subset shared by vLLM, llama-server and LiteLLM: one 200 schema with two branches, the JSON answer and, with `\"stream\": true`, the payload of every SSE `data:` line (`text/event-stream`). Server-specific fields say whose they are. Errors are the OpenAI error object (the collection's description).",
+      "description": "The OpenAI Chat Completions subset shared by vLLM, llama-server and LiteLLM. Server-specific fields say whose they are. Errors are the OpenAI error object (the collection's description).",
       "request": {
         "content_type": "application/json",
         "schema": {
@@ -924,25 +922,27 @@
         }
       },
       "responses": {
-        "200": {
-          "content_type": "application/json",
-          "description": "with `\"stream\": true` the body is `text/event-stream` instead, one `chat.completion.chunk` per `data:` line, then `data: [DONE]`",
-          "schema": {
-            "oneOf": [
-              {
-                "$ref": "#/$defs/openai_chat_completion"
-              },
-              {
-                "$ref": "#/$defs/openai_chat_completion_chunk"
-              }
-            ]
+        "200": [
+          {
+            "content_type": "application/json",
+            "description": "`stream` false or absent: the whole answer",
+            "schema": {
+              "$ref": "#/$defs/openai_chat_completion"
+            }
+          },
+          {
+            "content_type": "text/event-stream",
+            "description": "`\"stream\": true`: one `chat.completion.chunk` per `data:` line, then `data: [DONE]`",
+            "schema": {
+              "$ref": "#/$defs/openai_chat_completion_chunk"
+            }
           }
-        }
+        ]
       }
     },
     "POST /v1/completions": {
       "$comment": "OpenAI (legacy) Completions (vLLM CompletionRequest / CompletionResponse). vLLM: request fields checked against the box's GET /openapi.json (muse-glimmer, v0.29.0), which declares no 200 bodies, so the response shapes come from vllm/entrypoints/openai/{models,chat_completion,completion}/ and vllm/entrypoints/serve/engine/protocol.py at the v0.29.0 tag (the same field names at v0.27.1); vllm/vllm-openai:v0.29.0 (qwen3.6, vllm-qwen-vl, muse-glimmer) and v0.27.1 (qwen3.8, qwen3.8-solo). Also served by llama.cpp llama-server: ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2, a moving tag) and Unsloth's b10796-mix-659e406 / b10840-mix-d5c17a0 builds (tools/server/README.md at those tags) and by LiteLLM v1.95.0 (docker.litellm.ai/berriai/litellm:v1.95.0), whose entries point here (same_as). An image-tag bump on any of them re-checks it.",
-      "description": "The OpenAI (legacy) Completions subset shared by vLLM and llama-server: no chat template, the prompt is fed verbatim. With `\"stream\": true` each SSE `data:` line is a `text_completion` object holding the next `text` fragment, then `data: [DONE]`.",
+      "description": "The OpenAI (legacy) Completions subset shared by vLLM and llama-server: no chat template, the prompt is fed verbatim.",
       "request": {
         "content_type": "application/json",
         "schema": {
@@ -950,12 +950,22 @@
         }
       },
       "responses": {
-        "200": {
-          "content_type": "application/json",
-          "schema": {
-            "$ref": "#/$defs/openai_text_completion"
+        "200": [
+          {
+            "content_type": "application/json",
+            "description": "`stream` false or absent: the whole completion",
+            "schema": {
+              "$ref": "#/$defs/openai_text_completion"
+            }
+          },
+          {
+            "content_type": "text/event-stream",
+            "description": "`\"stream\": true`: one `text_completion` object per `data:` line, its `choices[].text` the next fragment, then `data: [DONE]`",
+            "schema": {
+              "$ref": "#/$defs/openai_text_completion"
+            }
           }
-        }
+        ]
       }
     }
   }

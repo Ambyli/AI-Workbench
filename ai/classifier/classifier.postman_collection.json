@@ -791,7 +791,7 @@
             }
           ]
         },
-        "description": "Delete the job row, its artifact directory AND its model-usage rows (the router's `on_delete` hook removes the directory and the `llm_calls` rows first, so nothing is left that nothing points at — the `text.*.json` layers go with it). **404** for an unknown job id — but the hook runs before that check, so a DELETE on a job the TTL sweeper already removed still deletes its usage rows (the one thing the sweeper leaves behind). A running job is stopped within ~1 s, as by POST /jobs/:jobId/cancel (its worker sees the row gone), and what it wrote after the hook ran — usage rows, an artifact directory — is removed once its runner has stopped. See API.md § `DELETE /jobs/{job_id}`.\n\n#### Schemas\n\nDeletes the row, its artifact directory, its model-usage rows and its progress history; a running job stops like a cancel. 404 no such job.\n\nResponse `204`: no body — no body."
+        "description": "Delete the job row, its artifact directory AND its model-usage rows (the router's `on_delete` hook removes the directory and the `llm_calls` rows first, so nothing is left that nothing points at — the `text.*.json` layers go with it). **404** for an unknown job id — but the hook runs before that check, so a DELETE on a job the TTL sweeper already removed still deletes its usage rows (the one thing the sweeper leaves behind). A running job is stopped within ~1 s, as by POST /jobs/:jobId/cancel (its worker sees the row gone), and what it wrote after the hook ran — usage rows, an artifact directory — is removed once its runner has stopped. See API.md § `DELETE /jobs/{job_id}`.\n\n#### Schemas\n\nDeletes the row, its artifact directory, its model-usage rows and its progress history; a running job stops like a cancel. 404 no such job.\n\nResponse `204`: no body."
       },
       "response": []
     },
@@ -1115,7 +1115,7 @@
                 }
               ]
             },
-            "description": "Delete the reference and its directory. 204; 404 unknown; 409 while a queued or running job reads it — its own creation job while pending, or an /assess listing it (metadata.references: the explicit ids or the auto pool) — naming the jobs. Enable `force=true` to delete anyway.\n\n#### Schemas\n\n404 no such reference; 409 a queued or running job reads it.\n\nResponse `204`: no body — no body."
+            "description": "Delete the reference and its directory. 204; 404 unknown; 409 while a queued or running job reads it — its own creation job while pending, or an /assess listing it (metadata.references: the explicit ids or the auto pool) — naming the jobs. Enable `force=true` to delete anyway.\n\n#### Schemas\n\n404 no such reference; 409 a queued or running job reads it.\n\nResponse `204`: no body."
           },
           "response": []
         }
@@ -1783,7 +1783,7 @@
                 }
               ]
             },
-            "description": "Free the disk and keep the job row: removes the whole artifact directory (regions.json, text layers, base image, cached layers). **204** on success; **404** for an unknown job or one with no directory. Afterwards the artifact routes answer **410**. The inline regions in the result survive.\n\n#### Schemas\n\nRemoves the directory; the job row stays. 404 an unknown job, or one with no directory.\n\nResponse `204`: no body — no body."
+            "description": "Free the disk and keep the job row: removes the whole artifact directory (regions.json, text layers, base image, cached layers). **204** on success; **404** for an unknown job or one with no directory. Afterwards the artifact routes answer **410**. The inline regions in the result survive.\n\n#### Schemas\n\nRemoves the directory; the job row stays. 404 an unknown job, or one with no directory.\n\nResponse `204`: no body."
           },
           "response": []
         }

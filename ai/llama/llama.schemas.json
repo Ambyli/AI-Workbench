@@ -3,6 +3,64 @@
   "service": "llama",
   "doc": "LLAMA.md",
   "$defs": {
+    "llama_completion": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "content",
+        "stop"
+      ],
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "The completion (a stream: the next piece)"
+        },
+        "tokens": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "Filled only with `return_tokens` or `stream`"
+        },
+        "stop": {
+          "type": "boolean",
+          "description": "true on the final object (not the request's `stop`)"
+        },
+        "model": {
+          "type": "string"
+        },
+        "stop_type": {
+          "enum": [
+            "none",
+            "eos",
+            "limit",
+            "word"
+          ]
+        },
+        "stopping_word": {
+          "type": "string"
+        },
+        "tokens_predicted": {
+          "type": "integer"
+        },
+        "tokens_evaluated": {
+          "type": "integer"
+        },
+        "tokens_cached": {
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "generation_settings": {
+          "$ref": "#/$defs/llama_sampling_params"
+        },
+        "timings": {
+          "$ref": "#/$defs/llama_timings"
+        }
+      },
+      "$comment": "server-task.cpp to_json_non_oaicompat (final) / partial (streamed)"
+    },
     "llama_sampling_params": {
       "type": "object",
       "additionalProperties": true,
@@ -226,7 +284,7 @@
     },
     "POST /completion": {
       "$comment": "llama-server POST /completion (README § POST /completion; server-task.cpp to_json_non_oaicompat): tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG).",
-      "description": "llama.cpp's native completion: no chat template, llama.cpp's own sampler knobs. With `\"stream\": true` the body is `text/event-stream` (server-sent events, not NDJSON): each `data:` line is this object holding only `content`, `tokens`, `stop: false` and the counters, until a last one with `stop: true` and the rest.",
+      "description": "llama.cpp's native completion: no chat template, llama.cpp's own sampler knobs.",
       "request": {
         "content_type": "application/json",
         "schema": {
@@ -299,66 +357,22 @@
         }
       },
       "responses": {
-        "200": {
-          "content_type": "application/json",
-          "schema": {
-            "type": "object",
-            "additionalProperties": true,
-            "required": [
-              "content",
-              "stop"
-            ],
-            "properties": {
-              "content": {
-                "type": "string",
-                "description": "The completion (a stream: the next piece)"
-              },
-              "tokens": {
-                "type": "array",
-                "items": {
-                  "type": "integer"
-                },
-                "description": "Filled only with `return_tokens` or `stream`"
-              },
-              "stop": {
-                "type": "boolean",
-                "description": "true on the final object (not the request's `stop`)"
-              },
-              "model": {
-                "type": "string"
-              },
-              "stop_type": {
-                "enum": [
-                  "none",
-                  "eos",
-                  "limit",
-                  "word"
-                ]
-              },
-              "stopping_word": {
-                "type": "string"
-              },
-              "tokens_predicted": {
-                "type": "integer"
-              },
-              "tokens_evaluated": {
-                "type": "integer"
-              },
-              "tokens_cached": {
-                "type": "integer"
-              },
-              "truncated": {
-                "type": "boolean"
-              },
-              "generation_settings": {
-                "$ref": "#/$defs/llama_sampling_params"
-              },
-              "timings": {
-                "$ref": "#/$defs/llama_timings"
-              }
+        "200": [
+          {
+            "content_type": "application/json",
+            "description": "`stream` false or absent: the whole completion",
+            "schema": {
+              "$ref": "#/$defs/llama_completion"
+            }
+          },
+          {
+            "content_type": "text/event-stream",
+            "description": "`\"stream\": true`: server-sent events, not NDJSON -- one object per `data:` line holding only `content`, `tokens`, `stop: false` and the counters, until a last one with `stop: true` and the rest; no `data: [DONE]` follows (that is the OpenAI endpoints')",
+            "schema": {
+              "$ref": "#/$defs/llama_completion"
             }
           }
-        }
+        ]
       }
     },
     "POST /tokenize": {

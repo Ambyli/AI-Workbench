@@ -237,6 +237,18 @@ def test_load_schemas_reads_entries_and_bodies(tmp_path):
     (lambda d: d["endpoints"]["MCP run"].pop("result"), "needs `result`"),
     (lambda d: d["endpoints"].update({"health": {"responses": {"200": {}}}}), "'<METHOD> /<path>'"),
     (lambda d: d["endpoints"]["GET /health"].update(responses={}), "non-empty"),
+    (lambda d: d["endpoints"]["GET /health"]["responses"].update({"200": []}), "must not be empty"),
+    (lambda d: d["endpoints"]["GET /health"]["responses"].update(
+        {"200": [{"content_type": "application/json", "schema": OBJ}, {"description": "nothing"}]}),
+     "every body names its `content_type`"),
+    (lambda d: d["endpoints"]["GET /health"]["responses"].update(
+        {"200": [{"content_type": "text/plain"}, {"content_type": "text/plain"}]}), "appears twice"),
+    (lambda d: d["endpoints"]["POST /run"].update(
+        request=[{"content_type": "application/json", "schema": OBJ}, {"content_type": "application/json",
+                                                                       "schema": OBJ}]), "appears twice"),
+    (lambda d: d["endpoints"]["GET /health"]["responses"].update(
+        {"200": [{"content_type": "application/json"}, {"content_type": "text/event-stream"}]}),
+     "needs a `schema`"),
 ])
 def test_load_schemas_refuses_a_bad_structure(tmp_path, mutate, message):
     path = _service(tmp_path, "svc", _collection(), _endpoints_ok(), defs=DEFS)
@@ -245,6 +257,58 @@ def test_load_schemas_refuses_a_bad_structure(tmp_path, mutate, message):
     schemas.dump_schemas(data, path)
     with pytest.raises(SchemaFileError, match=message):
         schemas.load_schemas(path)
+
+
+CHUNK = {**OBJ, "required": ["delta"], "properties": {"delta": {"type": "string"}}}
+
+
+def _streaming_endpoints() -> Dict[str, Any]:
+    endpoints = _endpoints_ok()
+    endpoints["POST /chat"] = {
+        "request": {"content_type": "application/json", "schema": {**OBJ, "properties": {"stream": {"type": "boolean"}}}},
+        "responses": {
+            "200": [{"content_type": "application/json", "description": "the whole answer",
+                     "schema": {"$ref": "#/$defs/status"}},
+                    {"content_type": "text/event-stream", "description": "each `data:` payload",
+                     "schema": CHUNK}],
+            "204": {"description": "no body"},
+        },
+    }
+    return endpoints
+
+
+def test_a_status_may_list_one_body_per_content_type(tmp_path):
+    path = _service(tmp_path, "svc", _collection(), _streaming_endpoints(), defs=DEFS)
+    chat = schemas.load_schemas(path).endpoints["POST /chat"]
+    # responses() keeps its one-body-per-status shape: the first of a list.
+    assert chat.responses()["200"].content_type == "application/json"
+    assert [b.content_type for b in chat.response_bodies("200")] == ["application/json", "text/event-stream"]
+    assert chat.response_bodies("404") == []
+    assert chat.response_for("200", "text/event-stream").schema == CHUNK
+    assert chat.response_for("200", "text/plain") is None and chat.response_for("204", "text/plain") is None
+    assert [(s, b.content_type) for s, b in chat.all_responses()] == [
+        ("200", "application/json"), ("200", "text/event-stream"), ("204", None)]
+    labels = [label for label, _ in chat.schemas()]
+    assert labels == ["request application/json", "response 200 application/json", "response 200 text/event-stream"]
+    assert chat.standalone(chat.response_for("200", "application/json").schema)["$defs"] == DEFS
+    text = render.endpoint_markdown(chat)
+    json_at = text.index("Response `200` (`application/json`) — the whole answer:")
+    sse_at = text.index("Response `200` (`text/event-stream`) — each `data:` payload:")
+    assert json_at < sse_at < text.index("Response `204`: no body.")
+    assert text[sse_at:].split("```json\n", 1)[1].startswith("{\n  \"type\": \"object\"")
+
+
+def test_a_no_body_response_says_no_body_once():
+    line = render._line
+    assert line("Response `204`", schemas.Body(None, None, "no body")) == "Response `204`: no body."
+    assert line("Response `204`", schemas.Body(None, None, "No body.")) == "Response `204`: no body."
+    assert line("Response `200`", schemas.Body(None, None, "no body: the engine is up")) == \
+        "Response `200`: no body — the engine is up."
+    assert line("Response `204`", schemas.Body(None, None, "nothing to run")) == \
+        "Response `204`: no body — nothing to run."
+    assert line("Response `204`", schemas.Body(None, None, "nobody home")) == "Response `204`: no body — nobody home."
+    assert line("Response `200`", schemas.Body("text/plain", None, "no body yet")) == \
+        "Response `200` (`text/plain`) — no body yet."
 
 
 def test_same_as_within_and_across_files(tmp_path):

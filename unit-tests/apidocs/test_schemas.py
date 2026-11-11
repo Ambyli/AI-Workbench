@@ -23,10 +23,7 @@ For each ``ai/<stack>/<stem>.postman_collection.json``:
      including the definitions of blocks too large to inline (the
      ``## Definitions`` section of ``*_SCHEMAS.md``, the ``#### Schema
      definitions`` section of the collection's ``info.description``), whose
-     every ``Uses:`` link must land on one of them;
-  6. **the rollout ratchet** -- a collection in ``PENDING`` skips 1 and 4,
-     and the test fails once a pending collection is complete, so the set
-     only shrinks (it goes when it is empty).
+     every ``Uses:`` link must land on one of them.
 
 Plus: every collection is in the canonical JSON form (``normalise``) and its
 description names the generic error bodies. Imports no service, needs no
@@ -47,23 +44,10 @@ from typing import Dict, List
 import pytest
 
 from common.apidocs import postman, render, schemas
-from common.apidocs.schemas import SchemaFileError
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 COLLECTIONS = sorted(ROOT.glob(f"ai/*/*{schemas.COLLECTION_SUFFIX}"))
 SCHEMA_FILES = sorted(ROOT.glob(f"ai/*/*{schemas.SUFFIX}"))
-
-# Collections whose schemas file is not written yet (phases 4-5 of the
-# rollout). Checks 1 and 4 skip them; test_pending_only_shrinks fails once
-# one is complete. Delete the set (and that test) when it is empty.
-PENDING = {
-    "litellm",
-    "llama",
-    "open-terminal",
-    "searxng",
-    "supabase",
-    "vllm",
-}
 
 # Upstream servers: their schemas are an open subset of the upstream API
 # (decision 5 of the plan), so check 3 does not apply.
@@ -192,8 +176,6 @@ def test_collection_names_the_generic_error_bodies(path):
 
 @pytest.mark.parametrize("path", COLLECTIONS, ids=_ids(COLLECTIONS))
 def test_every_endpoint_has_an_entry_and_every_entry_an_endpoint(path):
-    if _stem(path) in PENDING:
-        pytest.skip("pending: its schemas file is not written yet")
     schema_path = schemas.schemas_path_for(path)
     assert schema_path.exists(), f"{schema_path.relative_to(ROOT).as_posix()} is missing"
     assert coverage_problems(postman.load(path), schemas.load_schemas(schema_path)) == []
@@ -201,8 +183,6 @@ def test_every_endpoint_has_an_entry_and_every_entry_an_endpoint(path):
 
 @pytest.mark.parametrize("path", COLLECTIONS, ids=_ids(COLLECTIONS))
 def test_every_request_body_validates(path):
-    if _stem(path) in PENDING:
-        pytest.skip("pending: its schemas file is not written yet")
     assert body_problems(postman.load(path), schemas.load_schemas(schemas.schemas_path_for(path))) == []
 
 
@@ -259,30 +239,26 @@ def test_definitions_sections_match_the_blocks_over_the_limit(path):
     assert links == set(anchors), "every Uses: link lands on a definition, and every definition is used"
 
 
-def test_render_check_through_the_script():
+def _script():
     spec = importlib.util.spec_from_file_location("api_schemas", ROOT / "scripts" / "api_schemas.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert module.main(["render", "--check"]) == 0
+    return module
 
 
-# -- the rollout ratchet ------------------------------------------------------------------------
+def test_render_check_through_the_script():
+    assert _script().main(["render", "--check"]) == 0
 
 
-def test_pending_only_shrinks():
-    stems = {_stem(p) for p in COLLECTIONS}
-    assert PENDING <= stems, f"PENDING names no collection: {sorted(PENDING - stems)}"
-    complete = []
-    for stem in sorted(PENDING):
-        (path,) = [p for p in COLLECTIONS if _stem(p) == stem]
-        schema_path = schemas.schemas_path_for(path)
-        if not schema_path.exists():
-            continue
-        try:
-            sf = schemas.load_schemas(schema_path)
-        except SchemaFileError:
-            continue
-        collection = postman.load(path)
-        if not coverage_problems(collection, sf) and not body_problems(collection, sf):
-            complete.append(stem)
-    assert complete == [], f"complete -- remove from PENDING: {complete}"
+def test_import_openapi_lists_one_body_per_media_type():
+    document = {"paths": {"/chat": {"post": {"responses": {
+        "200": {"content": {"text/event-stream": {"schema": {"type": "string"}},
+                            "application/json": {"schema": {"$ref": "#/components/schemas/Answer"}}}},
+        "204": {"description": "none"},
+    }}}}, "components": {"schemas": {"Answer": {"type": "object", "nullable": True}}}}
+    entry = _script().openapi_entry(document, "POST", "/chat", "test")
+    assert entry["responses"]["200"] == [
+        {"content_type": "application/json", "schema": {"type": ["object", "null"]}},
+        {"content_type": "text/event-stream", "schema": {"type": "string"}},
+    ]
+    assert entry["responses"]["204"] == {}

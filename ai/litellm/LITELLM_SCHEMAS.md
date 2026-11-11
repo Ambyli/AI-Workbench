@@ -107,7 +107,7 @@ Response `503` (`application/json`) — this copy is shutting down (SIGTERM: a s
 
 Same as `vllm: POST /v1/chat/completions`.
 
-The OpenAI Chat Completions subset shared by vLLM, llama-server and LiteLLM: one 200 schema with two branches, the JSON answer and, with `"stream": true`, the payload of every SSE `data:` line (`text/event-stream`). Server-specific fields say whose they are. Errors are the OpenAI error object (the collection's description).
+The OpenAI Chat Completions subset shared by vLLM, llama-server and LiteLLM. Server-specific fields say whose they are. Errors are the OpenAI error object (the collection's description).
 
 Request body (`application/json`):
 
@@ -293,118 +293,220 @@ Request body (`application/json`):
 }
 ```
 
-Response `200` (`application/json`) — with `"stream": true` the body is `text/event-stream` instead, one `chat.completion.chunk` per `data:` line, then `data: [DONE]`:
+Response `200` (`application/json`) — `stream` false or absent: the whole answer:
 
 ```json
 {
-  "oneOf": [
-    {
-      "type": "object",
-      "additionalProperties": true,
-      "$comment": "vLLM ChatCompletionResponse (open subset); the same shape from llama-server and LiteLLM",
-      "description": "`stream` false or absent: the whole answer, `application/json`",
-      "required": ["id", "object", "created", "model", "choices", "usage"],
-      "properties": {
-        "id": {"type": "string"},
-        "object": {"const": "chat.completion"},
-        "created": {"type": "integer", "description": "Unix seconds"},
-        "model": {
-          "type": "string",
-          "description": "What the request named (LiteLLM: `auto` stays `auto`)"
-        },
-        "choices": {
-          "type": "array",
-          "items": {
+  "type": "object",
+  "additionalProperties": true,
+  "$comment": "vLLM ChatCompletionResponse (open subset); the same shape from llama-server and LiteLLM",
+  "required": ["id", "object", "created", "model", "choices", "usage"],
+  "properties": {
+    "id": {"type": "string"},
+    "object": {"const": "chat.completion"},
+    "created": {"type": "integer", "description": "Unix seconds"},
+    "model": {
+      "type": "string",
+      "description": "What the request named (LiteLLM: `auto` stays `auto`)"
+    },
+    "choices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["index", "message", "finish_reason"],
+        "properties": {
+          "index": {"type": "integer"},
+          "message": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["index", "message", "finish_reason"],
+            "required": ["role"],
             "properties": {
-              "index": {"type": "integer"},
-              "message": {
-                "type": "object",
-                "additionalProperties": true,
-                "required": ["role"],
-                "properties": {
-                  "role": {"const": "assistant"},
-                  "content": {
-                    "type": ["string", "null"],
-                    "description": "The answer (null when the turn only calls tools)"
-                  },
-                  "reasoning": {
-                    "type": ["string", "null"],
-                    "description": "vLLM: the reasoning parser's output (`--reasoning-parser`), kept out of `content`"
-                  },
-                  "reasoning_content": {
-                    "type": ["string", "null"],
-                    "description": "llama-server and LiteLLM (which maps vLLM's `reasoning` onto it): the same reasoning text"
-                  },
-                  "tool_calls": {
-                    "type": ["array", "null"],
-                    "items": {
+              "role": {"const": "assistant"},
+              "content": {
+                "type": ["string", "null"],
+                "description": "The answer (null when the turn only calls tools)"
+              },
+              "reasoning": {
+                "type": ["string", "null"],
+                "description": "vLLM: the reasoning parser's output (`--reasoning-parser`), kept out of `content`"
+              },
+              "reasoning_content": {
+                "type": ["string", "null"],
+                "description": "llama-server and LiteLLM (which maps vLLM's `reasoning` onto it): the same reasoning text"
+              },
+              "tool_calls": {
+                "type": ["array", "null"],
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "$comment": "OpenAI tool call (vLLM ToolCall)",
+                  "required": ["id", "type", "function"],
+                  "properties": {
+                    "id": {"type": "string"},
+                    "type": {"const": "function"},
+                    "function": {
                       "type": "object",
                       "additionalProperties": true,
-                      "$comment": "OpenAI tool call (vLLM ToolCall)",
-                      "required": ["id", "type", "function"],
+                      "required": ["name", "arguments"],
                       "properties": {
-                        "id": {"type": "string"},
-                        "type": {"const": "function"},
-                        "function": {
-                          "type": "object",
-                          "additionalProperties": true,
-                          "required": ["name", "arguments"],
-                          "properties": {
-                            "name": {"type": "string"},
-                            "arguments": {
-                              "type": "string",
-                              "description": "The arguments as a JSON-encoded string"
-                            }
-                          }
+                        "name": {"type": "string"},
+                        "arguments": {
+                          "type": "string",
+                          "description": "The arguments as a JSON-encoded string"
                         }
                       }
+                    }
+                  }
+                },
+                "description": "The parsed tool calls (`--tool-call-parser` on vLLM, `--jinja` on llama-server); absent when none"
+              }
+            }
+          },
+          "finish_reason": {
+            "type": ["string", "null"],
+            "description": "`stop`, `length`, `tool_calls`, …"
+          },
+          "logprobs": {
+            "type": ["object", "null"],
+            "additionalProperties": true,
+            "$comment": "vLLM ChatCompletionLogProbs; present when the request set `logprobs: true`",
+            "properties": {
+              "content": {
+                "type": ["array", "null"],
+                "description": "One entry per generated token. The classifier reads an integer field's distribution from these (`common.logprobs`)",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["token", "logprob"],
+                  "properties": {
+                    "token": {"type": "string"},
+                    "logprob": {"type": "number"},
+                    "bytes": {
+                      "type": ["array", "null"],
+                      "items": {"type": "integer"}
                     },
-                    "description": "The parsed tool calls (`--tool-call-parser` on vLLM, `--jinja` on llama-server); absent when none"
+                    "top_logprobs": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "required": ["token", "logprob"],
+                        "properties": {
+                          "token": {"type": "string"},
+                          "logprob": {"type": "number"},
+                          "bytes": {
+                            "type": ["array", "null"],
+                            "items": {"type": "integer"}
+                          }
+                        }
+                      },
+                      "description": "The `top_logprobs` most likely tokens at this position"
+                    }
                   }
                 }
-              },
-              "finish_reason": {
+              }
+            }
+          }
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "vLLM UsageInfo; llama-server and LiteLLM send the same keys",
+      "required": ["prompt_tokens", "total_tokens"],
+      "properties": {
+        "prompt_tokens": {"type": "integer"},
+        "completion_tokens": {"type": ["integer", "null"]},
+        "total_tokens": {"type": "integer"},
+        "prompt_tokens_details": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "cached_tokens": {
+              "type": ["integer", "null"],
+              "description": "Prompt tokens served from the prefix cache. vLLM fills it only with `--enable-prompt-tokens-details` (muse-glimmer); the classifier records it per call kind"
+            }
+          }
+        },
+        "completion_tokens_details": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "reasoning_tokens": {
+              "type": ["integer", "null"],
+              "description": "Completion tokens spent reasoning, where the server counts them"
+            }
+          }
+        }
+      }
+    },
+    "system_fingerprint": {"type": ["string", "null"]},
+    "timings": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "llama-server only: prompt and generation speed (`cache_n`, `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_per_second`, …)"
+    }
+  }
+}
+```
+
+Response `200` (`text/event-stream`) — `"stream": true`: one `chat.completion.chunk` per `data:` line, then `data: [DONE]`:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": true,
+  "$comment": "vLLM ChatCompletionStreamResponse (open subset); the same shape from llama-server and LiteLLM",
+  "required": ["id", "object", "created", "model", "choices"],
+  "properties": {
+    "id": {"type": "string"},
+    "object": {"const": "chat.completion.chunk"},
+    "created": {"type": "integer"},
+    "model": {"type": "string"},
+    "choices": {
+      "type": "array",
+      "description": "Empty on a final usage-only chunk",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["index", "delta"],
+        "properties": {
+          "index": {"type": "integer"},
+          "delta": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "What this chunk adds; concatenate `content` (and the reasoning field) across chunks",
+            "properties": {
+              "role": {"type": ["string", "null"]},
+              "content": {"type": ["string", "null"]},
+              "reasoning": {
                 "type": ["string", "null"],
-                "description": "`stop`, `length`, `tool_calls`, …"
+                "description": "vLLM: the reasoning parser's output (`--reasoning-parser`), kept out of `content`"
               },
-              "logprobs": {
-                "type": ["object", "null"],
-                "additionalProperties": true,
-                "$comment": "vLLM ChatCompletionLogProbs; present when the request set `logprobs: true`",
-                "properties": {
-                  "content": {
-                    "type": ["array", "null"],
-                    "description": "One entry per generated token. The classifier reads an integer field's distribution from these (`common.logprobs`)",
-                    "items": {
-                      "type": "object",
+              "reasoning_content": {
+                "type": ["string", "null"],
+                "description": "llama-server and LiteLLM (which maps vLLM's `reasoning` onto it): the same reasoning text"
+              },
+              "tool_calls": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["index"],
+                  "properties": {
+                    "index": {"type": "integer"},
+                    "id": {"type": ["string", "null"]},
+                    "type": {"type": ["string", "null"]},
+                    "function": {
+                      "type": ["object", "null"],
                       "additionalProperties": true,
-                      "required": ["token", "logprob"],
                       "properties": {
-                        "token": {"type": "string"},
-                        "logprob": {"type": "number"},
-                        "bytes": {
-                          "type": ["array", "null"],
-                          "items": {"type": "integer"}
-                        },
-                        "top_logprobs": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "additionalProperties": true,
-                            "required": ["token", "logprob"],
-                            "properties": {
-                              "token": {"type": "string"},
-                              "logprob": {"type": "number"},
-                              "bytes": {
-                                "type": ["array", "null"],
-                                "items": {"type": "integer"}
-                              }
-                            }
-                          },
-                          "description": "The `top_logprobs` most likely tokens at this position"
+                        "name": {"type": ["string", "null"]},
+                        "arguments": {
+                          "type": ["string", "null"],
+                          "description": "A fragment of the JSON arguments"
                         }
                       }
                     }
@@ -412,9 +514,58 @@ Response `200` (`application/json`) — with `"stream": true` the body is `text/
                 }
               }
             }
+          },
+          "finish_reason": {
+            "type": ["string", "null"],
+            "description": "Set on the choice's last chunk"
+          },
+          "logprobs": {
+            "type": ["object", "null"],
+            "additionalProperties": true,
+            "$comment": "vLLM ChatCompletionLogProbs; present when the request set `logprobs: true`",
+            "properties": {
+              "content": {
+                "type": ["array", "null"],
+                "description": "One entry per generated token. The classifier reads an integer field's distribution from these (`common.logprobs`)",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["token", "logprob"],
+                  "properties": {
+                    "token": {"type": "string"},
+                    "logprob": {"type": "number"},
+                    "bytes": {
+                      "type": ["array", "null"],
+                      "items": {"type": "integer"}
+                    },
+                    "top_logprobs": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "required": ["token", "logprob"],
+                        "properties": {
+                          "token": {"type": "string"},
+                          "logprob": {"type": "number"},
+                          "bytes": {
+                            "type": ["array", "null"],
+                            "items": {"type": "integer"}
+                          }
+                        }
+                      },
+                      "description": "The `top_logprobs` most likely tokens at this position"
+                    }
+                  }
+                }
+              }
+            }
           }
-        },
-        "usage": {
+        }
+      }
+    },
+    "usage": {
+      "anyOf": [
+        {
           "type": "object",
           "additionalProperties": true,
           "$comment": "vLLM UsageInfo; llama-server and LiteLLM send the same keys",
@@ -445,169 +596,17 @@ Response `200` (`application/json`) — with `"stream": true` the body is `text/
             }
           }
         },
-        "system_fingerprint": {"type": ["string", "null"]},
-        "timings": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "llama-server only: prompt and generation speed (`cache_n`, `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_per_second`, …)"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "additionalProperties": true,
-      "$comment": "vLLM ChatCompletionStreamResponse (open subset); the same shape from llama-server and LiteLLM",
-      "description": "`stream: true`: the body is `text/event-stream`, and each `data:` line carries one of these; the stream ends with `data: [DONE]`",
-      "required": ["id", "object", "created", "model", "choices"],
-      "properties": {
-        "id": {"type": "string"},
-        "object": {"const": "chat.completion.chunk"},
-        "created": {"type": "integer"},
-        "model": {"type": "string"},
-        "choices": {
-          "type": "array",
-          "description": "Empty on a final usage-only chunk",
-          "items": {
-            "type": "object",
-            "additionalProperties": true,
-            "required": ["index", "delta"],
-            "properties": {
-              "index": {"type": "integer"},
-              "delta": {
-                "type": "object",
-                "additionalProperties": true,
-                "description": "What this chunk adds; concatenate `content` (and the reasoning field) across chunks",
-                "properties": {
-                  "role": {"type": ["string", "null"]},
-                  "content": {"type": ["string", "null"]},
-                  "reasoning": {
-                    "type": ["string", "null"],
-                    "description": "vLLM: the reasoning parser's output (`--reasoning-parser`), kept out of `content`"
-                  },
-                  "reasoning_content": {
-                    "type": ["string", "null"],
-                    "description": "llama-server and LiteLLM (which maps vLLM's `reasoning` onto it): the same reasoning text"
-                  },
-                  "tool_calls": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": true,
-                      "required": ["index"],
-                      "properties": {
-                        "index": {"type": "integer"},
-                        "id": {"type": ["string", "null"]},
-                        "type": {"type": ["string", "null"]},
-                        "function": {
-                          "type": ["object", "null"],
-                          "additionalProperties": true,
-                          "properties": {
-                            "name": {"type": ["string", "null"]},
-                            "arguments": {
-                              "type": ["string", "null"],
-                              "description": "A fragment of the JSON arguments"
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              },
-              "finish_reason": {
-                "type": ["string", "null"],
-                "description": "Set on the choice's last chunk"
-              },
-              "logprobs": {
-                "type": ["object", "null"],
-                "additionalProperties": true,
-                "$comment": "vLLM ChatCompletionLogProbs; present when the request set `logprobs: true`",
-                "properties": {
-                  "content": {
-                    "type": ["array", "null"],
-                    "description": "One entry per generated token. The classifier reads an integer field's distribution from these (`common.logprobs`)",
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": true,
-                      "required": ["token", "logprob"],
-                      "properties": {
-                        "token": {"type": "string"},
-                        "logprob": {"type": "number"},
-                        "bytes": {
-                          "type": ["array", "null"],
-                          "items": {"type": "integer"}
-                        },
-                        "top_logprobs": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "additionalProperties": true,
-                            "required": ["token", "logprob"],
-                            "properties": {
-                              "token": {"type": "string"},
-                              "logprob": {"type": "number"},
-                              "bytes": {
-                                "type": ["array", "null"],
-                                "items": {"type": "integer"}
-                              }
-                            }
-                          },
-                          "description": "The `top_logprobs` most likely tokens at this position"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
-        "usage": {
-          "anyOf": [
-            {
-              "type": "object",
-              "additionalProperties": true,
-              "$comment": "vLLM UsageInfo; llama-server and LiteLLM send the same keys",
-              "required": ["prompt_tokens", "total_tokens"],
-              "properties": {
-                "prompt_tokens": {"type": "integer"},
-                "completion_tokens": {"type": ["integer", "null"]},
-                "total_tokens": {"type": "integer"},
-                "prompt_tokens_details": {
-                  "type": ["object", "null"],
-                  "additionalProperties": true,
-                  "properties": {
-                    "cached_tokens": {
-                      "type": ["integer", "null"],
-                      "description": "Prompt tokens served from the prefix cache. vLLM fills it only with `--enable-prompt-tokens-details` (muse-glimmer); the classifier records it per call kind"
-                    }
-                  }
-                },
-                "completion_tokens_details": {
-                  "type": ["object", "null"],
-                  "additionalProperties": true,
-                  "properties": {
-                    "reasoning_tokens": {
-                      "type": ["integer", "null"],
-                      "description": "Completion tokens spent reasoning, where the server counts them"
-                    }
-                  }
-                }
-              }
-            },
-            {"type": "null"}
-          ],
-          "description": "On the last chunk with `stream_options.include_usage` (LiteLLM and llama-server send it unasked)"
-        }
-      }
+        {"type": "null"}
+      ],
+      "description": "On the last chunk with `stream_options.include_usage` (LiteLLM and llama-server send it unasked)"
     }
-  ]
+  }
 }
 ```
 
 ## `POST /v1/embeddings`
 
-Answers only for a `model_list` entry whose backend serves embeddings; none of this deployment's vLLM / llama.cpp chat servers is started with an embedding task, so the collection's `qwen3.6` item gets the backend's error.
+No embedding model is configured in this deployment, so this answers an error today: every `model_list` backend is a chat (or TTS) server. The collection's `qwen3.6` reaches its vLLM server, which registers no `/v1/embeddings` for a chat model (FastAPI's 404 `{"detail": "Not Found"}`); LiteLLM (no retry for a 404) tries its `fallbacks` entry `claude-sonnet-5` (which it cannot embed with: `Unmapped LLM provider for this endpoint`) and answers the first error, a 404. With qwen3.6 down it is a 500 (connection error) instead. The 200 is what a model with an embedding backend would answer.
 
 Request body (`application/json`):
 
@@ -645,7 +644,7 @@ Request body (`application/json`):
 }
 ```
 
-Response `200` (`application/json`):
+Response `200` (`application/json`) — only from a model whose backend embeds (none configured):
 
 ```json
 {
@@ -683,6 +682,33 @@ Response `200` (`application/json`):
       "properties": {
         "prompt_tokens": {"type": "integer"},
         "total_tokens": {"type": "integer"}
+      }
+    }
+  }
+}
+```
+
+Response `404` (`application/json`) — today, for the collection's `qwen3.6`: its vLLM server has no embeddings route:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": true,
+  "$comment": "LiteLLM's ProxyException body",
+  "required": ["error"],
+  "properties": {
+    "error": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["message", "type", "param", "code"],
+      "properties": {
+        "message": {
+          "type": "string",
+          "description": "`litellm.NotFoundError: NotFoundError: OpenAIException - Error code: 404 - {'detail': 'Not Found'}. Received Model Group=qwen3.6`, then the fallbacks tried and each one's error"
+        },
+        "type": {"type": ["string", "null"], "description": "null here"},
+        "param": {"type": ["string", "null"], "description": "null here"},
+        "code": {"const": "404", "description": "The HTTP status, as a string"}
       }
     }
   }

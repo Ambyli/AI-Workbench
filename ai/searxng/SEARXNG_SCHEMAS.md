@@ -27,10 +27,6 @@ Response `200` (`application/json`):
   ],
   "properties": {
     "query": {"type": "string"},
-    "number_of_results": {
-      "type": "number",
-      "description": "Older releases only; master's get_json_response no longer sends it"
-    },
     "results": {
       "type": "array",
       "items": {

@@ -229,8 +229,8 @@
       "same_as": "vllm: POST /v1/chat/completions"
     },
     "POST /v1/embeddings": {
-      "$comment": "OpenAI Embeddings: request checked against the box's GET /openapi.json (its documented model types `input` as a list of strings; the proxy passes a string through as OpenAI allows); response litellm.types.utils.EmbeddingResponse; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
-      "description": "Answers only for a `model_list` entry whose backend serves embeddings; none of this deployment's vLLM / llama.cpp chat servers is started with an embedding task, so the collection's `qwen3.6` item gets the backend's error.",
+      "$comment": "OpenAI Embeddings: request checked against the box's GET /openapi.json (its documented model types `input` as a list of strings; the proxy passes a string through as OpenAI allows); 200 litellm.types.utils.EmbeddingResponse; the 404 from litellm/proxy/common_request_processing.py at the v1.95.0 tag _handle_llm_api_exception + litellm/proxy/_types.py at the v1.95.0 tag ProxyException, its message as LiteLLM 1.95.0's Router raises it (reproduced locally against a stand-in for the vLLM 404); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "No embedding model is configured in this deployment, so this answers an error today: every `model_list` backend is a chat (or TTS) server. The collection's `qwen3.6` reaches its vLLM server, which registers no `/v1/embeddings` for a chat model (FastAPI's 404 `{\"detail\": \"Not Found\"}`); LiteLLM (no retry for a 404) tries its `fallbacks` entry `claude-sonnet-5` (which it cannot embed with: `Unmapped LLM provider for this endpoint`) and answers the first error, a 404. With qwen3.6 down it is a 500 (connection error) instead. The 200 is what a model with an embedding backend would answer.",
       "request": {
         "content_type": "application/json",
         "schema": {
@@ -290,6 +290,7 @@
       "responses": {
         "200": {
           "content_type": "application/json",
+          "description": "only from a model whose backend embeds (none configured)",
           "schema": {
             "type": "object",
             "additionalProperties": true,
@@ -348,6 +349,54 @@
                   },
                   "total_tokens": {
                     "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "description": "today, for the collection's `qwen3.6`: its vLLM server has no embeddings route",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "$comment": "LiteLLM's ProxyException body",
+            "required": [
+              "error"
+            ],
+            "properties": {
+              "error": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "message",
+                  "type",
+                  "param",
+                  "code"
+                ],
+                "properties": {
+                  "message": {
+                    "type": "string",
+                    "description": "`litellm.NotFoundError: NotFoundError: OpenAIException - Error code: 404 - {'detail': 'Not Found'}. Received Model Group=qwen3.6`, then the fallbacks tried and each one's error"
+                  },
+                  "type": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "null here"
+                  },
+                  "param": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "null here"
+                  },
+                  "code": {
+                    "const": "404",
+                    "description": "The HTTP status, as a string"
                   }
                 }
               }

@@ -25,7 +25,10 @@
     }
 
 ``request`` may also be a LIST of such objects, one per content type (an
-endpoint that takes JSON or multipart). Keys are
+endpoint that takes JSON or multipart), and so may a response status (one
+that answers JSON or, streamed, ``text/event-stream`` -- whose ``schema`` is
+that of each ``data:`` payload); in a list every body names its own
+``content_type``, each once. Keys are
 :func:`common.apidocs.postman.endpoint_key`'s.
 
 **Schemas** are JSON Schema draft 2020-12. A ``$ref`` is ``#/$defs/<name>``;
@@ -309,13 +312,37 @@ class Endpoint:
         return None
 
     def responses(self) -> Dict[str, Body]:
-        return {status: _body(spec) for status, spec in (self.entry.get("responses") or {}).items()}
+        """Each status's FIRST body -- its only one, or the first of its
+        list (the primary content type). :meth:`response_bodies` has them
+        all."""
+        return {status: bodies[0] for status, bodies in self._response_lists().items()}
+
+    def response_bodies(self, status: str) -> List[Body]:
+        """Every body of one status, one per content type ([] for a status
+        the entry does not list)."""
+        return self._response_lists().get(status, [])
+
+    def response_for(self, status: str, content_type: str) -> Optional[Body]:
+        for b in self.response_bodies(status):
+            if b.content_type == content_type:
+                return b
+        return None
+
+    def all_responses(self) -> List[Tuple[str, Body]]:
+        """``(status, body)`` for every response body, in file order."""
+        return [(status, b) for status, bodies in self._response_lists().items() for b in bodies]
+
+    def _response_lists(self) -> Dict[str, List[Body]]:
+        return {status: [_body(s) for s in (spec if isinstance(spec, list) else [spec])]
+                for status, spec in (self.entry.get("responses") or {}).items()}
 
     def standalone(self, schema: Any) -> Any:
         return standalone(schema, self.defs)
 
     def schemas(self) -> Iterator[Tuple[str, Any]]:
-        """``(label, standalone schema)`` for every schema of the entry."""
+        """``(label, standalone schema)`` for every schema of the entry. A
+        response is labelled ``response <status>``, plus its content type
+        when the status lists several."""
         if self.is_mcp:
             for part in ("arguments", "params", "result"):
                 if part in self.entry:
@@ -324,9 +351,11 @@ class Endpoint:
         for b in self.requests():
             if b.schema is not None:
                 yield f"request {b.content_type}", self.standalone(b.schema)
-        for status, b in self.responses().items():
-            if b.schema is not None:
-                yield f"response {status}", self.standalone(b.schema)
+        for status, bodies in self._response_lists().items():
+            for b in bodies:
+                if b.schema is not None:
+                    label = f"response {status}" if len(bodies) == 1 else f"response {status} {b.content_type}"
+                    yield label, self.standalone(b.schema)
 
 
 def _body(spec: Mapping[str, Any]) -> Body:
@@ -416,10 +445,21 @@ def _check_structure(path: pathlib.Path, data: Any) -> None:
             responses = entry.get("responses")
             if not isinstance(responses, dict) or not responses:
                 raise SchemaFileError(f"{at}: `responses` must be a non-empty object")
-            bodies = list(responses.items())
-            request = entry.get("request")
-            if request is not None:
-                bodies += [("request", r) for r in (request if isinstance(request, list) else [request])]
+            bodies = []
+            for status, spec in [*responses.items(), ("request", entry.get("request"))]:
+                if spec is None and status == "request":
+                    continue
+                if isinstance(spec, list):
+                    if not spec:
+                        raise SchemaFileError(f"{at} {status}: a list of bodies must not be empty")
+                    types = [s.get("content_type") if isinstance(s, dict) else None for s in spec]
+                    if not all(types):
+                        raise SchemaFileError(f"{at} {status}: in a list, every body names its `content_type`")
+                    if len(set(types)) != len(types):
+                        raise SchemaFileError(f"{at} {status}: a content type appears twice in the list")
+                    bodies += [(status, s) for s in spec]
+                else:
+                    bodies.append((status, spec))
             for status, spec in bodies:
                 if status != "request" and not _STATUS.match(status):
                     raise SchemaFileError(f"{at}: response status {status!r} is not a 3-digit code")

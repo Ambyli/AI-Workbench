@@ -249,10 +249,31 @@ def text_to_speech(text: str, voice: str = "alloy") -> str:
         filename = _save_audio(text, voice, audio_bytes)
         return f"{AUDIO_BASE_URL}/audio/{filename}"
     except httpx.HTTPError as exc:
-        # A 4xx from kokoro-app (an unknown voice) says what to fix: relay its
-        # detail; unreachable / 5xx keeps httpx's own message.
+        # Avoid returning raw upstream error text directly in MCP tool output.
+        # Upstream `detail` may contain user-controlled strings; provide a
+        # stable error shape and only include a short sanitized hint.
         status, detail = _app_error(exc)
-        return f"Error generating audio: {detail if status != 502 else exc}"
+        if status == 400:
+            code = "kokoro_bad_request"
+            message = "Invalid request for speech generation."
+        elif status == 502:
+            code = "kokoro_unavailable"
+            message = "Speech service is temporarily unavailable."
+        else:
+            code = "kokoro_error"
+            message = "Speech generation failed."
+
+        safe_hint = ""
+        if status != 502 and detail:
+            safe_hint = "".join(ch for ch in str(detail) if ch.isprintable())
+            safe_hint = safe_hint.replace("\r", " ").replace("\n", " ").strip()
+            if len(safe_hint) > 120:
+                safe_hint = safe_hint[:120] + "..."
+
+        return (
+            f"Error [{code}] (status={status}): {message}"
+            + (f" Hint: {safe_hint}" if safe_hint else "")
+        )
 
 
 app.mount("/mcp", mcp_app)

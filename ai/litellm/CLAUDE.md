@@ -19,6 +19,7 @@ The single OpenAI-compatible surface: `litellm` (swap-class, fronted by `ai/edge
 - **Prometheus** lives here but scrapes every stack (`prometheus.yml`: `litellm`, `classifier`, `detector`, `route-policy`, `signals`, `edge`). It is recreate-class with a single-file bind mount: a new or changed scrape job needs `docker restart prometheus`. Its `/metrics` key is a virtual key allowed only `/metrics` — never turn off `require_auth_for_metrics_endpoint` (the tunnel makes `/metrics` public). `LITELLM.md § Prometheus scrape key`, `§ Prometheus scrape jobs`.
 - **Pass-throughs** (`/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox`, `/v1/route-policy`) must carry `auth: true` — a config-file pass-through without it forwards keyless requests, and none of those services checks a token. A virtual key also needs the route in `metadata.allowed_passthrough_routes` (inside `metadata`, never the top-level field); `scripts/passthrough_routes.py` edits it. `LITELLM.md § Pass-through auth`.
 - **Spills and spend.** `[overflow]` / `[route-policy]` lines in `make logs litellm`; the spend log's model group is the chain, its model the deployment. A `local-private` row with a Claude model must never exist.
+- **An image-tag bump re-checks `litellm.schemas.json`** (an open subset of the upstream API) against the new release (root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

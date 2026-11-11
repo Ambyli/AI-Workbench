@@ -6,7 +6,7 @@ A single-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sy
 |---|---|
 | `roofix` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
 
-Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR.md](../interceptor/INTERCEPTOR.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
+No host port is published for the bridge (only `roofix-db`'s `PORT_ROOFIX_DB`): it is reached on `ai_shared` as `roofix:8080`, or from outside through LiteLLM's `/v1/roofix` pass-through (`ai/litellm/litellm_config.yaml` → `pass_through_endpoints`, `auth: true` — see [Endpoints](#endpoints)). For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR.md](../interceptor/INTERCEPTOR.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
 
 ### Quick start
 
@@ -29,7 +29,7 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Container healthcheck. |
-| `GET /status` | Last-tick timestamp, per-action decision counts, escalation counts, error count, effective `DRY_RUN` / `AGENT_PHASE`. |
+| `GET /status` | In-memory counters (reset on restart): last-tick timestamp / ok / error, per-action and per-source decision counts, `escalations_total`, `phoenix_write_failures` (decisions whose Phoenix write — update_chatter, a mapped update_milestone, create_project's `ensure_entity_and_project` — returned ok=false, once per event; DRY_RUN writes succeed and a milestone event with no mapping writes nothing, so neither is counted; a mapped milestone whose block name does not resolve is), effective `DRY_RUN` / `AGENT_PHASE`. |
 | `POST /tick` | Manually process one batch now. Body optionally accepts `{"raw_emails": [...]}` (Contract A shape) to process crafted samples without hitting Gmail. |
 | `POST /execute/{message_id}` | Re-run one specific Gmail message through the pipeline. Fetches by id regardless of read/unread state, skips the `processed_store` dedup filter, otherwise runs the same orchestrator path a scheduled tick would (Phoenix writes, `mark_read`, escalation forward — all subject to `DRY_RUN`). Returns `404` if the id isn't visible to the OAuth token, `200 {records, count}` on success. |
 | `POST /reset/{message_id}` | Clear the three gates so the next scheduled tick re-fetches this email through the normal listener path: flips `processed_store` status to `pending`, removes `ROOFIX_PROCESSED_LABEL`, re-adds the `UNREAD` label. All Gmail modifies are idempotent. Returns `{message_id, store, gmail: {unread, label_removed}, label}`. `store` is `"unchanged"` if there was no processed_store row for the id (Gmail side still runs). `404` if Gmail can't find the id. See [Reanalyzing an email](#reanalyzing-an-email) for when to use this vs `/execute`. |
@@ -40,6 +40,12 @@ Reach the bridge from another container on `ai_shared`:
 ```bash
 make exec litellm litellm CMD='curl http://roofix:8080/status'
 make exec litellm litellm CMD='curl -X POST http://roofix:8080/tick'
+```
+
+Or through LiteLLM: `/v1/roofix` → `http://roofix:8080` is a pass-through (`include_subpath: true`, GET + POST, headers forwarded, `auth: true`), so `<litellm>/v1/roofix/status` is `GET /status`. The bridge checks no token itself; the pass-through's key check is the only gate — the master key or a proxy-admin key passes, a virtual key needs `/v1/roofix` in its (or its team's) `metadata.allowed_passthrough_routes` ([LITELLM.md § Pass-through auth](../litellm/LITELLM.md#pass-through-auth)).
+
+```bash
+curl -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" http://localhost:4001/v1/roofix/status
 ```
 
 For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR.md](../interceptor/INTERCEPTOR.md).
@@ -81,13 +87,15 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `action` | Phoenix write | `processed_store` | Gmail `mark_read` | Notes |
 |---|---|---|---|---|
 | `ignore` | — | `mark_ok({action, source, reasoning})` | only if `source=="rule"` | Terminal. AI-source ignores stay unread so an operator can review the model's judgment. Rule-source ignores are deterministic and safe to silence. |
-| `escalate` / `needs_human=True` | — | `mark_ok({action, forwarded, source, reasoning})` | only if forward succeeded | If `gmail`, `ESCALATION_RECIPIENTS`, and the original email are all available, calls `gmail.forward_email(...)`. On success stamps `decision["_forwarded"]=True` (→ `app.py` marks read). On failure or when no recipients are configured, stamps `False` (→ stays unread for operator review in the Roofix inbox). |
+| `escalate`, or `needs_human=True` with any action (checked first) | — | `mark_ok({action, forwarded, source, reasoning})` | only if forward succeeded | If `gmail`, `ESCALATION_RECIPIENTS`, and the original email are all available, calls `gmail.forward_email(...)`. On success stamps `decision["_forwarded"]=True` (→ `app.py` marks read). On failure or when no recipients are configured, stamps `False` (→ stays unread for operator review in the Roofix inbox). |
 | `update_chatter` | `phoenix.update_chatter(project_id, note_text)` | — | yes (default) | `target` is the Phoenix project id as str; cast to int. If `phoenix is None` or `DRY_RUN=true`, the write is short-circuited via the Result's `dry_run` flag; the audit row is prefixed `DRY_RUN`. |
 | `update_milestone` | `phoenix.update_milestone(project_id, block_name, status_id)` | — | yes (default) | Looks up the milestone mapping using `event_type` as the key (`FIELD_MAPPING_PATH`). Missing mapping → log a "no milestone mapping for `<event>`" warning and skip the write. |
 | `create_project` (accepted) | `phoenix.ensure_entity_and_project(payload)` | `mark_ok({roofix_id, phoenix_entity_id, project_id, accepted:True})` on write success; `mark_error({error})` on write failure | yes on success (default) | Uses the `_extracted_payload` stashed by `_scrape_and_extract`. Bails if the payload or `roofix_id` is missing (audit row `orchestrator/create_project` with ok=False). |
 | `create_project` (not accepted) | — | `mark_ok({roofix_id, accepted:False})` | yes (default) | Proposal wasn't accepted per the extractor's acceptance rule — log `orchestrator/not_accepted` and stop. |
 | `noop_project_exists` | — | `mark_ok({action, source, reasoning, project_id})` | yes (rule-source terminal) | Emitted by the brain for a `CREATE_PROJECT_EVENTS` event when Phoenix already resolved the project — either directly on identity, or after the scrape gate ran and re-resolved via the extracted Roofix id. No create, no scrape re-run. Response `decision.target` is the existing Phoenix project id; use it to distinguish "we already have this" from a fresh `create_project`. |
 | _anything else_ | — | `mark_error({error, source, reasoning})` | no (unread) | Most likely an AI hallucination (`"send_email"`, `"call_customer"`, etc.) or a Phase 1 action leaking into Phase 0. `mark_error` (not `mark_ok`) so `is_processed` returns False next tick — the brain gets another chance. Recurring errors here are a signal to tighten `SYSTEM_PROMPT`. |
+
+Every branch that calls a Phoenix write (`update_chatter`, `update_milestone` with a mapping, an accepted `create_project`) stamps `decision["_phoenix_write_ok"] = res.ok` (a DRY_RUN write is ok); `app.py` counts the false ones into `/status` `phoenix_write_failures`.
 
 Sub-cases that short-circuit before the action branches:
 - **Offline dry-run** — when `phoenix is None`, every action other than `ignore` / `escalate` short-circuits with `orchestrator/{action}` ok=True and detail prefixed `offline dry-run:`. No Phoenix write, no `processed_store` write.
@@ -129,7 +137,7 @@ Sub-cases that short-circuit before the action branches:
 | `ROOFIX_MAX_MATCHES_PER_PATTERN` | `5` | Cap on captures per URL pattern returned in one `/capture` response. |
 | `ROOFIX_INIT_DATA_URL_PATTERN` | `roofix\.io/api/1\.1/init/data` | Regex matched against captured XHR URLs to identify Bubble's page-hydrate endpoint. Override if Bubble ever renames it. |
 | `ROOFIX_MGET_URL_PATTERN` | `roofix\.io/elasticsearch/mget` | Regex matched against captured XHR URLs to identify the batch-get endpoint (customer + HIC + job docs). |
-| `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
+| `FIELD_MAPPING_PATH` | `config/field_mapping.json` beside `app.py` (in the image `/app/ai/roofix/config/field_mapping.json`) | Roofix-event → Phoenix (block_name, status_id) map. Unset or empty = the shipped file; point it at `/config/field_mapping.json` (the `ROOFIX_BRIDGE_CONFIG_DIR` mount) to change the map without a rebuild. |
 | `LOG_DIR` | `/data` | Where per-tick logs live (mounted volume). Two files: `roofix.log` (stdlib text log; framework messages + compact per-decision echo) and `agent_log.csv` (structured audit trail via `common.logging_setup.CsvLogger`). |
 | `DEBUG_LOGGING` | `false` | When true, promotes the stdlib file log to DEBUG level and the console to DEBUG. |
 
@@ -353,11 +361,17 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
 
 1. **Offline unit tests** (no Docker, no network):
 
+   Each file is a script (exit 1 on a failure); run each in its own process from `ai/roofix`:
+
    ```bash
    cd ai/roofix
-   PYTHONPATH=. python tests/test_parser.py
-   PYTHONPATH=. python tests/test_brain.py
+   for t in test_parser test_brain test_proposal_extractor test_phoenix_client \
+            test_t9_orchestrator test_extracted_payload test_execute test_field_mapping; do
+     PYTHONPATH=. UV_LINK_MODE=copy uv run --no-sync python tests/$t.py || echo "FAILED: $t"
+   done
    ```
+
+   `test_extracted_payload` pins the `_extracted_payload` names (ExtractedProposal → orchestrator → `ensure_entity_and_project`) and checks real records against `roofix.schemas.json`; `test_execute` covers the escalation branch, the `_phoenix_write_ok` stamp and `/status`'s `phoenix_write_failures`; `test_field_mapping` pins where the milestone map is read from (the shipped file, in the image too) and that it is still the stub. (`test_e2e_offline.py` predates the async orchestrator and does not pass.)
 
 2. **Bring up the stack**:
 
@@ -422,7 +436,8 @@ ai/roofix/
     roofix_email_samples.py         real observed email shapes
     fixtures/                       captured proposal payloads
     test_parser.py, test_brain.py, test_phoenix_client.py, test_proposal_extractor.py,
-    test_t9_orchestrator.py, test_e2e_offline.py
+    test_t9_orchestrator.py, test_extracted_payload.py, test_execute.py, test_field_mapping.py,
+    test_e2e_offline.py
 ```
 
 There is no separate scraper service any more: the Playwright proposal scraper (and its `save_roofix_session.py` + `/session/refresh` flow) was replaced by the generic `ai/interceptor/` service (Chrome under CDP), which owns the Roofix session as a named profile — see [Session profile](#session-profile-roofix-on-interceptor).
@@ -430,7 +445,13 @@ There is no separate scraper service any more: the Playwright proposal scraper (
 ### Known limitations / TODOs
 
 - **Phoenix writes are live via psycopg2** — no MCP dependency. The MCP client was reverted because the write tools weren't ready in time. `DRY_RUN=true` still short-circuits writes (returns Result with the intended SQL + params in `.data` for inspection).
-- **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. `update_milestone` will log a "no milestone mapping" warning and skip until the file is filled in.
+- **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. It loads (`FIELD_MAPPING_PATH`), but every milestone in it is `phoenix_block_TBD` / status `0`: `update_milestone` looks that block up in Phoenix (a read, even under `DRY_RUN`), finds no row, logs "process_block 'phoenix_block_TBD' resolved to 0 rows" and writes nothing (counted in `/status` `phoenix_write_failures`); an event with no entry at all (`Job Completed`, `Job Rescheduled`, `Execute HIC`, …) logs "no milestone mapping" and skips. Milestones are a Phase 0 rule (`AGENT_PHASE` does not gate them), so once real block names and status ids are filled in, `DRY_RUN=false` makes the writes real — the shipped file is baked into the image, so that is a rebuild (`make build roofix && make up roofix`) unless `FIELD_MAPPING_PATH` points at the mount.
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **Phase 1** — `create_project` and `notify_rep` paths exist but are stubbed. Wire a CloudTalk MCP when needed.
 - **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR.md § Refreshing a profile](../interceptor/INTERCEPTOR.md#refreshing-a-profile-operator-flow)).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`ROOFIX_SCHEMAS.md`](ROOFIX_SCHEMAS.md), generated from [`roofix.schemas.json`](roofix.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

@@ -297,6 +297,20 @@ def test_a_spec_missing_the_common_fields_is_refused():
                    fields={"n": FieldSpec("n", "integer")})
 
 
+def test_a_field_kind_must_be_a_json_kind():
+    """`kind` is a JSON Schema type (the detail schemas are generated from
+    it), so a typo is refused where the field is declared."""
+    from analysis.result_specs import KINDS, FieldSpec
+
+    with pytest.raises(ValueError, match="unknown kind 'float'"):
+        FieldSpec("a ratio", "float")
+    for type_, spec in specs().items():
+        assert {f.kind for f in spec.fields.values()} <= KINDS, type_
+    # nullable is declared, and served beside stable / when.
+    assert specs()["llm"].as_dict()["fields"]["value"]["nullable"] is True
+    assert "nullable" not in specs()["text"].as_dict()["fields"]["count"]
+
+
 # ---------------------------------------------------------------------------
 # detail.reference — declared once (REFERENCE_FIELD), on the llm type only
 # ---------------------------------------------------------------------------

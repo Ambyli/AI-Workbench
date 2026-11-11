@@ -5,8 +5,10 @@ networks:
 
 services:
   searxng:
-    # Pinned release tag. Bump this line and run `make build searxng` to
-    # update. Use `:latest` for the rolling upstream tag.
+    # NOT pinned: `latest` is upstream's rolling tag, and `make up` never
+    # re-pulls a cached one (compose pulls only a missing image). To pin, put
+    # a release tag from https://hub.docker.com/r/searxng/searxng/tags here
+    # and run `make up searxng`. See SEARXNG.md § Updating the image.
     image: docker.io/searxng/searxng:latest
     networks:
       - shared

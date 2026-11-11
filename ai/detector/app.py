@@ -521,7 +521,9 @@ async def detect_objects(
         parsed_threshold = parse_threshold(threshold)
         parsed_max = parse_max_per_label(max_per_label)
     except ValueError as exc:
-        return json.dumps({"error": str(exc)})
+        # The same 400 POST /detect gives these: every error-as-data carries
+        # the status a caller would have seen over HTTP.
+        return json.dumps({"error": str(exc), "status": 400})
 
     try:
         text = image.strip()

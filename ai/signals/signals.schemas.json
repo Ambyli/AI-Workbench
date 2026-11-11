@@ -1,0 +1,1062 @@
+{
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for signals.postman_collection.json, rendered into its items' descriptions and SIGNALS_SCHEMAS.md (linked from SIGNALS.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render. Hand-written from common.signals.wire (the request and the answer) and signals/api.py (/models, /health); unit-tests/signals/test_api_schemas.py validates the app's real responses against them.",
+  "service": "signals",
+  "doc": "SIGNALS.md",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "lane": {
+      "enum": [
+        "pii",
+        "embed",
+        "injection",
+        "language"
+      ]
+    },
+    "lane_state": {
+      "enum": [
+        "loading",
+        "ready",
+        "failed"
+      ]
+    },
+    "model_id": {
+      "type": "string",
+      "pattern": "^.+@[0-9a-f]{12}$",
+      "description": "`<repo>@<first 12 hex of the revision>` (fastText: of its sha256)"
+    },
+    "entity_type": {
+      "enum": [
+        "email",
+        "phone",
+        "street_address",
+        "gov_id",
+        "card_number",
+        "bank_account",
+        "account_number",
+        "date_of_birth",
+        "person",
+        "location",
+        "other"
+      ]
+    },
+    "text_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/id"
+      },
+      "description": "The ids of the texts this task scans, newest first; each names a text of the request"
+    },
+    "text_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id",
+          "description": "Caller-chosen, unique in the request (route-policy: `u<k>` = the user text of user message k, `t<k>` = the k-th tool result)"
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 20000,
+          "description": "Over 20,000 characters (or over 200,000 for all texts together) is a 413"
+        }
+      }
+    },
+    "max_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 512
+    },
+    "example_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "items"
+      ],
+      "properties": {
+        "fingerprint": {
+          "$ref": "#/$defs/id",
+          "description": "The sidecar's cache key for the embedded set"
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1000,
+          "description": "Ids unique; more than 1,000 examples is a 413",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "route",
+              "text"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "route": {
+                "$ref": "#/$defs/id"
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300,
+                "description": "Over 300 characters is a 413"
+              }
+            }
+          }
+        }
+      }
+    },
+    "task": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "task"
+          ],
+          "properties": {
+            "task": {
+              "const": "pii"
+            },
+            "texts": {
+              "$ref": "#/$defs/text_ids"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "task",
+            "examples"
+          ],
+          "properties": {
+            "task": {
+              "const": "nearest"
+            },
+            "texts": {
+              "$ref": "#/$defs/text_ids"
+            },
+            "max_tokens": {
+              "$ref": "#/$defs/max_tokens",
+              "description": "Default 256"
+            },
+            "k": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 50,
+              "description": "Default 5"
+            },
+            "examples": {
+              "$ref": "#/$defs/example_set"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "task"
+          ],
+          "properties": {
+            "task": {
+              "const": "injection"
+            },
+            "texts": {
+              "$ref": "#/$defs/text_ids"
+            },
+            "max_tokens": {
+              "$ref": "#/$defs/max_tokens",
+              "description": "Per window, default 256"
+            },
+            "windows": {
+              "enum": [
+                "head_tail",
+                null
+              ],
+              "description": "`head_tail`, the only mode"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "task"
+          ],
+          "properties": {
+            "task": {
+              "const": "language"
+            },
+            "texts": {
+              "$ref": "#/$defs/text_ids"
+            }
+          }
+        }
+      ]
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "partial",
+        "deadline",
+        "skipped",
+        "warming",
+        "error",
+        "unavailable"
+      ]
+    },
+    "ms": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "task_error": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "cached": {
+      "type": "boolean",
+      "description": "The sidecar answered from its cache"
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "similarity": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "pii_features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entities",
+        "complete",
+        "cached"
+      ],
+      "properties": {
+        "entities": {
+          "type": "object",
+          "description": "Entity type (`common.pii.ENTITY_TYPES`) -> how many the NER found in the text, and its best score",
+          "propertyNames": {
+            "$ref": "#/$defs/entity_type"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "count"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "max_score": {
+                "$ref": "#/$defs/score",
+                "description": "Absent when the model gives none"
+              }
+            }
+          }
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "False when only part of the text was scanned by the deadline"
+        },
+        "cached": {
+          "$ref": "#/$defs/cached"
+        }
+      }
+    },
+    "nearest_features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "neighbours",
+        "routes",
+        "cached"
+      ],
+      "properties": {
+        "neighbours": {
+          "type": "array",
+          "maxItems": 50,
+          "description": "The k nearest examples, most similar first (example ids, never example text)",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "route",
+              "similarity"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "route": {
+                "$ref": "#/$defs/id"
+              },
+              "similarity": {
+                "$ref": "#/$defs/similarity",
+                "description": "Cosine similarity"
+              }
+            }
+          }
+        },
+        "routes": {
+          "type": "object",
+          "description": "Per route among the k nearest",
+          "propertyNames": {
+            "$ref": "#/$defs/id"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "share",
+              "best",
+              "count"
+            ],
+            "properties": {
+              "share": {
+                "$ref": "#/$defs/score",
+                "description": "The route's part of the top-k similarity mass (what route-policy's min_share reads)"
+              },
+              "best": {
+                "$ref": "#/$defs/similarity",
+                "description": "Its best similarity"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How many of the k it holds"
+              }
+            }
+          }
+        },
+        "cached": {
+          "$ref": "#/$defs/cached"
+        }
+      }
+    },
+    "injection_features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "score",
+        "windows",
+        "cached"
+      ],
+      "properties": {
+        "score": {
+          "$ref": "#/$defs/score",
+          "description": "The highest injection probability, P(jailbreak), over the windows scored"
+        },
+        "windows": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How many windows were scored"
+        },
+        "cached": {
+          "$ref": "#/$defs/cached"
+        }
+      }
+    },
+    "language_features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "language",
+        "confidence",
+        "cached"
+      ],
+      "properties": {
+        "language": {
+          "type": "string",
+          "pattern": "^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8}){0,3}$",
+          "description": "A language code as the model labels it (`en`, `es`, `zh` ...); `und` with confidence 0 for a text with no letters"
+        },
+        "confidence": {
+          "$ref": "#/$defs/score"
+        },
+        "cached": {
+          "$ref": "#/$defs/cached"
+        }
+      }
+    },
+    "result_pii": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "ms",
+        "texts"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "ms": {
+          "$ref": "#/$defs/ms"
+        },
+        "texts": {
+          "type": "object",
+          "description": "Features per text id it finished",
+          "propertyNames": {
+            "$ref": "#/$defs/id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/pii_features"
+          }
+        },
+        "error": {
+          "$ref": "#/$defs/task_error"
+        }
+      }
+    },
+    "result_nearest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "ms",
+        "texts"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "ms": {
+          "$ref": "#/$defs/ms"
+        },
+        "texts": {
+          "type": "object",
+          "description": "Features per text id it finished",
+          "propertyNames": {
+            "$ref": "#/$defs/id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/nearest_features"
+          }
+        },
+        "error": {
+          "$ref": "#/$defs/task_error"
+        }
+      }
+    },
+    "result_injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "ms",
+        "texts"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "ms": {
+          "$ref": "#/$defs/ms"
+        },
+        "texts": {
+          "type": "object",
+          "description": "Features per text id it finished",
+          "propertyNames": {
+            "$ref": "#/$defs/id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/injection_features"
+          }
+        },
+        "error": {
+          "$ref": "#/$defs/task_error"
+        }
+      }
+    },
+    "result_language": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "ms",
+        "texts"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "ms": {
+          "$ref": "#/$defs/ms"
+        },
+        "texts": {
+          "type": "object",
+          "description": "Features per text id it finished",
+          "propertyNames": {
+            "$ref": "#/$defs/id"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/language_features"
+          }
+        },
+        "error": {
+          "$ref": "#/$defs/task_error"
+        }
+      }
+    },
+    "model_pin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "repo",
+        "revision",
+        "url",
+        "licence",
+        "files",
+        "tokens",
+        "state"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/model_id"
+        },
+        "repo": {
+          "type": "string",
+          "description": "Hugging Face repo id, or (with `url`) the display id"
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "The commit sha files are fetched at (Hugging Face only)"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A direct download URL instead of Hugging Face (one file)"
+        },
+        "licence": {
+          "type": "string",
+          "description": "SPDX id"
+        },
+        "files": {
+          "type": "object",
+          "description": "Relative path -> sha256 of every file the lane needs",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "tokens": {
+          "type": "object",
+          "description": "Token caps (request params are clamped to `max`)",
+          "additionalProperties": {
+            "type": "integer"
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/lane_state"
+        }
+      }
+    },
+    "lane_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "state",
+        "error",
+        "load_s"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/model_id"
+        },
+        "state": {
+          "$ref": "#/$defs/lane_state"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The exception type its load failed with"
+        },
+        "load_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Seconds its load and warm-up took; null while loading"
+        }
+      }
+    },
+    "health_models": {
+      "type": "object",
+      "description": "Per lane",
+      "required": [
+        "pii",
+        "embed",
+        "injection",
+        "language"
+      ],
+      "propertyNames": {
+        "$ref": "#/$defs/lane"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/lane_health"
+      }
+    },
+    "example_set_states": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warming",
+        "ready"
+      ],
+      "description": "How many example sets are being embedded / are held",
+      "properties": {
+        "warming": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ready": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "queue_depth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "foreground",
+        "background"
+      ],
+      "properties": {
+        "foreground": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "background": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "queues": {
+      "type": "object",
+      "description": "Jobs waiting for each ONNX lane's model (language runs inline)",
+      "required": [
+        "pii",
+        "embed",
+        "injection"
+      ],
+      "propertyNames": {
+        "enum": [
+          "pii",
+          "embed",
+          "injection"
+        ]
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/queue_depth"
+      }
+    }
+  },
+  "endpoints": {
+    "GET /health": {
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "description": "every model is loaded and has run one warm-up inference",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "models",
+              "cache_entries",
+              "example_sets",
+              "queues"
+            ],
+            "properties": {
+              "status": {
+                "const": "ok"
+              },
+              "models": {
+                "$ref": "#/$defs/health_models"
+              },
+              "cache_entries": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Entries in the in-memory feature cache"
+              },
+              "example_sets": {
+                "$ref": "#/$defs/example_set_states"
+              },
+              "queues": {
+                "$ref": "#/$defs/queues"
+              }
+            }
+          }
+        },
+        "503": {
+          "content_type": "application/json",
+          "description": "`loading` before that (about 5-10 s after a start), or `failed` for good when a model failed to load (its `error` is the exception type)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "models",
+              "cache_entries",
+              "example_sets",
+              "queues"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "loading",
+                  "failed"
+                ]
+              },
+              "models": {
+                "$ref": "#/$defs/health_models"
+              },
+              "cache_entries": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Entries in the in-memory feature cache"
+              },
+              "example_sets": {
+                "$ref": "#/$defs/example_set_states"
+              },
+              "queues": {
+                "$ref": "#/$defs/queues"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /models": {
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "description": "the pins and nothing to tune: no thresholds",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "models",
+              "tasks",
+              "statuses",
+              "pii",
+              "injection",
+              "caps"
+            ],
+            "properties": {
+              "models": {
+                "type": "object",
+                "description": "Per lane: its pin and its load state",
+                "required": [
+                  "pii",
+                  "embed",
+                  "injection",
+                  "language"
+                ],
+                "propertyNames": {
+                  "$ref": "#/$defs/lane"
+                },
+                "additionalProperties": {
+                  "$ref": "#/$defs/model_pin"
+                }
+              },
+              "tasks": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "pii",
+                  "nearest",
+                  "injection",
+                  "language"
+                ],
+                "description": "Which model lane serves each task (`common.signals.TASK_MODELS`)",
+                "properties": {
+                  "pii": {
+                    "const": "pii"
+                  },
+                  "nearest": {
+                    "const": "embed"
+                  },
+                  "injection": {
+                    "const": "injection"
+                  },
+                  "language": {
+                    "const": "language"
+                  }
+                }
+              },
+              "statuses": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/status"
+                }
+              },
+              "pii": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "vocabulary",
+                  "sensitive",
+                  "labels",
+                  "other_labels"
+                ],
+                "properties": {
+                  "vocabulary": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/entity_type"
+                    },
+                    "description": "`common.pii.ENTITY_TYPES`"
+                  },
+                  "sensitive": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/entity_type"
+                    },
+                    "description": "`common.pii.SENSITIVE_TYPES`"
+                  },
+                  "labels": {
+                    "type": "object",
+                    "description": "How the NER's labels map onto the vocabulary",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "other_labels": {
+                    "const": "other",
+                    "description": "The type of every label not in `labels`"
+                  }
+                }
+              },
+              "injection": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "windows"
+                ],
+                "properties": {
+                  "windows": {
+                    "type": "array",
+                    "items": {
+                      "const": "head_tail"
+                    }
+                  }
+                }
+              },
+              "caps": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "max_text_chars",
+                  "max_request_chars",
+                  "max_texts",
+                  "max_examples",
+                  "max_example_chars",
+                  "max_tokens",
+                  "max_k",
+                  "max_deadline_ms",
+                  "max_body_bytes"
+                ],
+                "description": "The request caps (past them: a 413, or a 422 for max_tokens / max_k / max_deadline_ms)",
+                "properties": {
+                  "max_text_chars": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_request_chars": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_texts": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_examples": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_example_chars": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_tokens": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_k": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_deadline_ms": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max_body_bytes": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /metrics": {
+      "responses": {
+        "200": {
+          "content_type": "text/plain",
+          "description": "Prometheus text (SIGNALS.md § GET /metrics)"
+        }
+      }
+    },
+    "POST /signals": {
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Parsed strictly by `common.signals.SignalsRequest.from_json` (a 422 names the field and the rule, never a value). Not expressible here, and also a 422: two texts with one id, a task naming a text id no text has, a task named twice (results are keyed by task).",
+          "properties": {
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "maxLength": 128,
+              "description": "For the sidecar's logs only (route-policy sends the decision id)"
+            },
+            "deadline_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "exclusiveMinimum": 0,
+              "maximum": 60000,
+              "description": "The answer goes out by then, measured from the parsed request. Omitted / `null`: no cut, every task runs to the end"
+            },
+            "texts": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "$ref": "#/$defs/text_item"
+              },
+              "description": "Every text to scan, newest first; more than 64 is a 413"
+            },
+            "tasks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/task"
+              },
+              "description": "Each task at most once; each takes only its own params"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "latency_ms",
+              "models",
+              "results"
+            ],
+            "properties": {
+              "request_id": {
+                "$ref": "#/$defs/id",
+                "description": "The request's `request_id`; absent when it sent none"
+              },
+              "latency_ms": {
+                "type": "number",
+                "minimum": 0,
+                "description": "The sidecar's own time"
+              },
+              "models": {
+                "type": "object",
+                "description": "The model behind each task, keyed per `common.signals.TASK_MODELS` (`nearest` -> `embed`)",
+                "required": [
+                  "pii",
+                  "embed",
+                  "injection",
+                  "language"
+                ],
+                "propertyNames": {
+                  "$ref": "#/$defs/lane"
+                },
+                "additionalProperties": {
+                  "$ref": "#/$defs/model_id"
+                }
+              },
+              "results": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "One result per task the request named, keyed by task. `status` -- ok: every text done; partial: some (a text cut by the deadline, or one that failed -- then `error` names the first failure's type); deadline: still running at the deadline; skipped: queued past it, never started; warming: the example set is being embedded; error: it failed, no text has features; unavailable: its model is not loaded. `ms` -- The time from the request's arrival until the task's last text was ready (until the cut, for `partial`); `null` when nothing came back. `error` -- For `error` / `unavailable`, and a `partial` some of whose texts failed: the first failure's exception type, or `loading`; never text. Features carry counts, scores and ids, never text, spans or offsets.",
+                "properties": {
+                  "pii": {
+                    "$ref": "#/$defs/result_pii"
+                  },
+                  "nearest": {
+                    "$ref": "#/$defs/result_nearest"
+                  },
+                  "injection": {
+                    "$ref": "#/$defs/result_injection"
+                  },
+                  "language": {
+                    "$ref": "#/$defs/result_language"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -18,6 +18,7 @@ from constants import (
     MAX_PAYLOAD_BYTES,
     RESERVED_ENV_KEYS,
     SESSION_ID_RE,
+    TTL_SECONDS_MIN,
 )
 
 
@@ -150,7 +151,12 @@ class RunRequest(BaseModel):
     )
     ttl_seconds: Optional[int] = Field(
         default=None,
-        description="Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS.",
+        ge=TTL_SECONDS_MIN,
+        description=(
+            "Idle TTL in seconds. Omit, null or 0 for "
+            "SANDBOX_DEFAULT_TTL_SECONDS; a negative value is refused. "
+            "Server clamps to SANDBOX_HARD_TTL_SECONDS."
+        ),
     )
     session_id: Optional[str] = Field(
         default=None,
@@ -221,9 +227,7 @@ class RunRequest(BaseModel):
     @classmethod
     def _validate_chat_id(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and not CHAT_ID_RE.match(v):
-            raise ValueError(
-                "chat_id must match ^[A-Za-z0-9_.:-]{1,128}$"
-            )
+            raise ValueError(f"chat_id must match {CHAT_ID_RE.pattern}")
         return v
 
     @field_validator("files")
@@ -301,7 +305,7 @@ class WriteFilesRequest(BaseModel):
 class CreateRequest(BaseModel):
     runtime: str
     entrypoint: Optional[str] = None
-    ttl_seconds: Optional[int] = None
+    ttl_seconds: Optional[int] = Field(default=None, ge=TTL_SECONDS_MIN)
     env: Optional[dict[str, str]] = None
     chat_id: Optional[str] = Field(
         default=None,
@@ -323,7 +327,7 @@ class CreateRequest(BaseModel):
     @classmethod
     def _validate_chat_id(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and not CHAT_ID_RE.match(v):
-            raise ValueError("chat_id must match ^[A-Za-z0-9_.:-]{1,128}$")
+            raise ValueError(f"chat_id must match {CHAT_ID_RE.pattern}")
         return v
 
 
@@ -396,7 +400,7 @@ class ToolRunRequest(BaseModel):
         ),
     )
     entrypoint: Optional[str] = Field(default=None)
-    ttl_seconds: Optional[int] = Field(default=None)
+    ttl_seconds: Optional[int] = Field(default=None, ge=TTL_SECONDS_MIN)
     session_id: Optional[str] = Field(default=None)
     deletes: list[str] = Field(default_factory=list)
     env: Optional[dict[str, str]] = Field(default=None)
@@ -422,5 +426,5 @@ class ToolRunRequest(BaseModel):
     @classmethod
     def _validate_chat_id(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and not CHAT_ID_RE.match(v):
-            raise ValueError("chat_id must match ^[A-Za-z0-9_.:-]{1,128}$")
+            raise ValueError(f"chat_id must match {CHAT_ID_RE.pattern}")
         return v

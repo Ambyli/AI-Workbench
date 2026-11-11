@@ -564,3 +564,9 @@ make exec litellm litellm CMD="python -c 'import urllib.request as u; print(u.ur
 ```
 
 The decision should carry `litellm_call_id: smoke-call-1` and `apply: true`. Its outcome should name the chain and deployment the footer showed.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`LITELLM_SCHEMAS.md`](LITELLM_SCHEMAS.md), generated from [`litellm.schemas.json`](litellm.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

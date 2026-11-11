@@ -353,3 +353,9 @@ Fully additive; to back out:
 2. Delete the connection in Admin Settings → Integrations → Open Terminal.
 3. Remove `- terminal` from the `openwebui` service's `networks:` list and recreate: `make up openwebui`.
 4. Tear the terminal down: `docker compose -f ai/open-terminal/docker-compose.open-terminal.yml --env-file .env -p ai-open-terminal down -v` (the `-v` drops every user's home directory; omit it to keep them for a re-enable).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`OPEN_TERMINAL_SCHEMAS.md`](OPEN_TERMINAL_SCHEMAS.md), generated from [`open-terminal.schemas.json`](open-terminal.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

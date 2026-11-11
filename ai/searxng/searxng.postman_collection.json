@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "searxng",
-    "description": "SearXNG metasearch endpoints. Direct host publish — no LiteLLM pass-through, no auth. Set the collection variable `searxng` (default http://localhost:8009 = PORT_SEARXNG). On ai_shared this is `http://searxng:8080`. See ai/searxng/SEARXNG.md for the operator guide.\n\nRate limiting: `server.limiter: false` in ai/searxng/settings.yml, so the built-in IP rate limiter is OFF and server-to-server callers (Open WebUI, curl, this collection) are not throttled. limiter.toml exists only to silence a startup warning. If you flip limiter back on, /search calls without the expected browser headers will start returning 429 — see https://docs.searxng.org/admin/searx.limiter.html.\n\nOutput formats: `search.formats: [html, json]` in settings.yml. Upstream defaults omit `json` — the override is what lets Open WebUI (and the JSON requests below) consume results. Omitting `format=json` returns the HTML search results page.\n\nEngines: this deployment inherits the upstream default engine set (google, bing, wikipedia, etc.) via `use_default_settings: true`, with one exception — `duckduckgo` is explicitly disabled in settings.yml's `engines:` block. DDG CAPTCHAs datacenter/server egress IPs almost unconditionally (`SearxEngineCaptchaException` in the searxng logs), so it was pure log noise and wasted fan-out latency with no chance of ever succeeding from this deployment's IP. See SEARXNG.md § Troubleshooting: fetch_url / search hangs.\n\nTimeouts: `outgoing.request_timeout` (5.0s) / `outgoing.max_request_timeout` (10.0s) in settings.yml bound every per-engine request, so a stuck or CAPTCHA'd engine can't stall the whole /search response past that ceiling — it just drops into `unresponsive_engines` in the JSON body.",
+    "description": "SearXNG metasearch endpoints. Direct host publish — no LiteLLM pass-through, no auth. Set the collection variable `searxng` (default http://localhost:8009 = PORT_SEARXNG). On ai_shared this is `http://searxng:8080`. See ai/searxng/SEARXNG.md for the operator guide.\n\nRate limiting: `server.limiter: false` in ai/searxng/settings.yml, so the built-in IP rate limiter is OFF and server-to-server callers (Open WebUI, curl, this collection) are not throttled. limiter.toml exists only to silence a startup warning. If you flip limiter back on, /search calls without the expected browser headers will start returning 429 — see https://docs.searxng.org/admin/searx.limiter.html.\n\nOutput formats: `search.formats: [html, json]` in settings.yml. Upstream defaults omit `json` — the override is what lets Open WebUI (and the JSON requests below) consume results. Omitting `format=json` returns the HTML search results page.\n\nEngines: this deployment inherits the upstream default engine set (google, bing, wikipedia, etc.) via `use_default_settings: true`, with one exception — `duckduckgo` is explicitly disabled in settings.yml's `engines:` block. DDG CAPTCHAs datacenter/server egress IPs almost unconditionally (`SearxEngineCaptchaException` in the searxng logs), so it was pure log noise and wasted fan-out latency with no chance of ever succeeding from this deployment's IP. See SEARXNG.md § Troubleshooting: fetch_url / search hangs.\n\nTimeouts: `outgoing.request_timeout` (5.0s) / `outgoing.max_request_timeout` (10.0s) in settings.yml bound every per-engine request, so a stuck or CAPTCHA'd engine can't stall the whole /search response past that ceiling — it just drops into `unresponsive_engines` in the JSON body.\n\n**Error bodies.** Each endpoint's `#### Schemas` section -- at the end of its first request's description, generated from `searxng.schemas.json` by `scripts/api_schemas.py render` -- documents the fields this stack uses of each response body: an open subset of the upstream server's. Errors answer the upstream server's own error body and are not repeated per endpoint.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "searxng-collection"
   },
@@ -21,10 +21,14 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/healthz",
-          "host": ["{{searxng}}"],
-          "path": ["healthz"]
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            "healthz"
+          ]
         },
-        "description": "Liveness probe. Returns plain text `OK` (Content-Type: text/plain) when the internal Flask app is up. This is exactly the endpoint the Docker healthcheck in docker-compose.searxng.yml polls every 30s via `urllib.request.urlopen`. Cheap — no upstream engine calls."
+        "description": "Liveness probe. Returns plain text `OK` (Content-Type: text/plain) when the internal Flask app is up. This is exactly the endpoint the Docker healthcheck in docker-compose.searxng.yml polls every 30s via `urllib.request.urlopen`. Cheap — no upstream engine calls.\n\n#### Schemas\n\nResponse `200` (`text/plain`) — `OK`."
       },
       "response": []
     },
@@ -35,14 +39,26 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/search?q=hello&format=json",
-          "host": ["{{searxng}}"],
-          "path": ["search"],
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            "search"
+          ],
           "query": [
-            { "key": "q", "value": "hello", "description": "Search query. Required." },
-            { "key": "format", "value": "json", "description": "Output format. Required for programmatic use — omit to get the HTML results page instead. Enabled via `search.formats: [html, json]` in ai/searxng/settings.yml." }
+            {
+              "key": "q",
+              "value": "hello",
+              "description": "Search query. Required."
+            },
+            {
+              "key": "format",
+              "value": "json",
+              "description": "Output format. Required for programmatic use — omit to get the HTML results page instead. Enabled via `search.formats: [html, json]` in ai/searxng/settings.yml."
+            }
           ]
         },
-        "description": "Programmatic search entrypoint. Returns JSON: `{query, number_of_results, results: [{url, title, content, engine, ...}], answers, corrections, infoboxes, suggestions, unresponsive_engines}`. This is the exact URL shape Open WebUI hits (`SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>&format=json`) — see SEARXNG.md § Wiring into Open WebUI.\n\nFan-out: every call spawns fresh requests to all enabled upstream engines (google, bing, wikipedia, etc. from the upstream default set via `use_default_settings: true` — `duckduckgo` is disabled, see the collection description). Latency is dominated by the slowest engine, bounded by `outgoing.max_request_timeout` (10.0s) in settings.yml. If `results` is empty, upstream engines all failed — check `make logs searxng` and inspect `unresponsive_engines`.\n\nRate limit: none, because `server.limiter: false` in settings.yml. Public egress IP may still get rate-limited by Google/Bing themselves — that surfaces as engines dropping into `unresponsive_engines`, not as a 429 from SearXNG."
+        "description": "Programmatic search entrypoint. Returns JSON: `{query, results: [{url, title, content, engine, ...}], answers, corrections, infoboxes, suggestions, unresponsive_engines}` (current releases no longer send `number_of_results`). This is the exact URL shape Open WebUI hits (`SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>&format=json`) — see SEARXNG.md § Wiring into Open WebUI.\n\nFan-out: every call spawns fresh requests to all enabled upstream engines (google, bing, wikipedia, etc. from the upstream default set via `use_default_settings: true` — `duckduckgo` is disabled, see the collection description). Latency is dominated by the slowest engine, bounded by `outgoing.max_request_timeout` (10.0s) in settings.yml. If `results` is empty, upstream engines all failed — check `make logs searxng` and inspect `unresponsive_engines`.\n\nRate limit: none, because `server.limiter: false` in settings.yml. Public egress IP may still get rate-limited by Google/Bing themselves — that surfaces as engines dropping into `unresponsive_engines`, not as a 429 from SearXNG.\n\n#### Schemas\n\nWith `format=json` (allowed by `search.formats` in settings.yml; a format not listed there is a 403); without it the HTML results page. `q` is required: none is a 400. Open WebUI reads `results[].url`, `title` and `content`.\n\nResponse `200` (`application/json`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"required\": [\n    \"query\",\n    \"results\",\n    \"answers\",\n    \"corrections\",\n    \"infoboxes\",\n    \"suggestions\",\n    \"unresponsive_engines\"\n  ],\n  \"properties\": {\n    \"query\": {\"type\": \"string\"},\n    \"results\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"additionalProperties\": true,\n        \"description\": \"A MainResult (or a legacy dict result) as `as_dict()` gives it\",\n        \"required\": [\"url\", \"title\", \"content\", \"engine\"],\n        \"properties\": {\n          \"url\": {\"type\": [\"string\", \"null\"]},\n          \"title\": {\"type\": \"string\"},\n          \"content\": {\"type\": \"string\", \"description\": \"The snippet\"},\n          \"engine\": {\"type\": \"string\", \"description\": \"The engine that returned it first\"},\n          \"engines\": {\n            \"type\": \"array\",\n            \"items\": {\"type\": \"string\"},\n            \"description\": \"Every engine that returned it\"\n          },\n          \"score\": {\"type\": \"number\", \"description\": \"The merged rank; `results` is sorted by it\"},\n          \"category\": {\"type\": \"string\"},\n          \"publishedDate\": {\n            \"type\": [\"string\", \"null\"],\n            \"description\": \"ISO 8601, when the engine gives one\"\n          },\n          \"thumbnail\": {\"type\": \"string\"},\n          \"img_src\": {\"type\": \"string\"},\n          \"template\": {\"type\": \"string\", \"description\": \"`default.html`, `images.html`, …\"},\n          \"parsed_url\": {\n            \"type\": [\"array\", \"null\"],\n            \"items\": {\"type\": \"string\"},\n            \"description\": \"urllib's six parts\"\n          },\n          \"positions\": {\"description\": \"Its position in each engine's list\"}\n        }\n      }\n    },\n    \"answers\": {\n      \"type\": \"array\",\n      \"items\": {\"type\": \"object\", \"additionalProperties\": true}\n    },\n    \"corrections\": {\n      \"type\": \"array\",\n      \"items\": {\"type\": \"string\"}\n    },\n    \"infoboxes\": {\n      \"type\": \"array\",\n      \"items\": {\"type\": \"object\", \"additionalProperties\": true}\n    },\n    \"suggestions\": {\n      \"type\": \"array\",\n      \"items\": {\"type\": \"string\"}\n    },\n    \"unresponsive_engines\": {\n      \"type\": \"array\",\n      \"description\": \"Engines that failed or timed out (`outgoing.max_request_timeout`), sorted\",\n      \"items\": {\n        \"type\": \"array\",\n        \"prefixItems\": [\n          {\"type\": \"string\", \"description\": \"The engine\"},\n          {\"type\": \"string\", \"description\": \"Why, translated (`Suspended: …` when suspended)\"}\n        ],\n        \"minItems\": 2,\n        \"maxItems\": 2\n      }\n    }\n  }\n}\n```\n\nResponse `400` (`application/json`) — no `q` (`No query`), or a bad parameter:\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"required\": [\"error\"],\n  \"properties\": {\n    \"error\": {\"type\": \"string\"}\n  }\n}\n```\n\nResponse `500` (`application/json`) — `search error`:\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"required\": [\"error\"],\n  \"properties\": {\n    \"error\": {\"type\": \"string\"}\n  }\n}\n```"
       },
       "response": []
     },
@@ -53,15 +69,31 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/search?q=hello&categories=general&format=json",
-          "host": ["{{searxng}}"],
-          "path": ["search"],
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            "search"
+          ],
           "query": [
-            { "key": "q", "value": "hello", "description": "Search query. Required." },
-            { "key": "categories", "value": "general", "description": "Comma-separated category filter. Upstream defaults include: general, images, videos, news, map, music, it, science, files, social media. Only engines tagged with a matching category run — narrows fan-out and lowers latency." },
-            { "key": "format", "value": "json", "description": "Output format." }
+            {
+              "key": "q",
+              "value": "hello",
+              "description": "Search query. Required."
+            },
+            {
+              "key": "categories",
+              "value": "general",
+              "description": "Comma-separated category filter. Upstream defaults include: general, images, videos, news, map, music, it, science, files, social media. Only engines tagged with a matching category run — narrows fan-out and lowers latency."
+            },
+            {
+              "key": "format",
+              "value": "json",
+              "description": "Output format."
+            }
           ]
         },
-        "description": "Category-filtered search. Same JSON response shape as the plain `/search` call. Category names come from the upstream engine catalogue — see https://docs.searxng.org/user/configured_engines.html for the full mapping of engines to categories.\n\nUse this when a caller only wants (say) news or images and the untargeted fan-out would waste latency on irrelevant engines."
+        "description": "Category-filtered search. Same JSON response shape as the plain `/search` call. Category names come from the upstream engine catalogue — see https://docs.searxng.org/user/configured_engines.html for the full mapping of engines to categories.\n\nUse this when a caller only wants (say) news or images and the untargeted fan-out would waste latency on irrelevant engines.\n\n#### Schemas\n\nSee *GET /search?q=… (JSON)*, the first request of this endpoint."
       },
       "response": []
     },
@@ -72,15 +104,31 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/search?q=hello&format=json&language=en",
-          "host": ["{{searxng}}"],
-          "path": ["search"],
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            "search"
+          ],
           "query": [
-            { "key": "q", "value": "hello", "description": "Search query. Required." },
-            { "key": "format", "value": "json", "description": "Output format." },
-            { "key": "language", "value": "en", "description": "IETF language tag (e.g. `en`, `en-US`, `de`, `fr`, `all`). Overrides `search.default_lang` in ai/searxng/settings.yml — which is empty here, meaning per-request must supply the tag if a language bias is wanted. `all` disables language biasing." }
+            {
+              "key": "q",
+              "value": "hello",
+              "description": "Search query. Required."
+            },
+            {
+              "key": "format",
+              "value": "json",
+              "description": "Output format."
+            },
+            {
+              "key": "language",
+              "value": "en",
+              "description": "IETF language tag (e.g. `en`, `en-US`, `de`, `fr`, `all`). Overrides `search.default_lang` in ai/searxng/settings.yml — which is empty here, meaning per-request must supply the tag if a language bias is wanted. `all` disables language biasing."
+            }
           ]
         },
-        "description": "Language-biased search. Same JSON response shape. Per-engine handling differs — Google/Bing use it as a soft bias, Wikipedia uses it to pick the language subdomain. Combine with `categories` freely."
+        "description": "Language-biased search. Same JSON response shape. Per-engine handling differs — Google/Bing use it as a soft bias, Wikipedia uses it to pick the language subdomain. Combine with `categories` freely.\n\n#### Schemas\n\nSee *GET /search?q=… (JSON)*, the first request of this endpoint."
       },
       "response": []
     },
@@ -91,10 +139,14 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/",
-          "host": ["{{searxng}}"],
-          "path": [""]
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            ""
+          ]
         },
-        "description": "Human-facing search UI. Returns the full HTML landing page (Content-Type: text/html) — a search box, engine toggles, preferences link. NOT a JSON API. Use this only to eyeball the deployment from a browser (SEARXNG.md § Quick start). For programmatic use, hit `/search?…&format=json` instead."
+        "description": "Human-facing search UI. Returns the full HTML landing page (Content-Type: text/html) — a search box, engine toggles, preferences link. NOT a JSON API. Use this only to eyeball the deployment from a browser (SEARXNG.md § Quick start). For programmatic use, hit `/search?…&format=json` instead.\n\n#### Schemas\n\nResponse `200` (`text/html`) — the search page (a request carrying `q` is redirected to /search, 308)."
       },
       "response": []
     },
@@ -105,10 +157,14 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/config",
-          "host": ["{{searxng}}"],
-          "path": ["config"]
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            "config"
+          ]
         },
-        "description": "Deployment introspection. Returns JSON describing the running instance's configuration: enabled engines (with their categories, timeouts, shortcuts), enabled categories, supported result formats, safe_search level, default language, autocomplete backend, plugin list, brand info. Useful to confirm the settings.yml overrides actually loaded — e.g. `formats` should list both `html` and `json` here.\n\nExposed by default upstream and not disabled in ai/searxng/settings.yml. Read-only, no side effects."
+        "description": "Deployment introspection. Returns JSON describing the running instance's configuration: every engine (its categories, shortcut, timeout and `enabled` flag), the categories, plugins, safe_search level, default locale, autocomplete backend, limiter state, version and brand info. Useful to confirm the settings.yml overrides loaded — `duckduckgo` shows `enabled: false` and `limiter.enabled` false. It does NOT report `search.formats`: check JSON output with `/search?q=…&format=json` instead (a format not listed there answers 403).\n\nExposed by default upstream and not disabled in ai/searxng/settings.yml. Read-only, no side effects.\n\n#### Schemas\n\nThe running instance's settings. It does not list `search.formats`.\n\nResponse `200` (`application/json`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"required\": [\"categories\", \"engines\", \"plugins\", \"version\"],\n  \"properties\": {\n    \"categories\": {\n      \"type\": \"array\",\n      \"items\": {\"type\": \"string\"}\n    },\n    \"engines\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"additionalProperties\": true,\n        \"required\": [\"name\", \"categories\", \"enabled\"],\n        \"properties\": {\n          \"name\": {\"type\": \"string\"},\n          \"categories\": {\n            \"type\": \"array\",\n            \"items\": {\"type\": \"string\"}\n          },\n          \"shortcut\": {\"type\": \"string\"},\n          \"enabled\": {\n            \"type\": \"boolean\",\n            \"description\": \"false for `duckduckgo` here (settings.yml)\"\n          },\n          \"paging\": {\"type\": \"boolean\"},\n          \"language_support\": {\"type\": \"boolean\"},\n          \"safesearch\": {\"type\": \"boolean\"},\n          \"time_range_support\": {\"type\": \"boolean\"},\n          \"timeout\": {\"type\": [\"number\", \"null\"]}\n        }\n      }\n    },\n    \"plugins\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"additionalProperties\": true,\n        \"properties\": {\n          \"name\": {\"type\": \"string\"},\n          \"enabled\": {\"type\": \"boolean\"}\n        }\n      }\n    },\n    \"instance_name\": {\"type\": \"string\"},\n    \"default_locale\": {\"type\": \"string\"},\n    \"autocomplete\": {\"type\": \"string\"},\n    \"safe_search\": {\"type\": \"integer\"},\n    \"default_theme\": {\"type\": \"string\"},\n    \"version\": {\"type\": \"string\"},\n    \"limiter\": {\n      \"type\": \"object\",\n      \"additionalProperties\": true,\n      \"properties\": {\n        \"enabled\": {\"type\": \"boolean\", \"description\": \"false here (`server.limiter`)\"}\n      }\n    },\n    \"public_instance\": {\"type\": \"boolean\"}\n  }\n}\n```"
       },
       "response": []
     },
@@ -119,10 +175,14 @@
         "header": [],
         "url": {
           "raw": "{{searxng}}/stats",
-          "host": ["{{searxng}}"],
-          "path": ["stats"]
+          "host": [
+            "{{searxng}}"
+          ],
+          "path": [
+            "stats"
+          ]
         },
-        "description": "Engine performance dashboard. Returns HTML (Content-Type: text/html) tabulating per-engine response times, error rates, and result counts since the container started. Useful when `/search` returns thin results — identify which engines are timing out or failing before touching config.\n\nJSON variant: append `?format=json` (some releases; not guaranteed). For a machine-readable error breakdown, `/stats/errors` returns HTML with a similar table.\n\nExposed by default upstream and not disabled in ai/searxng/settings.yml."
+        "description": "Engine performance dashboard. Returns HTML (Content-Type: text/html) tabulating per-engine response times, error rates, and result counts since the container started. Useful when `/search` returns thin results — identify which engines are timing out or failing before touching config.\n\nThere is no JSON variant (`format` is ignored here). For a machine-readable breakdown, `/stats/errors` returns the per-engine errors as JSON.\n\nExposed by default upstream and not disabled in ai/searxng/settings.yml.\n\n#### Schemas\n\nHTML only (there is no JSON variant); `/stats/errors` answers the same data as JSON.\n\nResponse `200` (`text/html`) — the engine statistics page."
       },
       "response": []
     }

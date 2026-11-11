@@ -660,7 +660,11 @@ def build_mcp(
         ),
         ttl_seconds: Optional[int] = Field(
             default=None,
-            description="Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS.",
+            description=(
+                "Idle TTL in seconds. Omit, null or 0 for the default "
+                "(SANDBOX_DEFAULT_TTL_SECONDS); a negative value is "
+                "refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+            ),
         ),
         entrypoint: Optional[str] = Field(
             default=None,
@@ -1351,7 +1355,11 @@ def build_mcp(
         ),
         ttl_seconds: Optional[int] = Field(
             default=None,
-            description="Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS.",
+            description=(
+                "Idle TTL in seconds. Omit, null or 0 for the default "
+                "(SANDBOX_DEFAULT_TTL_SECONDS); a negative value is "
+                "refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+            ),
         ),
         session_id: Optional[str] = Field(
             default=None,

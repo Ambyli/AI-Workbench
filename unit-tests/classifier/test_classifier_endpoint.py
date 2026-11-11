@@ -159,11 +159,7 @@ def _strip_ids(value, job_id: str):
     return json.loads(json.dumps(value).replace(job_id, "<job>"))
 
 
-ENTRY_KEYS = {
-    "status", "type", "key", "method", "scored", "score", "verdict", "confidence",
-    "reason", "detail", "regions", "regions_truncated", "artifacts",
-    "localization", "options_used", "error", "complete", "aggregate_used", "items",
-}
+from result_shape import ENTRY_KEYS  # noqa: E402 -- shared with test_api_schemas.py
 
 TEXT_CRITERIA = [
     {"name": "Limited Warranty", "type": "text"},

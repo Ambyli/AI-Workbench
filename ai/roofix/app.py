@@ -60,7 +60,13 @@ from components.phoenix_client import PhoenixClient
 from components.roofix_scraper_client import RoofixScraperClient
 
 TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
-FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH", "/app/config/field_mapping.json")
+# Michael's Roofix-event -> Phoenix milestone map. The default is the file
+# shipped beside this module (config/field_mapping.json -- in the image
+# /app/ai/roofix/config/field_mapping.json, Dockerfile.roofix's COPY); set
+# FIELD_MAPPING_PATH to read another (e.g. /config/field_mapping.json on the
+# ROOFIX_BRIDGE_CONFIG_DIR mount, to change it without a rebuild).
+DEFAULT_FIELD_MAPPING_PATH = str(Path(__file__).resolve().parent / "config" / "field_mapping.json")
+FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH") or DEFAULT_FIELD_MAPPING_PATH
 LOG_DIR = os.getenv("LOG_DIR", "/data")
 DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 
@@ -126,11 +132,11 @@ _STATE: dict = {
 
 
 def _load_milestone_map() -> dict:
-    """Read Michael's Roofix-event -> Phoenix (block_name, status_id) mapping.
-
-    The file lives on disk (mounted config) so it can be updated without a
-    container rebuild. Returns {} if the file is missing / malformed — brain
-    will log a "no milestone mapping for ..." warning and skip.
+    """Read Michael's Roofix-event -> Phoenix (block_name, status_id) mapping
+    from ``FIELD_MAPPING_PATH`` (by default the ``config/field_mapping.json``
+    shipped beside this module). Returns {} if the file is missing /
+    malformed — the orchestrator then logs a "no milestone mapping for ..."
+    warning and skips the write.
     """
     try:
         with open(FIELD_MAPPING_PATH, "r") as f:
@@ -281,8 +287,12 @@ async def _run_one_batch(
                             )
 
                     # ── Step 2: mark_read for the "clear from inbox" classes ─
+                    # An escalation is action "escalate" OR needs_human (the
+                    # orchestrator escalates both); unforwarded, it stays unread.
                     action = d.get("action")
-                    if action == "escalate" and not d.get("_forwarded"):
+                    if (action == "escalate" or d.get("needs_human")) and not d.get(
+                        "_forwarded"
+                    ):
                         continue
                     if action == "ignore" and d.get("source") != "rule":
                         continue
@@ -306,6 +316,11 @@ async def _run_one_batch(
 def _record_tick(records: list, error: Optional[str]) -> None:
     """``records`` is the list of {"event", "decision"} objects returned by
     ``orchestrator_run``. We only tally decision-side fields here.
+
+    ``phoenix_write_failures`` counts decisions whose Phoenix write call ran
+    and returned ok=False — the orchestrator stamps ``_phoenix_write_ok`` on
+    every decision that made one (update_chatter, update_milestone with a
+    mapping, create_project's ensure_entity_and_project), once per event.
     """
     with _STATE_LOCK:
         _STATE["last_tick_at"] = datetime.now(timezone.utc).isoformat(
@@ -321,6 +336,8 @@ def _record_tick(records: list, error: Optional[str]) -> None:
             _STATE["decisions_by_source"][d.get("source", "")] += 1
             if d.get("needs_human") or d.get("action") == "escalate":
                 _STATE["escalations_total"] += 1
+            if d.get("_phoenix_write_ok") is False:
+                _STATE["phoenix_write_failures"] += 1
 
 
 async def _scheduled_tick() -> None:

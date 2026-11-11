@@ -1,0 +1,4105 @@
+{
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for sandbox-runner.postman_collection.json, rendered into its items' descriptions and ENDPOINTS_SCHEMAS.md (linked from ENDPOINTS.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render. A schema whose $comment says `generated from …` is rewritten by unit-tests/sandbox/test_api_schemas.py (API_SCHEMAS_UPDATE=1): never edit one. The rest is hand-written from runner/app.py, operations.py, sandbox_mcp.py, tool_server.py, spawner.py and common.jobs; that test validates real responses against it (a fake Docker client and the job table in memory, no Docker, no Postgres). The MCP envelope follows the MCP SDK's models (open objects) as FastMCP 3.4.5 fills them.",
+  "service": "sandbox-runner",
+  "doc": "ENDPOINTS.md",
+  "$defs": {
+    "sandbox_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{12}$",
+      "description": "A sandbox's internal id: its job row's id, 12 hex characters"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Persistent handle across turns (`^[A-Za-z0-9_-]{1,64}$`; a generated one is 12 URL-safe characters)"
+    },
+    "app_status": {
+      "description": "On a fresh spawn (or a warming / existing sandbox) a placeholder `{code: 200, latency_ms: 0, note}` -- the readiness gate already passed; after a write, one live HTTP probe of the runtime's readiness path (3 s deadline): `{code, latency_ms}` for a real HTTP reply, `{error}` for a network failure",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "latency_ms"
+          ],
+          "properties": {
+            "code": {
+              "type": "integer",
+              "description": "HTTP status the app answered"
+            },
+            "latency_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "note": {
+              "type": "string",
+              "description": "`readiness ok`, `warming`, or `existing sandbox for chat (phase=<phase>)`"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "error"
+          ],
+          "properties": {
+            "error": {
+              "type": "string",
+              "description": "`timeout after <s>s`, `connection refused (<reason>)`, or `<ExceptionType>: <message>`"
+            }
+          }
+        }
+      ]
+    },
+    "runtime_type": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "summary",
+        "default_entrypoint",
+        "allows_custom_entrypoint",
+        "prebaked_packages",
+        "example_files"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "A key of `runtimes.RUNTIMES` (`static`, `python`, `node`)"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "default_entrypoint": {
+          "type": "string",
+          "description": "Command run when the caller gives none; binds port 80"
+        },
+        "allows_custom_entrypoint": {
+          "type": "boolean",
+          "description": "False: an `entrypoint` is a 400 (`static`)"
+        },
+        "prebaked_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "example_files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "A minimal `files` map for the runtime"
+        }
+      }
+    },
+    "run_result": {
+      "description": "`RunResponse` as the runner fills it",
+      "allOf": [
+        {
+          "$ref": "#/$defs/run_response"
+        }
+      ],
+      "properties": {
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "app_status": {
+          "$ref": "#/$defs/app_status"
+        }
+      }
+    },
+    "sandbox_fields": {
+      "description": "What `create` / `run` / `write_files` return (`operations._reuse_or_spawn`, `_do_create`, `_apply_files_to_running`)",
+      "properties": {
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "url": {
+          "type": "string",
+          "description": "`<SANDBOX_PROXY_URL>/<sandbox_id>/`: the iframe URL"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 UTC: spawn time + the TTL (clamped to SANDBOX_HARD_TTL_SECONDS)"
+        },
+        "reused": {
+          "type": "boolean",
+          "description": "True: the session's running container was reused (no respawn)"
+        },
+        "runtime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The runtime the session was spawned under"
+        },
+        "startup_output": {
+          "type": "string",
+          "description": "A tail of /tmp/sandbox.log -- after a write, only what the dev server printed since this write"
+        },
+        "app_status": {
+          "$ref": "#/$defs/app_status"
+        },
+        "recreated": {
+          "type": "boolean",
+          "description": "True: the session's container was gone and was respawned (self-heal)"
+        },
+        "warming": {
+          "type": "boolean",
+          "description": "The container is still warming (`create`, or an existing sandbox still in `spawning` / `starting`)"
+        },
+        "duplicate_create_prevented": {
+          "type": "boolean",
+          "description": "True: `chat_id` matched a live sandbox, so this is that session, not a new spawn"
+        },
+        "chat_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The `chat_id` the call carried"
+        }
+      }
+    },
+    "lint_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "line",
+        "offset",
+        "message",
+        "text"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "`<ErrorType>: <msg>`"
+        },
+        "text": {
+          "type": "string",
+          "description": "The offending source line"
+        }
+      }
+    },
+    "detail_static_lint": {
+      "type": "object",
+      "description": "Every `.py` file in the call is compiled before Docker is touched; nothing was written or spawned",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "session_id",
+        "errors",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "static lint failed"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "errors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/lint_error"
+          }
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "detail_session_not_found": {
+      "type": "object",
+      "description": "No running sandbox for this `session_id`",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "session_id",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "session not found"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "detail_no_running_sandbox": {
+      "type": "object",
+      "description": "exec / preview: no running sandbox for this `session_id`",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "session_id",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "no running sandbox for this session"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "detail_container_gone": {
+      "type": "object",
+      "description": "The registry says running but the container is gone, and the call does not respawn",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "session_id",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "sandbox container is gone"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "detail_not_ready": {
+      "type": "object",
+      "description": "The container never answered its readiness probe; it was torn down",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "session_id",
+        "logs",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "sandbox did not become ready within 30s"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "logs": {
+          "type": "string",
+          "description": "The container's /tmp/sandbox.log tail, read before teardown"
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "detail_reserve_failed": {
+      "type": "object",
+      "description": "The one-sandbox-per-chat index refused the spawn twice, and the winner could not be found",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "chat_id"
+      ],
+      "properties": {
+        "error": {
+          "const": "could not reserve a sandbox for this chat — retry"
+        },
+        "chat_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "detail_self_heal_failed": {
+      "type": "object",
+      "description": "`recreate_if_gone` on a session whose job row records no known runtime",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "session_id",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "cannot self-heal: runtime metadata missing"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "rewrite_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "similarity",
+        "changed_lines",
+        "old_lines",
+        "new_lines",
+        "identical"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "similarity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Line similarity of the new content to the existing file"
+        },
+        "changed_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "old_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "new_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "identical": {
+          "type": "boolean"
+        }
+      }
+    },
+    "detail_rewrite": {
+      "type": "object",
+      "description": "The rewrite guard: a listed path already exists as a text file of 30+ lines (WRITE_GUARD_MIN_LINES) and keeps >= 50 % of its lines (WRITE_GUARD_SIMILARITY); no file of the call was written",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "kind",
+        "tool",
+        "session_id",
+        "files",
+        "message",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "const": "rewrite of existing file"
+        },
+        "kind": {
+          "const": "rewrite_of_existing_file"
+        },
+        "tool": {
+          "enum": [
+            "write_files",
+            "run"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/rewrite_file"
+          }
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
+    },
+    "detail_file_op": {
+      "type": "object",
+      "description": "A refused read_file / edit_file (`common.textops.FileOpError`); nothing was modified",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "kind",
+        "tool",
+        "session_id",
+        "path",
+        "message",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "enum": [
+            "unsafe path",
+            "file does not exist",
+            "path is a directory",
+            "not a regular file",
+            "not a UTF-8 text file",
+            "file too large",
+            "old_string is empty",
+            "old_string equals new_string",
+            "old_string not found",
+            "old_string contains read_file line numbers",
+            "old_string matches more than once"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "unsafe_path",
+            "missing_file",
+            "is_directory",
+            "not_a_file",
+            "binary_file",
+            "too_large",
+            "empty_old_string",
+            "no_change",
+            "not_found",
+            "line_number_prefix",
+            "multiple_matches"
+          ]
+        },
+        "tool": {
+          "enum": [
+            "read_file",
+            "edit_file"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string",
+          "description": "The exact next action"
+        },
+        "closest_start_line": {
+          "type": "integer",
+          "description": "not_found: first line of the closest region (only when one scores >= 0.3)"
+        },
+        "closest_end_line": {
+          "type": "integer",
+          "description": "not_found: its last line"
+        },
+        "similarity": {
+          "type": "number",
+          "description": "not_found: how close it is (2 decimals)"
+        },
+        "closest_text": {
+          "type": "string",
+          "description": "not_found: the closest region, numbered like read_file"
+        },
+        "whitespace_only": {
+          "type": "boolean",
+          "description": "not_found: it differs only in whitespace / indentation"
+        },
+        "matches_without_prefixes": {
+          "type": "integer",
+          "description": "line_number_prefix: how often old_string matches with the prefixes removed"
+        },
+        "count": {
+          "type": "integer",
+          "description": "multiple_matches: how often old_string occurs"
+        },
+        "match_lines": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "multiple_matches: the first line of each match (up to 20)"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "line_number_prefix"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "matches_without_prefixes"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "multiple_matches"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "count",
+              "match_lines"
+            ]
+          }
+        }
+      ]
+    },
+    "detail_invalid_arguments": {
+      "type": "object",
+      "description": "MCP only: the arguments failed the pydantic model the HTTP route validates with (413 a size cap, 422 anything else)",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "tool",
+        "message",
+        "hint"
+      ],
+      "properties": {
+        "error": {
+          "enum": [
+            "payload too large",
+            "invalid arguments"
+          ]
+        },
+        "tool": {
+          "type": "string",
+          "description": "The MCP tool"
+        },
+        "message": {
+          "type": "string",
+          "description": "The validator's messages, one per line"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      }
+    },
+    "mcp_error": {
+      "type": "object",
+      "description": "An HTTP error of the operation whose `detail` was a string, returned as a normal tool result (never a JSON-RPC error)",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "status",
+        "error"
+      ],
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "status": {
+          "type": "integer",
+          "description": "The HTTP status the operation raised"
+        },
+        "error": {
+          "type": "string",
+          "description": "The plain detail"
+        }
+      }
+    },
+    "file_listing_entry": {
+      "type": "object",
+      "description": "A regular file under /app (no `paths`: a listing, no contents)",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative to /app"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "file_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size",
+        "encoding",
+        "content",
+        "truncated"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative to /app"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The file's real size in bytes"
+        },
+        "encoding": {
+          "enum": [
+            "utf-8",
+            "base64"
+          ],
+          "description": "base64 for a file with a NUL byte or invalid UTF-8"
+        },
+        "content": {
+          "type": "string",
+          "description": "The first `max_bytes_per_file` bytes; a truncated text file is cut on a character boundary"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string",
+          "description": "`not found`, or why the path could not be read (`size` 0, empty `content`)"
+        }
+      }
+    },
+    "file_entry_meta": {
+      "type": "object",
+      "description": "A `file_entry` without `content` (the contents are in the tool's text)",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size",
+        "encoding",
+        "truncated"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "encoding": {
+          "enum": [
+            "utf-8",
+            "base64"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "session_row": {
+      "type": "object",
+      "description": "One running sandbox, read back from its job row",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "sandbox_id",
+        "runtime",
+        "url",
+        "created_at",
+        "updated_at",
+        "expires_at",
+        "last_used_at",
+        "phase"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_used_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Bumped by every write / read_file / edit_file / exec"
+        },
+        "phase": {
+          "const": "running"
+        }
+      }
+    },
+    "sessions_listing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "sessions"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/session_row"
+          },
+          "description": "Every running sandbox on the deployment, newest first -- no per-user filtering"
+        }
+      }
+    },
+    "sandbox_job_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "entrypoint",
+        "ttl_seconds",
+        "expires_at",
+        "session_id",
+        "chat_id",
+        "last_used_at",
+        "env"
+      ],
+      "properties": {
+        "runtime": {
+          "type": "string"
+        },
+        "entrypoint": {
+          "type": "string",
+          "description": "The caller's entrypoint, else the runtime's default"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "description": "The caller's `ttl_seconds` (else SANDBOX_DEFAULT_TTL_SECONDS), clamped to SANDBOX_HARD_TTL_SECONDS"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "chat_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_used_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The caller's env, replayed on a self-heal respawn"
+        },
+        "warmed": {
+          "const": true,
+          "description": "Present on a `create` (a warming container)"
+        }
+      }
+    },
+    "sandbox_job": {
+      "description": "One sandbox's job row: the shared `common.jobs` `JobBase` with the runner's `metadata` / `result`",
+      "allOf": [
+        {
+          "$ref": "#/$defs/job_base"
+        }
+      ],
+      "properties": {
+        "job_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "phase": {
+          "enum": [
+            "spawning",
+            "starting",
+            "running",
+            "expired",
+            "closed",
+            "failed"
+          ],
+          "description": "`spawning` (container being created) → `starting` (readiness probe) → `running`; then `closed` (close / DELETE /session), `expired` (reaped, or replaced by a self-heal respawn) or `failed` (spawn or readiness failed, `error` set)"
+        },
+        "metadata": {
+          "$ref": "#/$defs/sandbox_job_metadata"
+        },
+        "result": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "url",
+                "container_name"
+              ],
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "container_name": {
+                  "type": "string",
+                  "description": "`sandbox-<sandbox_id>`"
+                }
+              }
+            }
+          ],
+          "description": "Set when the sandbox reached `running`"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why spawn / readiness failed"
+        }
+      }
+    },
+    "sandbox_jobs": {
+      "description": "The newest 20 job rows (PostgresRegistry.list_all), terminal ones included",
+      "allOf": [
+        {
+          "$ref": "#/$defs/jobs_list_response"
+        }
+      ],
+      "properties": {
+        "jobs": {
+          "items": {
+            "$ref": "#/$defs/sandbox_job"
+          }
+        },
+        "max_concurrent": {
+          "type": "null",
+          "description": "The registry tracks no ceiling (the runner's semaphore does)"
+        },
+        "available": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "max_concurrent",
+        "available"
+      ]
+    },
+    "read_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "sandbox_id",
+        "path",
+        "start_line",
+        "end_line",
+        "total_lines",
+        "more_lines",
+        "truncated",
+        "lines_cut",
+        "size",
+        "file_truncated",
+        "content"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "path": {
+          "type": "string",
+          "description": "The normalised relative path"
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The last line shown (start_line - 1 for an empty window)"
+        },
+        "total_lines": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lines in the file (in its first READ_FILE_MAX_BYTES when `file_truncated`)"
+        },
+        "more_lines": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lines after `end_line`"
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "More lines follow `end_line` (ask again with offset = end_line + 1)"
+        },
+        "lines_cut": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lines cut at READ_FILE_MAX_LINE_CHARS"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The file's size in bytes"
+        },
+        "file_truncated": {
+          "type": "boolean",
+          "description": "Only the first READ_FILE_MAX_BYTES were read"
+        },
+        "content": {
+          "type": "string",
+          "description": "`cat -n` style: the line number, a TAB, the line"
+        }
+      }
+    },
+    "edit_fields": {
+      "description": "What `edit_file` returns (`operations._do_edit_file`)",
+      "properties": {
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "url": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "runtime": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "replacements": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_line": {
+          "type": "integer",
+          "description": "The (first) replaced region in the NEW file"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "match_lines": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The first line of every replacement (up to 20)"
+        },
+        "total_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "startup_output": {
+          "type": "string",
+          "description": "What the dev server printed after this edit"
+        },
+        "app_status": {
+          "$ref": "#/$defs/app_status"
+        },
+        "recreated": {
+          "const": false
+        }
+      }
+    },
+    "exec_fields": {
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "-1 when the command timed out or the exec failed"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Earlier output was dropped (the LAST EXEC_MAX_OUTPUT_BYTES are kept)"
+        },
+        "timed_out": {
+          "type": "boolean"
+        }
+      }
+    },
+    "logs_fields": {
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/session_id"
+        },
+        "sandbox_id": {
+          "$ref": "#/$defs/sandbox_id"
+        },
+        "lines_requested": {
+          "type": "integer",
+          "description": "The `lines` asked for (the tail is clamped to 1..1000)"
+        },
+        "logs": {
+          "type": "string",
+          "description": "The tail of /tmp/sandbox.log: the app's stdout + stderr and `[browser]` lines; empty is not an error"
+        }
+      }
+    },
+    "mcp_list_params": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "mcp.types.PaginatedRequestParams",
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "description": "An opaque token representing the current pagination position"
+        }
+      }
+    },
+    "mcp_initialize_params": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "mcp.types.InitializeRequestParams: the SDK allows extra keys",
+      "required": [
+        "protocolVersion",
+        "capabilities",
+        "clientInfo"
+      ],
+      "properties": {
+        "protocolVersion": {
+          "type": "string",
+          "description": "The latest version of the Model Context Protocol that the client supports"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "clientInfo": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "name",
+            "version"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "mcp_initialize_result": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "mcp.types.InitializeResult: the SDK allows extra keys",
+      "required": [
+        "protocolVersion",
+        "capabilities",
+        "serverInfo"
+      ],
+      "properties": {
+        "protocolVersion": {
+          "type": "string",
+          "description": "The version of the Model Context Protocol that the server wants to use; it may not match the version the client requested"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "tools"
+          ],
+          "description": "What the server supports (`mcp.types.ServerCapabilities`); FastMCP announces `tools`, `prompts`, `resources` and `logging`"
+        },
+        "serverInfo": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "name",
+            "version"
+          ],
+          "properties": {
+            "name": {
+              "const": "sandbox"
+            },
+            "version": {
+              "type": "string",
+              "description": "The version FastMCP reports"
+            }
+          }
+        },
+        "instructions": {
+          "type": "string"
+        }
+      }
+    },
+    "run_response": {
+      "$comment": "generated from models.RunResponse — do not edit",
+      "properties": {
+        "sandbox_id": {
+          "title": "Sandbox Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "url": {
+          "title": "Url",
+          "type": "string"
+        },
+        "expires_at": {
+          "title": "Expires At",
+          "type": "string"
+        },
+        "reused": {
+          "default": false,
+          "title": "Reused",
+          "type": "boolean"
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime"
+        },
+        "startup_output": {
+          "default": "",
+          "title": "Startup Output",
+          "type": "string"
+        },
+        "app_status": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "App Status"
+        },
+        "recreated": {
+          "default": false,
+          "title": "Recreated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sandbox_id",
+        "session_id",
+        "url",
+        "expires_at"
+      ],
+      "title": "RunResponse",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "job_base": {
+      "$comment": "generated from common.jobs.model.JobBase — do not edit",
+      "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+      "properties": {
+        "job_id": {
+          "title": "Job Id",
+          "type": "string"
+        },
+        "phase": {
+          "title": "Phase",
+          "type": "string"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "elapsed_seconds": {
+          "title": "Elapsed Seconds",
+          "type": "number"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        }
+      },
+      "required": [
+        "job_id",
+        "phase",
+        "created_at",
+        "updated_at",
+        "elapsed_seconds",
+        "metadata"
+      ],
+      "title": "JobBase",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "jobs_list_response": {
+      "$comment": "generated from common.jobs.model.JobsListResponse — do not edit",
+      "$defs": {
+        "JobBase": {
+          "description": "Snapshot of one job at a point in time.\n\nFields:\n    job_id: 12-char hex identifier assigned at registration.\n    phase: Freeform string; each consumer defines its own convention.\n        Interceptor-api uses ``\"cloning\" | \"capturing\" | \"actions\" |\n        \"cleaning_up\"`` (``\"actions\"`` while a capture's\n        ``page_script`` / ``actions`` run);\n        classifier uses ``\"staging\" | \"pending\" | \"processing\" |\n        \"completed\" | \"failed\" | \"cancelled\"``.\n    created_at: ISO-8601 UTC timestamp when the job was registered.\n    updated_at: ISO-8601 UTC timestamp of the last phase / result / error\n        transition. Equals ``created_at`` for a job that hasn't transitioned.\n    elapsed_seconds: Wall-clock seconds since ``created_at``, computed at\n        snapshot time from a monotonic clock. Present for ephemeral jobs;\n        derived from ``created_at`` for persistent (SQLite-backed) jobs\n        where the monotonic anchor is process-local and doesn't survive\n        restarts.\n    metadata: Consumer-defined dict describing the job. Typically the\n        result of a pydantic ``BaseModel.model_dump()``.\n    result: Populated on successful completion for persistent backends.\n        Ephemeral backends never set this — a completed ephemeral job is\n        already gone from the registry.\n    error: Populated on failure for persistent backends. Same caveat as\n        ``result`` for ephemeral.",
+          "properties": {
+            "job_id": {
+              "title": "Job Id",
+              "type": "string"
+            },
+            "phase": {
+              "title": "Phase",
+              "type": "string"
+            },
+            "created_at": {
+              "title": "Created At",
+              "type": "string"
+            },
+            "updated_at": {
+              "title": "Updated At",
+              "type": "string"
+            },
+            "elapsed_seconds": {
+              "title": "Elapsed Seconds",
+              "type": "number"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Result"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Error"
+            }
+          },
+          "required": [
+            "job_id",
+            "phase",
+            "created_at",
+            "updated_at",
+            "elapsed_seconds",
+            "metadata"
+          ],
+          "title": "JobBase",
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "description": "Response body for ``GET /jobs``.\n\n``max_concurrent`` and ``available`` are populated by backends that have\na concurrency ceiling (like the in-memory backend fronted by a port pool);\npersistent backends leave them ``None``.",
+      "properties": {
+        "active_count": {
+          "title": "Active Count",
+          "type": "integer"
+        },
+        "jobs": {
+          "items": {
+            "$ref": "#/$defs/JobBase"
+          },
+          "title": "Jobs",
+          "type": "array"
+        },
+        "max_concurrent": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Concurrent"
+        },
+        "available": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Available"
+        }
+      },
+      "required": [
+        "active_count",
+        "jobs"
+      ],
+      "title": "JobsListResponse",
+      "type": "object",
+      "additionalProperties": false
+    }
+  },
+  "endpoints": {
+    "GET /v1/sandbox/health": {
+      "description": "Always 200: a failed `sandbox-db` probe is `degraded` / `down`.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "db"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded"
+                ]
+              },
+              "db": {
+                "enum": [
+                  "up",
+                  "down"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/sandbox/run": {
+      "description": "A field validator's refusal (a file over SANDBOX_MAX_FILE_BYTES, a payload over SANDBOX_MAX_PAYLOAD_BYTES, a reserved `env` key, a malformed `session_id` / `chat_id`, a negative `ttl_seconds`) is FastAPI's 422; 429 the pool is full; 500 a Docker spawn error.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "$comment": "generated from models.RunRequest — do not edit",
+          "properties": {
+            "runtime": {
+              "description": "One of the keys in runtimes.RUNTIMES",
+              "title": "Runtime",
+              "type": "string"
+            },
+            "files": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                ]
+              },
+              "description": "Path → content map. On the first call for a session this is the initial file set. On a follow-up call (same session_id) it is an overlay — paths given here overwrite files in the running container, unlisted files are left alone. Values are either raw UTF-8 strings, or {\"encoding\": \"base64\", \"content\": \"...\"} for binary payloads (images, PDFs, wheels). Per-file cap: SANDBOX_MAX_FILE_BYTES; total cap: SANDBOX_MAX_PAYLOAD_BYTES.",
+              "title": "Files",
+              "type": "object"
+            },
+            "entrypoint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Shell command inside the sandbox; must bind to port 80",
+              "title": "Entrypoint"
+            },
+            "ttl_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Idle TTL in seconds. Omit, null or 0 for SANDBOX_DEFAULT_TTL_SECONDS; a negative value is refused. Server clamps to SANDBOX_HARD_TTL_SECONDS.",
+              "title": "Ttl Seconds"
+            },
+            "session_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Persistent identifier for a preview across turns. Omit on the first call; the server generates one and returns it. Pass the same value back on follow-up calls to update files in place — no respawn, same URL, dev server hot-reloads.",
+              "title": "Session Id"
+            },
+            "deletes": {
+              "description": "Relative paths (under /app) to delete on a follow-up call. Ignored on the first call. Absolute paths and '..' are rejected.",
+              "items": {
+                "type": "string"
+              },
+              "title": "Deletes",
+              "type": "array"
+            },
+            "env": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Process env vars set inside the container. Immutable after spawn (respawned self-heal replays the same env). Reserved keys HTTP_PROXY/HTTPS_PROXY/PYTHONUNBUFFERED/TERM/etc. are rejected — those are runner-controlled invariants.",
+              "title": "Env"
+            },
+            "recreate_if_gone": {
+              "default": true,
+              "description": "If the session's container is gone, respawn a fresh one under the same session_id (env preserved; in-container files and exec-installed packages LOST). Default true — run is the one-shot path. Set false to get a 409 instead.",
+              "title": "Recreate If Gone",
+              "type": "boolean"
+            },
+            "overwrite": {
+              "default": false,
+              "description": "Follow-up calls only: allow replacing an existing text file of 30+ lines with content that keeps most of its lines. Without it such a write is refused with 409 rewrite_of_existing_file — use edit_file for changes to part of a file. New files, small files, binary files and genuine rewrites are never refused.",
+              "title": "Overwrite",
+              "type": "boolean"
+            },
+            "chat_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Id of the chat/conversation this call belongs to. When set and no session_id is given, the runner reuses the chat's existing live sandbox instead of spawning a second one — so one conversation maps to one container. Pass it on every call for a chat and you never have to thread session_id yourself.",
+              "title": "Chat Id"
+            }
+          },
+          "required": [
+            "runtime"
+          ],
+          "title": "RunRequest",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/run_result"
+          }
+        },
+        "400": {
+          "content_type": "application/json",
+          "description": "an unknown `runtime`, an `entrypoint` on a runtime that takes none, an unsafe path (a plain string), or static lint",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "description": "follow-up calls: the rewrite guard, or the container is gone and `recreate_if_gone` is false; or the one-sandbox-per-chat reservation failed",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_rewrite"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_reserve_failed"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "504": {
+          "content_type": "application/json",
+          "description": "the container did not answer its readiness probe within 30 s",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_not_ready"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/sandbox/create": {
+      "description": "The body is `RunResponse`, so the `warming` / `duplicate_create_prevented` / `chat_id` keys `create` computes are on the MCP tool's payload only. 400 an unknown `runtime` or an `entrypoint` on a runtime that takes none; 422 a malformed `chat_id`, a reserved `env` key or a negative `ttl_seconds`; 429 the pool is full; 500 a spawn error.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "$comment": "generated from models.CreateRequest — do not edit",
+          "properties": {
+            "runtime": {
+              "title": "Runtime",
+              "type": "string"
+            },
+            "entrypoint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Entrypoint"
+            },
+            "ttl_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Ttl Seconds"
+            },
+            "env": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Env"
+            },
+            "chat_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Id of the chat this create belongs to. When a live sandbox already exists for this chat_id, the runner returns THAT session instead of spawning a second container (duplicate_create_prevented=true in the response). One chat, one container.",
+              "title": "Chat Id"
+            }
+          },
+          "required": [
+            "runtime"
+          ],
+          "title": "CreateRequest",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/run_result"
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_reserve_failed"
+              }
+            }
+          }
+        },
+        "504": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_not_ready"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/sessions": {
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/sessions_listing"
+          }
+        }
+      }
+    },
+    "POST /v1/sandbox/session/:sandboxSessionId/files": {
+      "description": "A file over SANDBOX_MAX_FILE_BYTES or a payload over SANDBOX_MAX_PAYLOAD_BYTES is FastAPI's 422.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "$comment": "generated from models.WriteFilesRequest — do not edit",
+          "properties": {
+            "files": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                ]
+              },
+              "description": "Path → content overlay. Absent paths are preserved. Values are str (UTF-8) or {encoding: 'base64', content: '...'}.",
+              "title": "Files",
+              "type": "object"
+            },
+            "deletes": {
+              "description": "Relative paths under /app to delete.",
+              "items": {
+                "type": "string"
+              },
+              "title": "Deletes",
+              "type": "array"
+            },
+            "recreate_if_gone": {
+              "default": false,
+              "description": "If true and the session's container is gone, respawn a fresh container under the same session_id (files and packages installed via exec are LOST; env is preserved). Default false — caller must opt-in explicitly.",
+              "title": "Recreate If Gone",
+              "type": "boolean"
+            },
+            "overwrite": {
+              "default": false,
+              "description": "Allow replacing an existing text file of 30+ lines with content that keeps most of its lines. Without it such a write is refused with 409 rewrite_of_existing_file — use edit_file for changes to part of a file. New files, small files, binary files and genuine rewrites are never refused.",
+              "title": "Overwrite",
+              "type": "boolean"
+            }
+          },
+          "title": "WriteFilesRequest",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/run_result"
+          }
+        },
+        "400": {
+          "content_type": "application/json",
+          "description": "an invalid `session_id` or an unsafe path (a plain string), or static lint",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_session_not_found"
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "description": "the rewrite guard, or the container is gone and `recreate_if_gone` is false",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_rewrite"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_reserve_failed"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "500": {
+          "content_type": "application/json",
+          "description": "a spawn error (a plain string), or a self-heal with no runtime recorded",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_self_heal_failed"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "504": {
+          "content_type": "application/json",
+          "description": "a self-heal respawn did not become ready",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_not_ready"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/session/:sandboxSessionId/files": {
+      "description": "400 an invalid `session_id`, 404 no running sandbox for it.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "session_id",
+              "sandbox_id",
+              "files"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/$defs/session_id"
+              },
+              "sandbox_id": {
+                "$ref": "#/$defs/sandbox_id"
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/file_listing_entry"
+                    },
+                    {
+                      "$ref": "#/$defs/file_entry"
+                    }
+                  ]
+                },
+                "description": "Without `paths`: every regular file under /app (path + size); with `paths`: each one's content, binary as base64, a missing one with `error`"
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "description": "the session's container is gone (get_files never respawns)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_container_gone"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/session/:sandboxSessionId/file": {
+      "description": "Counts as activity (bumps `last_used_at`). A missing `path` query is FastAPI's 422.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/read_window"
+          }
+        },
+        "400": {
+          "content_type": "application/json",
+          "description": "an invalid `session_id` (a plain string), or `unsafe_path`",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "description": "no running session, or `missing_file`",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_session_not_found"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "description": "the container is gone (read_file never respawns), or `binary_file` / `is_directory` / `not_a_file`",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/sandbox/session/:sandboxSessionId/edit": {
+      "description": "All-or-nothing: no file is modified on any error. `old_string` / `new_string` over SANDBOX_MAX_FILE_BYTES, or an empty `path`, is FastAPI's 422.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "$comment": "generated from models.EditFileRequest — do not edit",
+          "description": "One exact-string replacement in one file — ``edit_file``.",
+          "properties": {
+            "path": {
+              "description": "Relative path under /app of an EXISTING UTF-8 file. Absolute paths and '..' are rejected.",
+              "title": "Path",
+              "type": "string"
+            },
+            "old_string": {
+              "description": "The exact text to replace, copied from read_file output WITHOUT the line-number prefix. Must occur exactly once in the file unless replace_all is true.",
+              "title": "Old String",
+              "type": "string"
+            },
+            "new_string": {
+              "description": "The replacement text. Must differ from old_string.",
+              "title": "New String",
+              "type": "string"
+            },
+            "replace_all": {
+              "default": false,
+              "description": "Replace every occurrence of old_string instead of exactly one.",
+              "title": "Replace All",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path",
+            "old_string",
+            "new_string"
+          ],
+          "title": "EditFileRequest",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/edit_fields"
+              }
+            ],
+            "properties": {
+              "snippet": {
+                "type": "string",
+                "description": "The replaced region with 3 lines of context each side, numbered, at most 40 rows"
+              }
+            },
+            "required": [
+              "sandbox_id",
+              "session_id",
+              "url",
+              "expires_at",
+              "runtime",
+              "path",
+              "replacements",
+              "start_line",
+              "end_line",
+              "match_lines",
+              "total_lines",
+              "startup_output",
+              "app_status",
+              "recreated",
+              "snippet"
+            ],
+            "unevaluatedProperties": false
+          }
+        },
+        "400": {
+          "content_type": "application/json",
+          "description": "an invalid `session_id` (a plain string), `unsafe_path`, or the edited `.py` file does not compile",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "description": "no running session, or `missing_file`",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_session_not_found"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "description": "the container is gone (no self-heal), or a refused edit: `not_found`, `multiple_matches`, `line_number_prefix`, `no_change`, `empty_old_string`, `binary_file`, `is_directory`, `not_a_file`",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "413": {
+          "content_type": "application/json",
+          "description": "`too_large`: the file, or the edited file, is over SANDBOX_MAX_FILE_BYTES",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_file_op"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/sandbox/session/:sandboxSessionId/exec": {
+      "description": "400 an invalid `session_id`, an empty `command` or an unsafe `working_dir`.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "$comment": "generated from models.ExecRequest — do not edit",
+          "properties": {
+            "command": {
+              "description": "Shell command (sh -c). Non-interactive.",
+              "title": "Command",
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Timeout Seconds"
+            },
+            "working_dir": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Working Dir"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "title": "ExecRequest",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/exec_fields"
+              }
+            ],
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Echoed"
+              },
+              "output": {
+                "type": "string",
+                "description": "Combined stdout + stderr: the LAST EXEC_MAX_OUTPUT_BYTES, cut on a character boundary"
+              }
+            },
+            "required": [
+              "session_id",
+              "sandbox_id",
+              "command",
+              "exit_code",
+              "duration_ms",
+              "output",
+              "truncated",
+              "timed_out"
+            ],
+            "unevaluatedProperties": false
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_no_running_sandbox"
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "description": "the session's container is gone (exec never respawns)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_container_gone"
+              }
+            }
+          }
+        }
+      }
+    },
+    "DELETE /v1/sandbox/session/:sandboxSessionId": {
+      "description": "Idempotent: an unknown or expired session is a 204 too. 400 an invalid `session_id`.",
+      "responses": {
+        "204": {
+          "description": "no body"
+        }
+      }
+    },
+    "GET /v1/sandbox/session/:sandboxSessionId/download": {
+      "description": "Follows self-heal: the session's CURRENT sandbox. 400 an invalid `session_id`, 404 no running sandbox (or its container is gone).",
+      "responses": {
+        "200": {
+          "content_type": "application/x-tar",
+          "description": "The container's /app as a plain tar stream (archive root `app/`), `Content-Disposition: attachment; filename=\"sandbox-<sandbox_id>.tar\"`"
+        }
+      }
+    },
+    "GET /v1/sandbox/session/:sandboxSessionId/logs": {
+      "description": "400 an invalid `session_id`, 404 no running sandbox.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/logs_fields"
+              }
+            ],
+            "required": [
+              "session_id",
+              "sandbox_id",
+              "lines_requested",
+              "logs"
+            ],
+            "unevaluatedProperties": false
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/jobs": {
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/sandbox_jobs"
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/jobs/:sandboxId": {
+      "description": "404 no such sandbox.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/sandbox_job"
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/jobs/:sandboxId/download": {
+      "description": "404 no such sandbox (or its container is gone), 409 it never reached `running`.",
+      "responses": {
+        "200": {
+          "content_type": "application/x-tar",
+          "description": "The container's /app as a plain tar stream (archive root `app/`), `Content-Disposition: attachment; filename=\"sandbox-<sandbox_id>.tar\"`"
+        }
+      }
+    },
+    "GET /v1/sandbox/jobs/:sandboxId/logs": {
+      "description": "404 no such sandbox, 409 it never reached `running`.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "sandbox_id",
+              "lines_requested",
+              "logs"
+            ],
+            "properties": {
+              "sandbox_id": {
+                "$ref": "#/$defs/sandbox_id"
+              },
+              "lines_requested": {
+                "type": "integer",
+                "description": "The `lines` asked for (the tail is clamped to 1..1000)"
+              },
+              "logs": {
+                "type": "string",
+                "description": "The tail of that container's /tmp/sandbox.log"
+              }
+            }
+          }
+        }
+      }
+    },
+    "DELETE /v1/sandbox/jobs/:sandboxId": {
+      "description": "Stops the container, deletes the row, releases the slot if it held one. 404 no such sandbox.",
+      "responses": {
+        "204": {
+          "description": "no body"
+        }
+      }
+    },
+    "POST /v1/sandbox/internal/browser-log/:sandboxId": {
+      "description": "Internal: the browser shim's ingest. Always 204 -- a malformed id, body or entry is dropped silently -- except a body over BROWSER_LOG_MAX_BODY_BYTES, a 413 before parsing. Entries past BROWSER_LOG_RATE_LIMIT_PER_MIN per sandbox per minute collapse into one `[browser rate-limited: N events dropped …]` line.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "entries"
+          ],
+          "description": "Parsed by hand: anything else is dropped, never refused",
+          "properties": {
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "level",
+                  "message"
+                ],
+                "properties": {
+                  "level": {
+                    "enum": [
+                      "error",
+                      "warn",
+                      "log",
+                      "info",
+                      "debug"
+                    ],
+                    "description": "Anything else drops the entry"
+                  },
+                  "ts": {
+                    "type": "number",
+                    "description": "Epoch milliseconds; missing or non-numeric is the runner's clock"
+                  },
+                  "message": {
+                    "type": "string",
+                    "description": "Folded onto one line"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "Script URL or filename"
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "col": {
+                    "type": "integer"
+                  },
+                  "stack": {
+                    "type": "string",
+                    "description": "Rendered indented under the line"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "204": {
+          "description": "no body"
+        }
+      }
+    },
+    "GET /v1/sandbox/tool/openapi.json": {
+      "description": "OpenWebUI fetches it to register the Tool Server.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "$comment": "FastAPI's OpenAPI document for the /tool sub-app; its structure is the OpenAPI specification's, so it stays open",
+            "required": [
+              "openapi",
+              "info",
+              "paths"
+            ],
+            "properties": {
+              "openapi": {
+                "type": "string",
+                "description": "The OpenAPI version FastAPI emits"
+              },
+              "info": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "title",
+                  "version"
+                ],
+                "properties": {
+                  "title": {
+                    "const": "sandbox-runner tools"
+                  },
+                  "version": {
+                    "type": "string"
+                  }
+                }
+              },
+              "paths": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "/run",
+                  "/get_runtime_types"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/sandbox/tool/run": {
+      "description": "`recreate_if_gone` is always true and the rewrite guard is off (`overwrite=true`): the Tool Server's only tool is `run`. Errors are JSON, not HTML; 422 a field validator's refusal (size caps, reserved `env` key, malformed `chat_id`, a negative `ttl_seconds`), 429 the pool is full, 500 a spawn error.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "$comment": "generated from models.ToolRunRequest — do not edit",
+          "description": "Request shape for the OpenWebUI Tool Server ``/tool/run`` route.\n\nKept separate from ``RunRequest`` because the Tool Server surface has\nslightly different defaults (no ``recreate_if_gone`` — the OpenWebUI\npath always self-heals) and doesn't need the same field descriptions.",
+          "properties": {
+            "runtime": {
+              "description": "One of 'static', 'python', 'node'.",
+              "title": "Runtime",
+              "type": "string"
+            },
+            "files": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                ]
+              },
+              "description": "Map of relative path → content. Values are UTF-8 str or {encoding:'base64', content:'...'} for binary. On follow-up with the same session_id, only send changed files.",
+              "title": "Files",
+              "type": "object"
+            },
+            "entrypoint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Entrypoint"
+            },
+            "ttl_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Ttl Seconds"
+            },
+            "session_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Session Id"
+            },
+            "deletes": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Deletes",
+              "type": "array"
+            },
+            "env": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Env"
+            },
+            "chat_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Chat id. With no session_id, reuse the chat's existing sandbox instead of spawning a second one.",
+              "title": "Chat Id"
+            }
+          },
+          "required": [
+            "runtime"
+          ],
+          "title": "ToolRunRequest",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "text/html",
+          "description": "The preview page (`sandbox_mcp.render_preview_html`), with `Content-Disposition: inline`"
+        },
+        "400": {
+          "content_type": "application/json",
+          "description": "an invalid `session_id` or unknown `runtime` (a plain string), or static lint",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "409": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_reserve_failed"
+              }
+            }
+          }
+        },
+        "504": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "detail"
+            ],
+            "properties": {
+              "detail": {
+                "$ref": "#/$defs/detail_not_ready"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/sandbox/tool/get_runtime_types": {
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/runtime_type"
+            }
+          }
+        }
+      }
+    },
+    "MCP initialize": {
+      "description": "The JSON-RPC response's `result` (streamable HTTP at `/mcp/`: one SSE `data:` message when the request accepts `text/event-stream`); the `mcp-session-id` response header names the session the later calls send back.",
+      "params": {
+        "$ref": "#/$defs/mcp_initialize_params"
+      },
+      "result": {
+        "$ref": "#/$defs/mcp_initialize_result"
+      }
+    },
+    "MCP tools/list": {
+      "description": "The JSON-RPC response's `result` (one SSE `data:` message).",
+      "params": {
+        "$ref": "#/$defs/mcp_list_params"
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": true,
+        "$comment": "mcp.types.ListToolsResult: the SDK allows extra keys",
+        "required": [
+          "tools"
+        ],
+        "properties": {
+          "tools": {
+            "type": "array",
+            "minItems": 12,
+            "maxItems": 12,
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "$comment": "mcp.types.Tool: the SDK allows extra keys",
+              "required": [
+                "name",
+                "inputSchema"
+              ],
+              "properties": {
+                "name": {
+                  "enum": [
+                    "get_runtime_types",
+                    "create",
+                    "write_files",
+                    "read_file",
+                    "edit_file",
+                    "get_files",
+                    "get_logs",
+                    "exec",
+                    "preview",
+                    "close",
+                    "list_sessions",
+                    "run"
+                  ]
+                },
+                "description": {
+                  "type": "string",
+                  "description": "The tool's docstring, or the description built from constants.py: what the model reads"
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "A JSON Schema: the arguments of `MCP <name>`"
+                },
+                "_meta": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "FastMCP's own"
+                }
+              }
+            }
+          },
+          "nextCursor": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "MCP get_logs": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. Errors as `GET /session/:sandboxSessionId/logs`'s, as data.",
+      "arguments": {
+        "$comment": "generated from app._mcp:get_logs — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id from a previous create / run / write_files response. Must match ^[A-Za-z0-9_-]{1,64}$.",
+            "type": "string"
+          },
+          "lines": {
+            "default": 100,
+            "description": "Trailing log lines to return. Clamped 1..1000. Default 100 is enough for most tracebacks.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The logs, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/logs_fields"
+              }
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "empty": {
+                "const": true,
+                "description": "Present when `logs` is empty"
+              }
+            },
+            "required": [
+              "ok",
+              "session_id",
+              "sandbox_id",
+              "lines_requested",
+              "logs"
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          }
+        ]
+      }
+    },
+    "MCP get_runtime_types": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. Never fails.",
+      "arguments": {
+        "$comment": "generated from app._mcp:get_runtime_types — do not edit",
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runtime_types"
+        ],
+        "properties": {
+          "runtime_types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/runtime_type"
+            }
+          }
+        }
+      }
+    },
+    "MCP create": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. Every key `create` computes, unlike POST /create's `RunResponse`.",
+      "arguments": {
+        "$comment": "generated from app._mcp:create — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "runtime": {
+            "description": "Runtime for the empty warming container. One of the names in get_runtime_types.",
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Idle TTL in seconds. Omit, null or 0 for the default (SANDBOX_DEFAULT_TTL_SECONDS); a negative value is refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+          },
+          "entrypoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Shell command bound to port 80. Leave unset for the runtime's default. Rejected for the 'static' runtime."
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Process env vars set inside the container. IMMUTABLE after create — self-heal respawn replays the same env. Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, TERM, etc.) are rejected."
+          },
+          "chat_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Id of the chat you're answering in. Pass it and the runner enforces ONE sandbox per chat: if this chat already created one, create returns THAT session instead of spawning a duplicate (no extra slot used). Use the OpenWebUI chat id, or any stable per-conversation string. Strongly recommended — it stops a chat from leaking containers across turns when the session_id is lost."
+          }
+        },
+        "required": [
+          "runtime"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The session, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/sandbox_fields"
+              }
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok",
+              "sandbox_id",
+              "session_id",
+              "url",
+              "expires_at",
+              "reused",
+              "runtime",
+              "startup_output",
+              "app_status",
+              "recreated",
+              "warming",
+              "duplicate_create_prevented",
+              "chat_id"
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_invalid_arguments"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_reserve_failed"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_not_ready"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP write_files": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads.",
+      "arguments": {
+        "$comment": "generated from app._mcp:write_files — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id from a previous create / run response.",
+            "type": "string"
+          },
+          "files": {
+            "additionalProperties": true,
+            "description": "Path → FULL content of NEW files (or of files you are rewriting from scratch). Every listed file is replaced wholesale; unlisted files are preserved. Values are UTF-8 str, or {\"encoding\":\"base64\",\"content\":\"...\"} for binaries. Per-file cap: SANDBOX_MAX_FILE_BYTES; total cap: SANDBOX_MAX_PAYLOAD_BYTES. To change part of an existing file use edit_file instead.",
+            "type": "object"
+          },
+          "deletes": {
+            "description": "Relative paths under /app to remove. Ignored on fresh spawns.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "recreate_if_gone": {
+            "default": false,
+            "description": "OPT-IN self-heal. If false (default) and the container is gone, this returns an error telling you to explicitly opt in. If true, the runner respawns fresh — files installed via exec and in-container state are LOST; env is preserved.",
+            "type": "boolean"
+          },
+          "overwrite": {
+            "default": false,
+            "description": "Set true ONLY to deliberately replace an existing text file of 30+ lines with content that keeps 50% or more of its lines. Without it that write is refused (rewrite_of_existing_file) — use edit_file for such changes.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The updated session, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/sandbox_fields"
+              }
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok",
+              "sandbox_id",
+              "session_id",
+              "url",
+              "expires_at",
+              "reused",
+              "runtime",
+              "startup_output",
+              "app_status",
+              "recreated"
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_invalid_arguments"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_session_not_found"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_rewrite"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_self_heal_failed"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_reserve_failed"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_not_ready"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP read_file": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. The numbered lines are in the text only.",
+      "arguments": {
+        "$comment": "generated from app._mcp:read_file — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id returned by create / run.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Relative path of ONE text file under /app.",
+            "type": "string"
+          },
+          "offset": {
+            "default": 1,
+            "description": "1-based line number to start reading at.",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 400,
+            "description": "Number of lines to return (max 2000).",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "path"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The window's bounds, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "session_id",
+              "sandbox_id",
+              "path",
+              "start_line",
+              "end_line",
+              "total_lines",
+              "truncated"
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "session_id": {
+                "$ref": "#/$defs/session_id"
+              },
+              "sandbox_id": {
+                "$ref": "#/$defs/sandbox_id"
+              },
+              "path": {
+                "type": "string"
+              },
+              "start_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "end_line": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "total_lines": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_session_not_found"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP edit_file": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. The snippet is in the text only.",
+      "arguments": {
+        "$comment": "generated from app._mcp:edit_file — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id returned by create / run.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Relative path under /app of an EXISTING text file.",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "The exact text to replace, copied from read_file output WITHOUT the line-number prefix. Include enough lines to make it unique in the file.",
+            "type": "string"
+          },
+          "new_string": {
+            "description": "The text to put in its place (must differ).",
+            "type": "string"
+          },
+          "replace_all": {
+            "default": false,
+            "description": "Replace every occurrence of old_string (e.g. renaming a variable). Default: old_string must occur exactly once.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id",
+          "path",
+          "old_string",
+          "new_string"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The edit, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/edit_fields"
+              }
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok",
+              "sandbox_id",
+              "session_id",
+              "url",
+              "expires_at",
+              "runtime",
+              "path",
+              "replacements",
+              "start_line",
+              "end_line",
+              "match_lines",
+              "total_lines",
+              "startup_output",
+              "app_status",
+              "recreated"
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_invalid_arguments"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_session_not_found"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_file_op"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP get_files": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. With `paths`, the contents are in the text only.",
+      "arguments": {
+        "$comment": "generated from app._mcp:get_files — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id returned by create / run.",
+            "type": "string"
+          },
+          "paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Relative paths under /app. Omit to get a directory listing (paths + sizes only, no contents)."
+          },
+          "max_bytes_per_file": {
+            "default": 8192,
+            "description": "Truncate each file to this many bytes. Hard cap 65536.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The listing or the files' metadata, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "session_id",
+              "sandbox_id",
+              "files"
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "session_id": {
+                "$ref": "#/$defs/session_id"
+              },
+              "sandbox_id": {
+                "$ref": "#/$defs/sandbox_id"
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/file_listing_entry"
+                    },
+                    {
+                      "$ref": "#/$defs/file_entry_meta"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "$ref": "#/$defs/detail_container_gone"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP exec": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. The command and its output are in the text only.",
+      "arguments": {
+        "$comment": "generated from app._mcp:exec — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The target session.",
+            "type": "string"
+          },
+          "command": {
+            "description": "Shell command (via `sh -c`). NON-INTERACTIVE — stdin is closed, so anything that reads input hangs until timeout. Use -y / non-interactive flags.",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 30,
+            "description": "Command timeout in seconds. Hard cap 120.",
+            "type": "integer"
+          },
+          "working_dir": {
+            "default": "/app",
+            "description": "Working dir inside the container. Must be under /app; absolute paths outside /app and '..' traversal are rejected.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "command"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The exit status, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/exec_fields"
+              }
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok",
+              "session_id",
+              "sandbox_id",
+              "exit_code",
+              "duration_ms",
+              "truncated",
+              "timed_out"
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_no_running_sandbox"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_container_gone"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP preview": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. The text ends with the fenced ```html block the model must relay verbatim.",
+      "arguments": {
+        "$comment": "generated from app._mcp:preview — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id whose preview iframe you want.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The preview, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "session_id",
+              "sandbox_id",
+              "url",
+              "expires_at",
+              "runtime",
+              "download_url",
+              "iframe_html"
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "session_id": {
+                "$ref": "#/$defs/session_id"
+              },
+              "sandbox_id": {
+                "$ref": "#/$defs/sandbox_id"
+              },
+              "url": {
+                "type": "string"
+              },
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "runtime": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "download_url": {
+                "type": "string",
+                "description": "`<SANDBOX_PROXY_URL>/download/<session_id>`"
+              },
+              "iframe_html": {
+                "type": "string",
+                "description": "The preview page the fenced block carries"
+              }
+            }
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "$ref": "#/$defs/detail_no_running_sandbox"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "MCP close": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. Idempotent.",
+      "arguments": {
+        "$comment": "generated from app._mcp:close — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "The session_id to tear down.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The teardown, or an error",
+        "oneOf": [
+          {
+            "oneOf": [
+              {
+                "type": "object",
+                "description": "Torn down, slot released",
+                "additionalProperties": false,
+                "required": [
+                  "ok",
+                  "session_id",
+                  "sandbox_id",
+                  "was_running"
+                ],
+                "properties": {
+                  "ok": {
+                    "const": true
+                  },
+                  "session_id": {
+                    "$ref": "#/$defs/session_id"
+                  },
+                  "sandbox_id": {
+                    "$ref": "#/$defs/sandbox_id"
+                  },
+                  "was_running": {
+                    "const": true
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "ok",
+                  "session_id",
+                  "was_running",
+                  "note"
+                ],
+                "properties": {
+                  "ok": {
+                    "const": true
+                  },
+                  "session_id": {
+                    "$ref": "#/$defs/session_id"
+                  },
+                  "was_running": {
+                    "const": false
+                  },
+                  "note": {
+                    "const": "already closed or never existed"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          }
+        ]
+      }
+    },
+    "MCP list_sessions": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads.",
+      "arguments": {
+        "$comment": "generated from app._mcp:list_sessions — do not edit",
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "count",
+          "sessions"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/session_row"
+            }
+          }
+        }
+      }
+    },
+    "MCP run": {
+      "description": "The JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` is the prose the model reads. The text ends with the fenced ```html block the model must relay verbatim. `recreate_if_gone` is always true.",
+      "arguments": {
+        "$comment": "generated from app._mcp:run — do not edit",
+        "additionalProperties": false,
+        "properties": {
+          "runtime": {
+            "description": "Runtime for the sandbox. One of the names in get_runtime_types.",
+            "type": "string"
+          },
+          "files": {
+            "additionalProperties": true,
+            "description": "Path → content map. First call (no session_id): full initial file set. Follow-up (with session_id): overlay — only NEW files; change existing ones with edit_file. Values are UTF-8 str or {encoding:'base64', content:'...'} for binaries.",
+            "type": "object"
+          },
+          "entrypoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Shell command inside the sandbox, must bind port 80. Leave unset for the runtime's default. Rejected for runtimes with allows_custom_entrypoint=false. Ignored on follow-up calls."
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Idle TTL in seconds. Omit, null or 0 for the default (SANDBOX_DEFAULT_TTL_SECONDS); a negative value is refused. Server clamps to SANDBOX_HARD_TTL_SECONDS."
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Handle for a persistent preview. OMIT on the first call, PASS on follow-ups to update in place."
+          },
+          "deletes": {
+            "description": "Relative paths under /app to remove on a follow-up call.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Process env vars. Applied only on the first call. Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, etc.) rejected."
+          },
+          "chat_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Id of the chat you're answering in. With no session_id, the runner reuses this chat's existing container instead of spawning a new one — so repeated run calls in one chat update the same preview even if you lost the session_id. Pass it on every run for the chat."
+          },
+          "overwrite": {
+            "default": false,
+            "description": "Follow-up calls only. Set true ONLY to deliberately replace an existing text file of 30+ lines with content that keeps 50% or more of its lines. Without it that write is refused (rewrite_of_existing_file) — use edit_file for such changes.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "runtime"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "description": "The session and its preview, or an error",
+        "oneOf": [
+          {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/$defs/sandbox_fields"
+              }
+            ],
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "download_url": {
+                "type": "string",
+                "description": "`<SANDBOX_PROXY_URL>/download/<session_id>`"
+              },
+              "iframe_html": {
+                "type": "string",
+                "description": "The preview page the fenced block carries"
+              }
+            },
+            "required": [
+              "ok",
+              "sandbox_id",
+              "session_id",
+              "url",
+              "expires_at",
+              "reused",
+              "runtime",
+              "startup_output",
+              "app_status",
+              "recreated",
+              "download_url",
+              "iframe_html"
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "$ref": "#/$defs/mcp_error"
+          },
+          {
+            "type": "object",
+            "description": "An HTTP error with a structured `detail`, returned as a normal tool result",
+            "additionalProperties": false,
+            "required": [
+              "ok",
+              "status",
+              "error",
+              "session_id",
+              "detail"
+            ],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "status": {
+                "type": "integer",
+                "description": "The HTTP status the operation raised"
+              },
+              "error": {
+                "type": "string",
+                "description": "`detail.error`"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`detail.session_id`"
+              },
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/detail_invalid_arguments"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_static_lint"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_rewrite"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_reserve_failed"
+                  },
+                  {
+                    "$ref": "#/$defs/detail_not_ready"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

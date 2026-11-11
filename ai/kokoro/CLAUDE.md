@@ -1,6 +1,6 @@
 # ai/kokoro
 
-Kokoro-82M text-to-speech: `kokoro-app` (the model, GPU) behind `kokoro-api` (a stateless proxy with an OpenAI-compatible `POST /v1/audio/speech` and the `text_to_speech` MCP tool). Guide: [`KOKORO.md`](KOKORO.md). Compose: `docker-compose.kokoro.yml`. API: `kokoro.postman_collection.json`.
+Kokoro-82M text-to-speech: `kokoro-app` (the model, GPU) behind `kokoro-api` (a stateless proxy with an OpenAI-compatible `POST /v1/audio/speech` and the `text_to_speech` MCP tool). Guide: [`KOKORO.md`](KOKORO.md). Compose: `docker-compose.kokoro.yml`. API: `kokoro.postman_collection.json` + `kokoro.schemas.json`.
 
 ## Rules
 
@@ -9,6 +9,8 @@ Kokoro-82M text-to-speech: `kokoro-app` (the model, GPU) behind `kokoro-api` (a 
 - **First chunk only** — `app.py`'s `/generate` takes one item from the `KPipeline` generator, so long text is cut; Open WebUI's `AUDIO_TTS_SPLIT_ON=punctuation` sidesteps it. The real fix is concatenating every chunk.
 - **Open WebUI calls `kokoro-api` directly over `ai_shared`, not via LiteLLM** (its virtual key is scoped to chat models; `kokoro` stays off the chat picker). Its `AUDIO_TTS_*` settings are first-boot-only PersistentConfig (`OPENWEBUI.md § Voice (TTS via Kokoro)`).
 - The model lazy-loads on the first request (slow), cached in the `kokoro_data` volume.
+- **`text_to_speech` links live `AUDIO_MAX_AGE_SECONDS` (a day)**: each save prunes older WAVs with their cache entries; only startup clears `audio/` — kokoro-api's own lifespan, which must keep wrapping `mcp_app.lifespan` (without it every `/mcp` call is a 500). Tests: `unit-tests/kokoro` (no model needed).
+- **kokoro-app's 4xx pass through** (an unknown voice is its 400, detail kept); only unreachable / 5xx is kokoro-api's 502.
 
 ## Cross-folder rules
 

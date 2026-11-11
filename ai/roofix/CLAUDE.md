@@ -10,9 +10,9 @@ The Roofix ↔ Phoenix bridge: one event-sourced worker (`roofix`, FastAPI + APS
 - **The AI fallback goes through LiteLLM** (`ROOFIX_LLM_URL`, default `http://litellm:4000`, `BRAIN_MODEL`). Swapping the model is a LiteLLM config / `BRAIN_MODEL` change, never a bridge code change.
 - **Roofix session refresh is a manual operator flow**: the `roofix` profile lives in the interceptor; capture it on a laptop with a visible browser (`uv run cdp-spy`), tar it, `POST /profiles/roofix/refresh` (`INTERCEPTOR.md § Refreshing a profile (operator flow)`). Re-capture when `/capture` returns `login_wall: true`.
 - **Keep the `-label:${ROOFIX_PROCESSED_LABEL}` clause in `LISTENER_QUERY`**, or processed emails refill the 25-message fetch window every tick. Backfill the label on old rows with `POST /labels/backfill`.
-- **`config/field_mapping.json` is a stub on purpose** (Michael owns the mapping): milestone writes log "no milestone mapping" and skip until it is filled in. Not a bug to fix.
+- **`config/field_mapping.json` is a stub on purpose** (Michael owns the mapping). `FIELD_MAPPING_PATH` defaults to it, beside `app.py` (baked into the image at `/app/ai/roofix/config/`); its `phoenix_block_TBD` / status `0` placeholders resolve to no Phoenix process block, so `update_milestone` logs "resolved to 0 rows" (a `phoenix_write_failures`) and writes nothing. Not a bug to fix — but once real values land, `DRY_RUN=false` makes milestone writes real (Phase 0: `AGENT_PHASE` does not gate them), and `tests/test_field_mapping.py` fails until it is updated on purpose.
 - **Both services are recreate-class**: two `roofix` copies would double-tick APScheduler, and the processed-email store upserts rather than claims. Never label it swap.
-- Endpoint changes update `roofix.postman_collection.json` and `ROOFIX.md § Endpoints` together (root `CLAUDE.md` § Postman collections).
+- Endpoint changes update `roofix.postman_collection.json`, `roofix.schemas.json` and `ROOFIX.md § Endpoints` together (`scripts/api_schemas.py render`; root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 
@@ -41,4 +41,5 @@ One line each; full detail in `.env.example` and `ROOFIX.md § Configuration`.
 - `ROOFIX_DB_USER` / `_PASSWORD` / `_NAME` (`roofix`) — `roofix-db` (`ProcessedStore`); same default in compose and `app.py`'s DSN. On `ai_shared`: override the password before exposing it.
 - `PORT_ROOFIX_DB` (`5433`) — host port of `roofix-db`.
 - `INTERCEPTOR_URL` (`http://interceptor:8080`) — where `/capture` goes.
+- `FIELD_MAPPING_PATH` (`config/field_mapping.json` beside `app.py`) — the milestone map; `/config/field_mapping.json` reads the `ROOFIX_BRIDGE_CONFIG_DIR` mount instead.
 - `ROOFIX_PROFILE_NAME` (`roofix`) — interceptor profile holding the Roofix session.

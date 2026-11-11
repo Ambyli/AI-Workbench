@@ -40,6 +40,12 @@ net = [
 signals = [
     "httpx>=0.27",
 ]
+# common.apidocs.schemas.check_schema / validate — draft 2020-12 checks of the
+# endpoint schemas in ai/*/*.schemas.json. Walking, rendering and generating
+# them are stdlib-only; jsonschema is imported lazily by those two functions.
+apidocs = [
+    "jsonschema>=4.23",
+]
 
 [dependency-groups]
 dev = [
@@ -56,6 +62,7 @@ dev = [
     "pillow>=11.3.0",    # for tests/test_documents_*.py (AVIF needs 11.3)
     "pillow-heif>=1.8.1,<2",  # for tests/test_documents_*.py (HEIC decode + fixture encoder)
     "numpy>=1.26",       # for tests/test_documents_*.py
+    "jsonschema>=4.23",  # for tests/test_apidocs.py (the `apidocs` extra) and unit-tests/apidocs
 ]
 
 [project.scripts]

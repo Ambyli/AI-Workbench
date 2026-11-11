@@ -104,10 +104,14 @@ could not be fetched. **503** the model is not loaded — see `GET /health`.
  "default_threshold": 0.25, "max_image_side": 1024, "max_labels": 32}
 ```
 
-Returns **503** with `"status": "degraded"` and the loader's error while the
-weights are not resident. That is deliberate: a container that is up with a
-failed model load is not healthy, and the Docker healthcheck should fail it
-rather than route traffic to a service that can only answer 503. `device` is
+Returns **503** with `"status": "degraded"` and the loader's error after a
+failed model load (a bad `DETECTOR_MODEL`, a Grounding DINO id, no disk). That
+is deliberate: a container that is up with a failed model load is not healthy,
+and the Docker healthcheck should fail it rather than route traffic to a
+service that can only answer 503. It never answers *during* the first-start
+load: the lifespan loads the weights before uvicorn accepts a connection, so a
+request then is refused (through `ai/edge`, the edge's own `503` +
+`Retry-After`). `device` is
 what is actually in use, which is not always `configured_device` — see
 [CPU fallback](#cpu-fallback).
 
@@ -124,6 +128,12 @@ detect_objects(image, labels, threshold=None, max_per_label=None)
 photo is a very large tool argument. The tool returns the same body as
 `POST /detect` minus the flat `detections` list, which is redundant with
 `by_label` and is the bulky half.
+
+Errors come back as data, not as a JSON-RPC error: `{"error": "<message>",
+"status": <the status POST /detect gives the same failure>}` — 400 for bad
+`labels` / `threshold` / `max_per_label`, a blocked URL or an unusable image,
+502 for an image URL that could not be fetched, 503 when the model is not
+loaded.
 
 ### Through LiteLLM
 
@@ -389,4 +399,10 @@ Sanity checks worth making on any change to `detectors/`:
 | Every label returns zero boxes | Either the image genuinely has none of them (try `["person","car","tree"]` on a street photo to confirm the model works), or the threshold is too high. OWLv2 scores are low in absolute terms; 0.2–0.3 is a normal working range. |
 | Spurious boxes covering the whole image | Threshold too low. Also true of OWLv2 generally — a full-frame box is usually the model saying "I have nothing". |
 | OOM on GPU 2 | `qwen3.8-solo` grew, or `DETECTOR_MODEL` was pointed at the `large` checkpoint. Drop back to `base`, or set `DETECTOR_DEVICE=cpu`. |
-| Classifier criteria come back `status: "error"` naming the detector | The classifier's `DETECTOR_URL` is set but the detector did not answer (refused, timed out after `DETECTOR_TIMEOUT_S`, a `503` while the model loads). Only the criteria that asked the detector fail, and the job is `complete: false` — there is no silent fall-through to the LLM ([API.md § The detector](../classifier/API.md#the-detector)). With `DETECTOR_URL` empty a `detector` criterion is refused at submit instead. |
+| Classifier criteria come back `status: "error"` naming the detector | The classifier's `DETECTOR_URL` is set but the detector did not answer (refused — also while the model loads at startup —, timed out after `DETECTOR_TIMEOUT_S`, a `503` after a failed model load). Only the criteria that asked the detector fail, and the job is `complete: false` — there is no silent fall-through to the LLM ([API.md § The detector](../classifier/API.md#the-detector)). With `DETECTOR_URL` empty a `detector` criterion is refused at submit instead. |
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`DETECTOR_SCHEMAS.md`](DETECTOR_SCHEMAS.md), generated from [`detector.schemas.json`](detector.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

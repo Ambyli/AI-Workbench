@@ -104,18 +104,15 @@ docker run --rm --network ai_shared curlimages/curl \
 
 ### Updating the image
 
-The image tag is pinned in `ai/searxng/docker-compose.searxng.yml`:
+The image is **not** pinned: `ai/searxng/docker-compose.searxng.yml` uses upstream's rolling tag,
 
 ```yaml
 image: docker.io/searxng/searxng:latest
 ```
 
-To bump to a specific release, pick a tag from <https://hub.docker.com/r/searxng/searxng/tags>, edit that line, then:
+and `make up` never re-pulls a cached `latest` (compose pulls only a missing image), so the box runs whichever `latest` it pulled last. Refresh it with `docker compose -f ai/searxng/docker-compose.searxng.yml --env-file .env -p ai-searxng pull searxng`, then `make up searxng`.
 
-```bash
-make build searxng
-make down searxng && make up searxng
-```
+To pin a release instead, pick a tag from <https://hub.docker.com/r/searxng/searxng/tags>, put it on that line, then `make up searxng` (a swap deploy: the new copy starts beside the old one).
 
 ### Troubleshooting: fetch_url / search hangs
 
@@ -131,4 +128,10 @@ These are two separate failures that happen to correlate:
 - SearXNG doesn't need a GPU or any secrets besides `SEARXNG_SECRET`. It's stateless — every query fans out to upstream engines fresh.
 - It's not on the LiteLLM fan-out. Models never call SearXNG directly; Open WebUI enriches the prompt with search results server-side before dispatching to LiteLLM.
 - If public search engines start rate-limiting your egress IP, individual engines can be disabled in `settings.yml` under `engines:` — see the [upstream engine list](https://docs.searxng.org/user/configured_engines.html). `duckduckgo` already is, per the troubleshooting note above.
-- Wider infrastructure map: [`AI_INFRA.md`](AI_INFRA.md).
+- Wider infrastructure map: [`AI_INFRA.md`](../AI_INFRA.md).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`SEARXNG_SCHEMAS.md`](SEARXNG_SCHEMAS.md), generated from [`searxng.schemas.json`](searxng.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

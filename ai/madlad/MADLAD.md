@@ -46,6 +46,8 @@ curl -X POST http://localhost:8008/translate \
 
 Source language is auto-detected — no need to specify it.
 
+**Errors.** An unknown `target_lang` is `madlad-app`'s `400` `{"detail": "Unknown target_lang '<code>'. Use /languages to list supported codes."}`, and `madlad-api` passes any `madlad-app` 4xx through with its status and `detail`. A body that is not JSON, or one missing `text` / `target_lang`, is FastAPI's `422` (`json_invalid` / `missing`). `madlad-app` unreachable, timing out or answering a 5xx (a model that produced nothing is its 500) is a `502` `{"detail": "Cannot reach madlad-app: …"}`. The `translate` MCP tool never raises: it returns `Error translating: <madlad-app's detail>` for an unknown `target_lang`, `Error translating: <httpx error>` otherwise. Tests: `unit-tests/madlad` (no model needed).
+
 ### Dependencies
 
 | Variable | Default | Purpose |
@@ -198,3 +200,9 @@ Codes follow ISO 639-1 where available (e.g. `en`, `es`, `fr`, `de`, `ja`, `zh`,
 ### License note
 
 MADLAD-400 checkpoints on HuggingFace are released by Google under the **Apache 2.0** license — commercial use is permitted with no restrictions on output. This is the reason MADLAD was chosen over Aya Expanse (CC-BY-NC, non-commercial) and NLLB (CC-BY-NC).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`MADLAD_SCHEMAS.md`](MADLAD_SCHEMAS.md), generated from [`madlad.schemas.json`](madlad.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

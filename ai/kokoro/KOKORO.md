@@ -36,6 +36,10 @@ curl -X POST "http://localhost:8004/generate?text=Hello+world&voice=af_heart" \
 
 The response is a WAV file. The default voice is `af_heart` if `voice` is omitted.
 
+**Errors.** An unknown voice is `kokoro-app`'s `400` `{"detail": "Unknown voice '<voice>'. Available: [...]"}`, and `kokoro-api` passes any `kokoro-app` 4xx through with its status and `detail` (on `/generate`, `/v1/audio/speech`, `/voices`, `/languages`). `kokoro-app` unreachable, timing out or answering a 5xx is a `502` `{"detail": "Cannot reach kokoro-app: …"}`.
+
+**The `text_to_speech` MCP tool** writes the WAV under kokoro-api's `audio/` directory and returns `${AUDIO_BASE_URL}/audio/<12 hex>.wav` (served by `GET /audio/{filename}`); the same text and voice return the same URL. A link works for at least `AUDIO_MAX_AGE_SECONDS` (a day, a constant in `api/kokoro_server.py`) unless kokoro-api restarts: each save deletes WAVs older than that (a WAV handed out again gets a fresh age), and startup — the app's lifespan, which wraps the MCP app's own — clears the directory, so a restart or a `make up kokoro` swap 404s earlier links. Errors come back as text, not a tool error: `Error generating audio: <kokoro-app's detail>` for an unknown voice, `Error generating audio: <httpx error>` when kokoro-app is unreachable or fails.
+
 ### Dependencies
 
 | Variable | Default | Purpose |
@@ -120,7 +124,7 @@ curl http://localhost:4001/v1/audio/speech \
 
 Kokoro voice names (e.g. `af_heart`) can also be passed directly and will be used as-is.
 
-> **Note:** Kokoro only produces WAV output. The `response_format` field is accepted but ignored — the response is always `audio/wav`.
+> **Note:** Kokoro only produces WAV output. The `response_format` field is accepted but ignored — kokoro-api always answers WAV bytes with `Content-Type: audio/wav`. **Through LiteLLM the same WAV bytes arrive labelled `audio/mpeg`**: LiteLLM's proxy (`proxy_server.py`, its `/v1/audio/speech` handler) sets that type for every TTS model whose name is not a Gemini TTS one, whatever the upstream sent. Save the response as `.wav` (as above) and go by the bytes (`RIFF…WAVE`), not the header.
 
 ### Open WebUI integration
 
@@ -179,3 +183,9 @@ curl -X POST "http://localhost:8004/generate?text=%E3%83%8F%E3%83%AD%E3%83%BC&vo
 Note that OpenAI voice aliases (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`) always map to English voices. To speak another language via `/v1/audio/speech`, pass a Kokoro voice name in the `voice` field.
 
 Japanese and Mandarin use extra G2P dependencies (`misaki[ja]`, `misaki[zh]`), which are installed as part of `kokoro-app`.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`KOKORO_SCHEMAS.md`](KOKORO_SCHEMAS.md), generated from [`kokoro.schemas.json`](kokoro.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

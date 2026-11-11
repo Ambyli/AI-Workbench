@@ -13,6 +13,7 @@ llama.cpp `llama-server` instances, one per service: `glm5.2` (GPU + RAM expert 
 - `glm5.3-flash` `--n-predict`, LiteLLM's `max_tokens` / `max_output_tokens` and `max_input_tokens` change together (recreate both); see `LLAMA.md § glm5.3-flash`.
 - `qwen3.8-flash` shares `ai/jinja/qwen_fixed_chat_template.jinja` with vLLM `qwen3.8` — patch the template once, recreate both.
 - Editing a `command:` block needs a recreate (`make up llama <svc>`); `llama_data` must stay mounted at `/root/.cache/huggingface`. A new service needs a `PORT_*` in the PORT REGISTRY and a line in the Makefile's `llama` stack.
+- **An image-tag bump re-checks `llama.schemas.json`** (an open subset of the upstream API) against the new release (root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

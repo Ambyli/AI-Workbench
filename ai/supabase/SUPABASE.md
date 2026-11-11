@@ -334,3 +334,9 @@ requests with the gateway base URL and keys as collection variables.
 | Renaming a data-plane service key | `volumes/api/envoy/cds.yaml` addresses them by name — the gateway 503s that route |
 | Deleting `supabase_db_config` but keeping `supabase_db_data` | Loses the pgsodium decryption key the image seeded; encrypted columns become unreadable |
 | Editing the compose file instead of `.env` | The compose file is a pure `${SUPABASE_*}` template by design |
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`SUPABASE_SCHEMAS.md`](SUPABASE_SCHEMAS.md), generated from [`supabase.schemas.json`](supabase.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

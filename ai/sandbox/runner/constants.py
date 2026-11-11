@@ -29,7 +29,8 @@ regression.
 
 - Env-derived — SANDBOX_*, LOG_DIR, DEBUG_LOGGING. Overridable in ``.env``.
 - Payload limits — file/payload caps used by the pydantic validators.
-- Validation regexes / reserved sets — SESSION_ID_RE, RESERVED_ENV_KEYS.
+- Validation regexes / reserved sets — SESSION_ID_RE, CHAT_ID_RE, TTL_SECONDS_MIN,
+  RESERVED_ENV_KEYS.
 - Read-file limits — GET_FILES_*, READ_FILE_*.
 - Edit / write-guard — EDIT_*, WRITE_GUARD_*.
 - Exec limits — EXEC_*.
@@ -105,17 +106,18 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # and the runner refuses to spawn a SECOND container for a chat that already
 # has a live one — it returns the existing session instead. Widened past
 # SESSION_ID_RE to accept the id shapes real chat frontends mint: Open WebUI
-# uses UUIDs (with dots in some builds), so ``.`` and up to 128 chars are
-# allowed. Still validated (not free text) because the id lands in SQL
-# (parameterized) and log lines.
-CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-
-# Chat / conversation identifiers come from the host UI (OpenWebUI chat
-# ids are UUID-ish; other clients may send opaque tokens). Permissive on
-# characters but bounded, and it lands in a JSONB metadata column plus
-# log lines — never a path or URL — so the regex is about hygiene, not
-# injection.
+# uses UUIDs (with dots in some builds), other clients opaque tokens (``:``,
+# ``@``), up to 128 chars. Permissive on characters but bounded: the id lands
+# in a JSONB metadata column (parameterized SQL) and log lines — never a path
+# or URL — so the regex is about hygiene, not injection. Validator messages
+# quote CHAT_ID_RE.pattern, so they cannot drift from it.
 CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
+
+# The smallest ``ttl_seconds`` VALUE a request may send (models.py): a
+# negative one is refused (it used to give an expires_at in the past). 0,
+# like omitted / null, means DEFAULT_TTL_S (operations: ``ttl_seconds or
+# DEFAULT_TTL_S``); a positive one is the TTL, clamped to HARD_TTL_S.
+TTL_SECONDS_MIN = 0
 
 # Env vars we refuse to accept from the caller — these are
 # runner-controlled invariants (egress proxy, log buffering) and must

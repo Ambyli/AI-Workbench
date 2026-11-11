@@ -6,10 +6,11 @@ A uv workspace monorepo, mostly **AI infrastructure** for one Ubuntu box (`zeo@1
 
 | Path | What |
 |---|---|
-| `ai/<stack>/` | One compose stack each: `docker-compose.<stack>.yml` + its guide (`<STACK>.md`, the classifier's `API.md`). Topology, ports and the flow diagram: [`ai/AI_INFRA.md`](ai/AI_INFRA.md). |
+| `ai/<stack>/` | One compose stack each: `docker-compose.<stack>.yml` + its guide (`<STACK>.md`, the classifier's `API.md`) + its Postman collection and `*.schemas.json` ([§ Postman collections](#postman-collections)). Topology, ports and the flow diagram: [`ai/AI_INFRA.md`](ai/AI_INFRA.md). |
 | `ai/jinja/` | Chat templates bind-mounted into several model servers. |
 | `shared/common/` | The `common` package every Python project imports ([§ Shared Python code](#shared-python-code-sharedcommon)). |
 | `scripts/deploy.py` | What `make up` runs ([§ Deploys](#deploys-make-up)). |
+| `scripts/api_schemas.py` | Renders the endpoint schemas into the Postman collections and each endpoint doc's generated `*_SCHEMAS.md` ([§ Postman collections](#postman-collections)). |
 | `unit-tests/<service>/`, `shared/common/tests/` | Tests ([§ Testing](#testing)). |
 | `widget/` | The tray widget (`claude_observer`); the root `config.json` is the widget's. |
 | `.env.example` | Every variable with its comment; 1:1 with the local `.env`, which differs only in values ([§ Env vars](#env-vars-and-the-port-registry)). The box's copy is its own `.env`. |
@@ -80,11 +81,11 @@ Rules:
 
 Any Python package or module a second project could plausibly want within six months — scraping / CDP / browser helpers, MCP or model clients, env + logging boilerplate, cross-cutting utilities — MUST live in `shared/common/`, not in the project dir that first needs it. Project-specific business logic stays put; the test is reusability, not size. Consumers import it through the uv workspace (`common = { workspace = true }`). New capability: `shared/common/src/common/<name>/`, public API in its `__init__.py`, tests in `shared/common/tests/`; consumers need no pyproject change unless a new external dep appears. Full descriptions: [`shared/common/CLAUDE.md`](shared/common/CLAUDE.md).
 
-`cdp_interceptor` (Chrome CDP capture) · `conversation` (reading chat histories; stdlib, mounted into LiteLLM) · `documents` (load / OCR / text-match documents) · `env` (`.env` loader) · `jobs` (job registries, Postgres work queue, progress) · `keywordmatch` (Go-RE2 keyword rules) · `logging_setup` · `logprobs` (a JSON integer field's distribution from token logprobs; stdlib) · `net` (SSRF guard, `fetch_url`, locality check) · `pii` (pattern PII finder) · `processed_store` (Gmail dedup) · `signals` (signals sidecar wire + client) · `textops` (Claude-Code-style file edits) · `trino` (`TrinoClient`, SELECT-only by default) · `vision` (regions, layers, `ArtifactStore`).
+`apidocs` (Postman collections and endpoint JSON Schemas: walk, render, generate, validate; stdlib, `jsonschema` in its extra) · `cdp_interceptor` (Chrome CDP capture) · `conversation` (reading chat histories; stdlib, mounted into LiteLLM) · `documents` (load / OCR / text-match documents) · `env` (`.env` loader) · `jobs` (job registries, Postgres work queue, progress) · `keywordmatch` (Go-RE2 keyword rules) · `logging_setup` · `logprobs` (a JSON integer field's distribution from token logprobs; stdlib) · `net` (SSRF guard, `fetch_url`, locality check) · `pii` (pattern PII finder) · `processed_store` (Gmail dedup) · `signals` (signals sidecar wire + client) · `textops` (Claude-Code-style file edits) · `trino` (`TrinoClient`, SELECT-only by default) · `vision` (regions, layers, `ArtifactStore`).
 
 ## Result shapes declared beside the producer
 
-Every structured result a service returns has a shape declared next to its producer (a decorator), registered under the key consumers look it up by, served by an endpoint, and checked by a test that runs the real producer (failing on an undeclared key, a missing required key or a wrong value). Adding a producer or a key updates its declaration in the same change. Today: the classifier's `@describes` / `@result_spec` (`ai/classifier/CLAUDE.md`) and route-policy's `@declares(OutputSpec)` (`ai/route-policy/CLAUDE.md`).
+Every structured result a service returns has a shape declared next to its producer (a decorator), registered under the key consumers look it up by, served by an endpoint, and checked by a test that runs the real producer (failing on an undeclared key, a missing required key or a wrong value). Adding a producer or a key updates its declaration in the same change. Today: the classifier's `@describes` / `@result_spec` (`ai/classifier/CLAUDE.md`) and route-policy's `@declares(OutputSpec)` (`ai/route-policy/CLAUDE.md`). The `detail` sub-schemas in `route-policy.schemas.json` (each vote's, from `OutputSpec`) and `classifier.schemas.json` (each criterion type's, from `ResultSpec`, and each OpenCV detector's `measurements`, from `DetectorSpec`) are generated from these declarations (§ Postman collections), so a declaration change regenerates them.
 
 ## `ai/AI_INFRA.md` stays in sync
 
@@ -92,7 +93,7 @@ When a `docker-compose.*.yml` under `ai/` is added, renamed or removed, or its s
 
 ## Postman collections
 
-Every `ai/` service with an HTTP API ships a Postman v2.1 collection beside its docs, modelled on sandbox-runner's (collection-level bearer auth on a `virtual master key` variable, a base-URL variable, one `item` per endpoint with a real body, an `MCP` subfolder for JSON-RPC).
+Every `ai/` service with an HTTP API ships a Postman v2.1 collection beside its docs, modelled on sandbox-runner's (collection-level bearer auth on a `virtual master key` variable, a base-URL variable, one `item` per endpoint with a real body, an `MCP` subfolder for JSON-RPC), and a JSON Schema for every endpoint's request and response bodies (below).
 
 | Service | Collection | Endpoints doc (same folder) |
 |---|---|---|
@@ -114,18 +115,37 @@ Every `ai/` service with an HTTP API ships a Postman v2.1 collection beside its 
 
 Open WebUI is omitted on purpose (a UI; its traffic is LiteLLM's).
 
+**Request and response schemas.**
+
+- **The file:** every endpoint in a collection (method + path; each MCP tool, keyed `MCP <tool>`, and each other JSON-RPC method) has an entry in `<collection-stem>.schemas.json` beside it. An entry holds a JSON Schema (draft 2020-12) for its request body when it takes one, and one per response status with a body: the success status, plus each error whose body is more than `{"detail": "<str>"}` (the generic error bodies are named once, in the collection's `info.description`). A non-JSON response names its content type, and SSE gets a schema per `data:` payload. A status that answers more than one content type (JSON, or `text/event-stream` when the request streams) lists one body per content type, as a `request` may. Format: `common.apidocs.schemas`.
+- **Our services' schemas** are exhaustive and closed (`additionalProperties: false`).
+- **Upstream servers' schemas** (vLLM, llama.cpp, LiteLLM, SearXNG, Supabase, Open Terminal) cover the fields this stack uses, are open, and carry a `$comment` naming the upstream spec and image tag. An image-tag bump re-checks them.
+- **Generated entries:** entries whose `$comment` says `generated from …` come from the code (Pydantic models, route-policy's `OutputSpec`, the classifier's `ResultSpec` / `DetectorSpec`, FastMCP tool signatures). They are rewritten by the service's `test_api_schemas.py` run with `API_SCHEMAS_UPDATE=1`; never hand-edit one.
+- **The displayed copies:** `uv run --no-sync python scripts/api_schemas.py render` copies every entry into the description of its endpoint's first Postman item (a final `#### Schemas` section; sibling items point to it) and into `<doc-stem>_SCHEMAS.md`, a generated file beside the endpoint doc (`ROUTE_POLICY.md` → `ROUTE_POLICY_SCHEMAS.md`; one `##` section per endpoint), which the doc links to from a generated `## Request and response schemas` block between `<!-- api-schemas:begin -->` / `<!-- api-schemas:end -->`. Each schema is shown with its `$ref`s inlined — unless that would exceed `INLINE_LIMIT` (64 KiB, `common.apidocs.render`; today only the classifier's two job responses): such a block keeps its `$ref`s plus a `Uses:` line naming every definition it reaches, and each of those definitions is shown once per service, in a final `## Definitions` section of the `*_SCHEMAS.md` (`### <name>`, anchored `def-<name>`, which `Uses:` links to) and a final `#### Schema definitions` section of the collection's `info.description`. Never edit any of these copies.
+
 **Keep them in sync with the code.** An endpoint added, renamed or removed, or a change to its request / response shape, path or query params, auth or headers, updates its collection in the SAME change:
-1. Add / update / remove the `item` (or its `MCP` subfolder); `url.path`, `method`, `header`, `body.raw` match the code exactly (valid JSON for the current Pydantic model).
+1. Add / update / remove the `item` (or its `MCP` subfolder); `url.path`, `method`, `header`, `body.raw` match the code exactly (valid JSON for the current Pydantic model), and update the endpoint's entry in `<collection-stem>.schemas.json`, then run `scripts/api_schemas.py render`.
 2. **Path parameters use `:name`, never `{{name}}`**, in both `url.raw` and `url.path`, with a `url.variable` entry per parameter (`{"key", "value": "", "description"}`) and a matching top-level collection `variable` as the default. The leading host variable (`{{litellm}}`, `{{kokoro}}`, …) is the only `{{…}}` allowed in `url.raw`; headers, bodies, query values and auth may use `{{…}}`.
 3. The `description` says what it does, returns and which errors it can give, naming its doc section.
 4. A new variable gets a top-level `variable` with a `description`; a routing change updates the base-URL variable and `info.description`'s auth note.
-5. A new HTTP service gets `{service}.postman_collection.json` beside its docs and a row above.
+5. A new HTTP service gets `{service}.postman_collection.json` and `{service}.schemas.json` beside its docs, and a row above.
 
-The `*.md` endpoint doc and the collection must agree; when they don't, the code is authoritative and both are corrected.
+The `*.md` endpoint doc, the collection and the schemas file must agree; when they don't, the code is authoritative and all are corrected.
+
+**Tests.**
+
+- `unit-tests/apidocs/` checks every collection against its schemas file:
+  - an entry for every endpoint and none extra;
+  - valid draft-2020-12 schemas, and in our services `additionalProperties` stated on every object;
+  - every request body in the collection validates (items in an entry's `invalid_examples` must fail);
+  - the rendered copies are current, and the collection is in the canonical JSON form (`scripts/api_schemas.py normalise`).
+- Each service's `test_api_schemas.py`:
+  - checks its generated entries are current;
+  - validates real responses from its in-process harness against the schemas.
 
 ## Testing
 
-- Layout: `unit-tests/<service>/` per service and `shared/common/tests/`. No `make test`; one shared workspace `.venv`.
+- Layout: `unit-tests/<service>/` per service and `shared/common/tests/`; `unit-tests/apidocs` (every collection against its schemas, § Postman collections) runs in its own process like the rest. No `make test`; one shared workspace `.venv`.
 - Run each suite in **its own pytest process** (`unit-tests/classifier` and `unit-tests/detector` both ship a top-level `config.py`): `UV_LINK_MODE=copy uv run --no-sync python -m pytest unit-tests/<suite> -q -p no:cacheprovider`; the classifier / detector suites add `--with pytest --package classifier|detector`. Per-suite commands: each stack's guide and CLAUDE.md.
 - Postgres-backed tests (classifier, route-policy, `common.jobs`) **skip** without `TEST_POSTGRES_DSN` — an admin DSN on which each session creates and drops its own database. A run that skipped them has not passed.
 - Never `uv sync --package X` (it prunes the shared venv); use `--no-sync`. `UV_LINK_MODE=copy` fixes hardlink errors.

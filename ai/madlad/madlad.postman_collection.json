@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "madlad",
-    "description": "MADLAD-400 translation service (madlad-api), called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/madlad` → `http://madlad-api:8000`, `include_subpath: true`, methods GET+POST, headers forwarded). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth.\n\nDirect access: if you don't want to go through LiteLLM, override the URL of individual requests to `{{madlad}}` — that variable points at madlad-api's host-published port (default localhost:8008 via PORT_MADLAD_API). The direct path is unauthenticated by default; the /v1/madlad LiteLLM path is authenticated by the virtual key. See ai/madlad/MADLAD.md for the operator guide and ai/litellm/LITELLM.md for issuing virtual keys.\n\nEndpoints: GET /languages (list ~400 supported target codes), POST /translate (auto-detect source, translate to target), GET /health (liveness), plus MCP JSON-RPC at /mcp/ exposing the `translate` tool. Note the request body uses `target_lang` — source language is auto-detected, there is no `src` field.",
+    "description": "MADLAD-400 translation service (madlad-api), called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/madlad` → `http://madlad-api:8000`, `include_subpath: true`, methods GET+POST, headers forwarded). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth.\n\nDirect access: if you don't want to go through LiteLLM, override the URL of individual requests to `{{madlad}}` — that variable points at madlad-api's host-published port (default localhost:8008 via PORT_MADLAD_API). The direct path is unauthenticated by default; the /v1/madlad LiteLLM path is authenticated by the virtual key. See ai/madlad/MADLAD.md for the operator guide and ai/litellm/LITELLM.md for issuing virtual keys.\n\nEndpoints: GET /languages (list ~400 supported target codes), POST /translate (auto-detect source, translate to target), GET /health (liveness), plus MCP JSON-RPC at /mcp/ exposing the `translate` tool. Note the request body uses `target_lang` — source language is auto-detected, there is no `src` field.\n\n**Error bodies.** Each endpoint's `#### Schemas` section -- at the end of its first request's description, generated from `madlad.schemas.json` by `scripts/api_schemas.py render` -- documents its request body, its success response and every error status whose body is more than FastAPI's `{\"detail\": \"<message>\"}`. Any other error answers that `{\"detail\": \"<message>\"}`; a request that fails FastAPI's own validation answers 422 `{\"detail\": [{\"type\", \"loc\", \"msg\", \"input\", ...}]}`, one entry per problem. A request sent through LiteLLM (`{{litellm}}`) can also be refused by LiteLLM itself before it reaches the service -- 401 / 403 for a missing or unauthorised key -- with LiteLLM's `{\"error\": {\"message\", \"type\", \"param\", \"code\"}}`.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "madlad-collection"
   },
@@ -49,10 +49,16 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/madlad/health",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "madlad", "health"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "madlad",
+            "health"
+          ]
         },
-        "description": "Liveness probe on madlad-api (the proxy container). Returns {\"status\": \"ok\"} once the FastAPI app has started — does NOT verify madlad-app (the inference container) is reachable, since the model is lazy-loaded on the first /translate or /languages call. Docker's own healthcheck for madlad-api polls this endpoint. See MADLAD.md § Health check."
+        "description": "Liveness probe on madlad-api (the proxy container). Returns {\"status\": \"ok\"} once the FastAPI app has started — does NOT verify madlad-app (the inference container) is reachable, since the model is lazy-loaded on the first /translate or /languages call. Docker's own healthcheck for madlad-api polls this endpoint. See MADLAD.md § Health check.\n\n#### Schemas\n\nResponse `200` (`application/json`) — madlad-api is up; madlad-app is not checked:\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\"status\"],\n  \"properties\": {\n    \"status\": {\"const\": \"ok\"}\n  }\n}\n```"
       },
       "response": []
     },
@@ -63,10 +69,16 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/madlad/languages",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "madlad", "languages"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "madlad",
+            "languages"
+          ]
         },
-        "description": "List the ~400 target languages MADLAD-400 supports. Response shape: {\"languages\": [{\"code\": \"af\", \"name\": \"Afrikaans\"}, {\"code\": \"am\", \"name\": \"Amharic\"}, …]}. Codes are ISO 639-1 where available, ISO 639-3 for low-resource languages, occasionally with a regional suffix (e.g. `zh_CN`). Names are resolved via the `langcodes` library. Use a returned `code` as `target_lang` in POST /translate.\n\nFirst call after container start triggers the lazy model download (~1-3 min for the ~3 GB CT2 checkpoint). Subsequent calls are instant. Proxied to madlad-app's /languages inside the ai_shared network; returns 502 with `Cannot reach madlad-app: …` if the inference container is down. See MADLAD.md § Supported languages."
+        "description": "List the ~400 target languages MADLAD-400 supports. Response shape: {\"languages\": [{\"code\": \"af\", \"name\": \"Afrikaans\"}, {\"code\": \"am\", \"name\": \"Amharic\"}, …]}. Codes are ISO 639-1 where available, ISO 639-3 for low-resource languages, occasionally with a regional suffix (e.g. `zh_CN`). Names are resolved via the `langcodes` library. Use a returned `code` as `target_lang` in POST /translate.\n\nFirst call after container start triggers the lazy model download (~1-3 min for the ~3 GB CT2 checkpoint). Subsequent calls are instant. Proxied to madlad-app's /languages inside the ai_shared network; returns 502 with `Cannot reach madlad-app: …` if the inference container is down or fails (5xx); a 4xx of its own is passed through with its status and `detail`. See MADLAD.md § Supported languages.\n\n#### Schemas\n\nmadlad-app's body, passed through. A 4xx of madlad-app's is passed through with its status and `detail`; madlad-app unreachable or a 5xx of its own is a 502 `{\"detail\": \"Cannot reach madlad-app: …\"}`.\n\nResponse `200` (`application/json`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\"languages\"],\n  \"properties\": {\n    \"languages\": {\n      \"type\": \"array\",\n      \"description\": \"Every target language the checkpoint's tokenizer has a `<2xx>` token for, sorted by code\",\n      \"items\": {\n        \"type\": \"object\",\n        \"additionalProperties\": false,\n        \"required\": [\"code\", \"name\"],\n        \"properties\": {\n          \"code\": {\n            \"type\": \"string\",\n            \"pattern\": \"^[a-z]{2,3}(?:_[A-Za-z]+)?$\",\n            \"description\": \"Used as `target_lang` in /translate. ISO 639-1 where available, otherwise ISO 639-3, occasionally with a regional suffix (e.g. `zh_CN`)\"\n          },\n          \"name\": {\n            \"type\": \"string\",\n            \"description\": \"Resolved via the `langcodes` library; an unknown code falls back to the code itself\"\n          }\n        }\n      }\n    }\n  }\n}\n```"
       },
       "response": []
     },
@@ -75,19 +87,32 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"text\": \"Good morning\",\n  \"target_lang\": \"ja\"\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{litellm}}/v1/madlad/translate",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "madlad", "translate"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "madlad",
+            "translate"
+          ]
         },
-        "description": "Translate a single string. Body: {\"text\": string, \"target_lang\": string}. Source language is auto-detected by MADLAD — there is no `src` field. `target_lang` must be one of the codes returned by GET /languages (ISO 639-1 preferred, e.g. `es`, `fr`, `ja`, `zh`, `de`, `pt`, `ar`, `hi`, `ko`).\n\nResponse shape: {\"translated\": \"<string>\"}. First call after container start triggers the ~1-3 min lazy load. Steady-state latency is dominated by the model forward pass; the beam-search + repetition guards default to ~3-4× a greedy decode (see MADLAD.md § Decoding parameters for the current beam_size=4 / repetition_penalty=1.1 / no_repeat_ngram_size=3 / max_decoding_length=1024 defaults and when to tune).\n\nErrors: 400 for malformed JSON, 422 for missing fields, 502 with `Cannot reach madlad-app: …` if the inference container is unreachable. See MADLAD.md § Usage."
+        "description": "Translate a single string. Body: {\"text\": string, \"target_lang\": string}. Source language is auto-detected by MADLAD — there is no `src` field. `target_lang` must be one of the codes returned by GET /languages (ISO 639-1 preferred, e.g. `es`, `fr`, `ja`, `zh`, `de`, `pt`, `ar`, `hi`, `ko`).\n\nResponse shape: {\"translated\": \"<string>\"}. First call after container start triggers the ~1-3 min lazy load. Steady-state latency is dominated by the model forward pass; the beam-search + repetition guards default to ~3-4× a greedy decode (see MADLAD.md § Decoding parameters for the current beam_size=4 / repetition_penalty=1.1 / no_repeat_ngram_size=3 / max_decoding_length=1024 defaults and when to tune).\n\nErrors: 400 for an unknown `target_lang` (madlad-app's own `Unknown target_lang '<code>'. Use /languages to list supported codes.`, passed through); 422 (FastAPI's) for a body that is not JSON (`json_invalid`) or a missing field; 502 with `Cannot reach madlad-app: …` if the inference container is unreachable or fails (5xx). See MADLAD.md § Usage.\n\n#### Schemas\n\nmadlad-app's body, passed through. An unknown `target_lang` is madlad-app's 400 `{\"detail\": \"Unknown target_lang '<code>'. Use /languages to list supported codes.\"}`, passed through with that status and detail (any madlad-app 4xx is); madlad-app unreachable or a 5xx -- a model that produced nothing is its 500 -- is a 502 `{\"detail\": \"Cannot reach madlad-app: …\"}`. A body that is not JSON is FastAPI's 422 (`json_invalid`), as is a missing field.\n\nRequest body (`application/json`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"required\": [\"text\", \"target_lang\"],\n  \"properties\": {\n    \"text\": {\n      \"type\": \"string\",\n      \"description\": \"Source language is auto-detected; there is no `src` field\"\n    },\n    \"target_lang\": {\"type\": \"string\", \"description\": \"One of the codes GET /languages returns\"}\n  }\n}\n```\n\nResponse `200` (`application/json`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\"translated\"],\n  \"properties\": {\n    \"translated\": {\"type\": \"string\"}\n  }\n}\n```"
       },
       "response": []
     },
@@ -100,20 +125,37 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/madlad/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "madlad", "mcp", ""]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "madlad",
+                "mcp",
+                ""
+              ]
             },
-            "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable. Response body is a JSON-RPC result advertising FastMCP's server info + capabilities."
+            "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable. Response body is a JSON-RPC result advertising FastMCP's server info + capabilities.\n\n#### Schemas\n\nThe JSON-RPC response's `result` (streamable HTTP at `/mcp/`: one SSE `data:` message when the request accepts `text/event-stream`); the `mcp-session-id` response header names the session the later calls send back.\n\nParams (`params`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"$comment\": \"mcp.types.InitializeRequestParams: the SDK allows extra keys\",\n  \"required\": [\"protocolVersion\", \"capabilities\", \"clientInfo\"],\n  \"properties\": {\n    \"protocolVersion\": {\n      \"type\": \"string\",\n      \"description\": \"The latest version of the Model Context Protocol that the client supports\"\n    },\n    \"capabilities\": {\"type\": \"object\", \"additionalProperties\": true},\n    \"clientInfo\": {\n      \"type\": \"object\",\n      \"additionalProperties\": true,\n      \"required\": [\"name\", \"version\"],\n      \"properties\": {\n        \"name\": {\"type\": \"string\"},\n        \"version\": {\"type\": \"string\"}\n      }\n    }\n  }\n}\n```\n\nResult (`result`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"$comment\": \"mcp.types.InitializeResult: the SDK allows extra keys\",\n  \"required\": [\"protocolVersion\", \"capabilities\", \"serverInfo\"],\n  \"properties\": {\n    \"protocolVersion\": {\n      \"type\": \"string\",\n      \"description\": \"The version of the Model Context Protocol that the server wants to use; it may not match the version the client requested\"\n    },\n    \"capabilities\": {\n      \"type\": \"object\",\n      \"additionalProperties\": true,\n      \"required\": [\"tools\"],\n      \"description\": \"What the server supports (`mcp.types.ServerCapabilities`); FastMCP announces `tools`, `prompts`, `resources` and `logging`\"\n    },\n    \"serverInfo\": {\n      \"type\": \"object\",\n      \"additionalProperties\": true,\n      \"required\": [\"name\", \"version\"],\n      \"properties\": {\n        \"name\": {\"const\": \"MADLAD Translation\"},\n        \"version\": {\"type\": \"string\", \"description\": \"The version FastMCP reports\"}\n      }\n    },\n    \"instructions\": {\"type\": \"string\"}\n  }\n}\n```"
           },
           "response": []
         },
@@ -122,21 +164,41 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/madlad/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "madlad", "mcp", ""]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "madlad",
+                "mcp",
+                ""
+              ]
             },
-            "description": "Enumerate available tools. madlad-api exposes exactly one: `translate(text: str, target_lang: str) -> str`. `text` is the source (any language, auto-detected); `target_lang` is an ISO 639-1 code (see GET /languages). Returns the translated string, or an `Error translating: …` string on upstream failure (the MCP tool does not raise — it swallows the httpx error into the return value)."
+            "description": "Enumerate available tools. madlad-api exposes exactly one: `translate(text: str, target_lang: str) -> str`. `text` is the source (any language, auto-detected); `target_lang` is an ISO 639-1 code (see GET /languages). Returns the translated string, or an `Error translating: …` string on upstream failure — madlad-app's own message for an unknown `target_lang`, the httpx error when madlad-app is unreachable or fails (the MCP tool does not raise; the error is the return value).\n\n#### Schemas\n\nThe JSON-RPC response's `result` (one SSE `data:` message).\n\nParams (`params`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"$comment\": \"mcp.types.PaginatedRequestParams\",\n  \"properties\": {\n    \"cursor\": {\n      \"type\": \"string\",\n      \"description\": \"An opaque token representing the current pagination position\"\n    }\n  }\n}\n```\n\nResult (`result`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": true,\n  \"$comment\": \"mcp.types.ListToolsResult: the SDK allows extra keys\",\n  \"required\": [\"tools\"],\n  \"properties\": {\n    \"tools\": {\n      \"type\": \"array\",\n      \"minItems\": 1,\n      \"maxItems\": 1,\n      \"items\": {\n        \"type\": \"object\",\n        \"additionalProperties\": true,\n        \"$comment\": \"mcp.types.Tool: the SDK allows extra keys\",\n        \"required\": [\"name\", \"inputSchema\"],\n        \"properties\": {\n          \"name\": {\"const\": \"translate\"},\n          \"description\": {\n            \"type\": \"string\",\n            \"description\": \"The tool's docstring summary: what the model reads\"\n          },\n          \"inputSchema\": {\n            \"type\": \"object\",\n            \"additionalProperties\": true,\n            \"description\": \"A JSON Schema: the arguments of `MCP translate`\"\n          },\n          \"outputSchema\": {\n            \"type\": \"object\",\n            \"additionalProperties\": true,\n            \"description\": \"A JSON Schema of `structuredContent`: `{\\\"result\\\": <string>}` (FastMCP wraps a `str` return)\"\n          },\n          \"_meta\": {\"type\": \"object\", \"additionalProperties\": true, \"description\": \"FastMCP's own\"}\n        }\n      }\n    },\n    \"nextCursor\": {\"type\": \"string\"}\n  }\n}\n```"
           },
           "response": []
         },
@@ -145,21 +207,41 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"translate\",\n    \"arguments\": {\n      \"text\": \"Good morning\",\n      \"target_lang\": \"ja\"\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/madlad/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "madlad", "mcp", ""]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "madlad",
+                "mcp",
+                ""
+              ]
             },
-            "description": "Invoke the `translate` tool via MCP. Result body has a text-content block containing the translated string (e.g. `おはよう` for the example). Equivalent in effect to POST /translate — same lazy-load behavior on the first call, same beam-search decoding defaults. Difference is transport: this path is what chat models routed through LiteLLM's mcp_servers.madlad_translate hit when they decide to translate mid-conversation. See MADLAD.md § LiteLLM integration for the chat-completions → tool-call round-trip pattern."
+            "description": "Invoke the `translate` tool via MCP. Result body has a text-content block containing the translated string (e.g. `おはよう` for the example). Equivalent in effect to POST /translate — same lazy-load behavior on the first call, same beam-search decoding defaults. Difference is transport: this path is what chat models routed through LiteLLM's mcp_servers.madlad_translate hit when they decide to translate mid-conversation. See MADLAD.md § LiteLLM integration for the chat-completions → tool-call round-trip pattern.\n\n#### Schemas\n\nThe JSON-RPC response's `result.structuredContent` (one SSE `data:` message); `result.content[0].text` carries the same string. A madlad-app failure is not a tool error: it comes back as the string.\n\nArguments (`params.arguments` of `tools/call`):\n\n```json\n{\n  \"type\": \"object\",\n  \"$comment\": \"translate(text: str, target_lang: str) as FastMCP 3.4.5 lists it (it closes a tool's arguments)\",\n  \"additionalProperties\": false,\n  \"required\": [\"text\", \"target_lang\"],\n  \"properties\": {\n    \"text\": {\"type\": \"string\", \"description\": \"The source text. Source language is auto-detected.\"},\n    \"target_lang\": {\n      \"type\": \"string\",\n      \"description\": \"ISO 639-1 language code (e.g. \\\"es\\\", \\\"fr\\\", \\\"ja\\\", \\\"zh\\\").\\nCall the /languages endpoint for the full list of supported codes.\"\n    }\n  }\n}\n```\n\nResult (`result.structuredContent`):\n\n```json\n{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\"result\"],\n  \"properties\": {\n    \"result\": {\n      \"type\": \"string\",\n      \"description\": \"The translated text; `Error translating: <madlad-app's detail>` for a 4xx of madlad-app's (an unknown target_lang); `Error translating: <httpx error>` when madlad-app cannot be reached or answers a 5xx. FastMCP wraps a `str` return as `{\\\"result\\\": …}`\"\n    }\n  }\n}\n```"
           },
           "response": []
         }

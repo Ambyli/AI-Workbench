@@ -131,6 +131,7 @@ repo), phases 2–6.
 - [Operations](#operations)
 - [Code layout](#code-layout)
 - [Tests](#tests)
+- [Request and response schemas](#request-and-response-schemas) (generated)
 
 ## How it fits
 
@@ -2089,6 +2090,7 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
 | `test_analysis_queue.py` | Dedupe, overflow, skip-if-stored, the written row (scores by route, winner's reason, usage, provenance; failures with no scores), write failures, shutdown (waiting dropped, running cancelled and still deleted) |
 | `test_shadows.py` | Resolving shadows, skipped unloadable ones, derived ids, the primary response unchanged by a shadow, the shadow row and its evaluations, idempotency, provenance of analysis requests, a primary with an `llm_classifier`, isolation (a raising shadow, a hung database, the task cap), `/evaluate` reading without enqueueing |
 | `test_db.py` (`postgres`) | Startup, seeding (with shadow slots), immutability, migrations (0003 on a phase-4 database with rows), the phase-2 → phase-3 and phase-4 → `default@3` upgrades (a turn pinned across the deploy), idempotent `/decide` / `/observe` in either order, shadow rows and both views (the 0003 columns), the `analyses` table (first write wins, caps, the CHECK), the whole classifier loop on a fake classifier (job deleted, verdict voted next turn, no text stored), one classification per turn, the turn lookup on real rows (each shadow pinned from its own rows), the startup warm-up and a shadow's signals call on a fake sidecar, an edit making a verdict unreachable, a stored draft compiling like its file, the reads |
+| `test_api_schemas.py` | `route-policy.schemas.json` against the code: the generated schemas current (request models, the ruleset document, each type's vote `detail`; `API_SCHEMAS_UPDATE=1` rewrites them), and real responses of every endpoint valid -- the app with no database, the tables in memory behind a fake connection answering the real SQL's columns, every `test_declarations.py` outcome against its type's sub-schema, every declared status produced; the reads once more on Postgres (`postgres`) |
 | `test_wiring.py` | Postman coverage (a `default-signals` dry run included), compose classes and env (the signals settings), Trino env, pass-through, Makefile, Dockerfile (bench shipped and imported), line endings |
 | `bench/` | The benchmark's pure parts ([`bench/BENCH.md`](bench/BENCH.md)) |
 
@@ -2097,3 +2099,9 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
   database. Without it they skip.
 - **For a scratch server on Windows,** use the EDB binaries zip:
   `initdb -U postgres --auth=trust`, then `pg_ctl -o "-p 55441" start`.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`ROUTE_POLICY_SCHEMAS.md`](ROUTE_POLICY_SCHEMAS.md), generated from [`route-policy.schemas.json`](route-policy.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

@@ -14,7 +14,7 @@ Runs untrusted, model-generated web apps (Streamlit, Gradio, Flask, FastAPI, Vit
 - **Sessions + idle TTL.** `create` / `run` return a `session_id`; passing it back reuses the container. The reaper enforces `SANDBOX_HARD_TTL_SECONDS` and `SANDBOX_IDLE_TTL_SECONDS` (via `metadata->>'last_used_at'`, bumped on every reuse call). Teardown: `close`, `DELETE /session/{id}`, `DELETE /jobs/{id}`.
 - **Env passed to a sandbox is immutable after spawn**; runner-controlled keys (`HTTP_PROXY`, `HTTPS_PROXY`, `PYTHONUNBUFFERED`, …) are refused and re-applied by the spawner.
 - **Classes:** `sandbox-proxy`, `sandbox-egress` swap; `sandbox-runner` recreate (slot semaphore, reaper), `sandbox-db` recreate. Use `make exec sandbox sandbox-proxy CMD='…'` for swap containers.
-- API shape changes update `sandbox-runner.postman_collection.json` and `ENDPOINTS.md` in the same change (root `CLAUDE.md` § Postman collections).
+- API shape changes update `sandbox-runner.postman_collection.json`, `sandbox-runner.schemas.json` and `ENDPOINTS.md` in the same change (`scripts/api_schemas.py render` writes the schemas into the collection and the generated `ENDPOINTS_SCHEMAS.md`; root `CLAUDE.md` § Postman collections). The request models, `RunResponse`, the shared jobs models and the MCP tools' arguments are generated — `API_SCHEMAS_UPDATE=1` on `unit-tests/sandbox/test_api_schemas.py` rewrites them; the rest is hand-written and closed (each structured `detail`, each MCP tool's payload and the details its operation can raise), and that test validates real responses (the real `Spawner` over `sandbox_fakes`' Docker client, the job table in memory behind a pool that answers the runner's own SELECTs, `/jobs` through `build_router`, MCP through an in-memory `fastmcp.Client`). A new `detail` shape or a `_do_*` key updates the schema in the same change.
 
 ## Cross-folder rules
 
@@ -32,7 +32,7 @@ Also in the root `CLAUDE.md` § Cross-folder rules — read the named entry ther
 One line each; full detail in `.env.example` (`SANDBOX_*` block) and `SANDBOX.md § Configuration`.
 
 - `SANDBOX_MAX_CONCURRENT` (`8`) — running sandboxes at once; `429` past it. ~512 MB RAM + 1 CPU each.
-- `SANDBOX_DEFAULT_TTL_SECONDS` (`900`) — default idle TTL; a model may ask shorter, never past the hard TTL.
+- `SANDBOX_DEFAULT_TTL_SECONDS` (`900`) — default idle TTL; a model may ask shorter (`ttl_seconds` 0 / omitted = this default, negative refused — `TTL_SECONDS_MIN`), never past the hard TTL.
 - `SANDBOX_IDLE_TTL_SECONDS` (empty — inherits the default TTL) — reaper's idle threshold on `last_used_at`; keep it ≤ the hard TTL.
 - `SANDBOX_HARD_TTL_SECONDS` (`3600`) — absolute lifetime; reaper sweeps every 60 s.
 - `SANDBOX_EGRESS_ALLOWLIST` (empty) — additive to `tinyproxy.filter`; prefer the filter file.

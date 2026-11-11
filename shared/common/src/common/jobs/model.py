@@ -21,7 +21,9 @@ class JobBase(BaseModel):
     Fields:
         job_id: 12-char hex identifier assigned at registration.
         phase: Freeform string; each consumer defines its own convention.
-            Interceptor-api uses ``"cloning" | "capturing" | "cleaning_up"``;
+            Interceptor-api uses ``"cloning" | "capturing" | "actions" |
+            "cleaning_up"`` (``"actions"`` while a capture's
+            ``page_script`` / ``actions`` run);
             classifier uses ``"staging" | "pending" | "processing" |
             "completed" | "failed" | "cancelled"``.
         created_at: ISO-8601 UTC timestamp when the job was registered.

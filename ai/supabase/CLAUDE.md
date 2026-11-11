@@ -15,6 +15,7 @@ A full self-hosted Supabase (Postgres 17, Envoy gateway, GoTrue, PostgREST, Real
 - **`SUPABASE_PUBLIC_URL` is the exact browser origin, no trailing slash** (Envoy CORS exact match); its port agrees with `PORT_SUPABASE_API`.
 - **LAN-facing only** — no oauth2-proxy / tunnel in front; gates are Envoy basic auth on Studio and the API keys. Public exposure is a follow-up, not an oversight.
 - **Containers:** `supabase-db`, `supabase-pooler` (key `supavisor`) and `supabase-realtime` keep fixed names (recreate-class: Postgres, migrations + TCP ports, replication slot); the rest are `supabase-<svc>-<hash>` — use `make exec|logs supabase <svc>`.
+- **An image-tag bump re-checks `supabase.schemas.json`** (an open subset of the upstream API) against the new release (root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

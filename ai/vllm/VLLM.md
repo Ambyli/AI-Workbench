@@ -260,3 +260,9 @@ Delete the corresponding service block from `ai/vllm/docker-compose.vllm.yml`, t
 docker compose -f ai/vllm/docker-compose.vllm.yml down
 docker compose -f ai/vllm/docker-compose.vllm.yml up -d
 ```
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`VLLM_SCHEMAS.md`](VLLM_SCHEMAS.md), generated from [`vllm.schemas.json`](vllm.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

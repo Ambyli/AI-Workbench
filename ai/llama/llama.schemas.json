@@ -1,0 +1,487 @@
+{
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for llama.postman_collection.json, rendered into its items' descriptions and LLAMA_SCHEMAS.md (linked from LLAMA.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render llama. An OPEN subset (additionalProperties: true) of llama.cpp's llama-server: the fields this stack and the collection use, from tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG). The OpenAI-compatible endpoints point to the subset shared with vLLM and LiteLLM (vllm.schemas.json, same_as). Checked by unit-tests/apidocs only (tier 1); an image-tag bump re-checks them (ai/llama/CLAUDE.md).",
+  "service": "llama",
+  "doc": "LLAMA.md",
+  "$defs": {
+    "llama_sampling_params": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "llama-server's sampling parameters as /props and /completion report them (README § POST /completion options); a subset",
+      "properties": {
+        "n_predict": {
+          "type": "integer",
+          "description": "-1: no limit (the server's `--n-predict` caps it)"
+        },
+        "temperature": {
+          "type": "number"
+        },
+        "top_k": {
+          "type": "integer"
+        },
+        "top_p": {
+          "type": "number"
+        },
+        "min_p": {
+          "type": "number"
+        },
+        "presence_penalty": {
+          "type": "number"
+        },
+        "repeat_penalty": {
+          "type": "number"
+        },
+        "stop": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_tokens": {
+          "type": "integer"
+        },
+        "samplers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "seed": {
+          "type": "integer"
+        }
+      }
+    },
+    "llama_timings": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "llama-server's timings object (README § Timings and context usage)",
+      "properties": {
+        "cache_n": {
+          "type": "integer",
+          "description": "Prompt tokens reused from the cache"
+        },
+        "prompt_n": {
+          "type": "integer",
+          "description": "Prompt tokens processed"
+        },
+        "prompt_ms": {
+          "type": "number"
+        },
+        "prompt_per_second": {
+          "type": "number"
+        },
+        "predicted_n": {
+          "type": "integer",
+          "description": "Tokens generated"
+        },
+        "predicted_ms": {
+          "type": "number"
+        },
+        "predicted_per_second": {
+          "type": "number"
+        }
+      }
+    }
+  },
+  "endpoints": {
+    "GET /health": {
+      "$comment": "llama-server GET /health (README § GET /health; server-context.cpp get_health): tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG).",
+      "description": "Public (no API key check); `/v1/health` answers the same.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "description": "the model has loaded",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          }
+        },
+        "503": {
+          "content_type": "application/json",
+          "description": "the model is still loading (first start: the GGUF download too)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "$comment": "llama-server's OpenAI-style error object (README § API errors)",
+            "required": [
+              "error"
+            ],
+            "properties": {
+              "error": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "code",
+                  "message",
+                  "type"
+                ],
+                "properties": {
+                  "code": {
+                    "const": 503
+                  },
+                  "message": {
+                    "const": "Loading model"
+                  },
+                  "type": {
+                    "const": "unavailable_error"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/models": {
+      "same_as": "vllm: GET /v1/models"
+    },
+    "GET /props": {
+      "$comment": "llama-server GET /props (README § GET /props; server-context.cpp get_res_props): tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "default_generation_settings",
+              "total_slots",
+              "model_path",
+              "chat_template",
+              "build_info"
+            ],
+            "properties": {
+              "default_generation_settings": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "The defaults `/completion` starts from: the launch command's sampling flags (`--temp`, `--top-p`, … `--n-predict`)",
+                "properties": {
+                  "params": {
+                    "$ref": "#/$defs/llama_sampling_params"
+                  },
+                  "n_ctx": {
+                    "type": "integer",
+                    "description": "Context per slot: `-c` / `--parallel`"
+                  }
+                }
+              },
+              "total_slots": {
+                "type": "integer",
+                "description": "`--parallel`"
+              },
+              "model_alias": {
+                "type": "string",
+                "description": "`-a`"
+              },
+              "model_path": {
+                "type": "string"
+              },
+              "modalities": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "vision": {
+                    "type": "boolean"
+                  },
+                  "audio": {
+                    "type": "boolean"
+                  },
+                  "video": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "chat_template": {
+                "type": "string",
+                "description": "The Jinja template in use (`--jinja`; `--chat-template-file` when set)"
+              },
+              "chat_template_caps": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "build_info": {
+                "type": "string",
+                "description": "`b<build>-<commit>`"
+              },
+              "is_sleeping": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/chat/completions": {
+      "same_as": "vllm: POST /v1/chat/completions"
+    },
+    "POST /v1/completions": {
+      "same_as": "vllm: POST /v1/completions"
+    },
+    "POST /completion": {
+      "$comment": "llama-server POST /completion (README § POST /completion; server-task.cpp to_json_non_oaicompat): tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG).",
+      "description": "llama.cpp's native completion: no chat template, llama.cpp's own sampler knobs. With `\"stream\": true` the body is `text/event-stream` (server-sent events, not NDJSON): each `data:` line is this object holding only `content`, `tokens`, `stop: false` and the counters, until a last one with `stop: true` and the rest.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "README § POST /completion options; a subset",
+          "required": [
+            "prompt"
+          ],
+          "properties": {
+            "prompt": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              ],
+              "description": "A string, token ids, a mix, or `{prompt_string, multimodal_data}`; a list of prompts answers a list"
+            },
+            "n_predict": {
+              "type": "integer",
+              "description": "Tokens to generate; -1: no limit"
+            },
+            "temperature": {
+              "type": "number"
+            },
+            "top_k": {
+              "type": "integer"
+            },
+            "top_p": {
+              "type": "number"
+            },
+            "min_p": {
+              "type": "number"
+            },
+            "stop": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Stop strings, not included in `content`"
+            },
+            "stream": {
+              "type": "boolean"
+            },
+            "cache_prompt": {
+              "type": "boolean",
+              "default": true
+            },
+            "grammar": {
+              "type": "string"
+            },
+            "json_schema": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "n_probs": {
+              "type": "integer"
+            },
+            "id_slot": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "content",
+              "stop"
+            ],
+            "properties": {
+              "content": {
+                "type": "string",
+                "description": "The completion (a stream: the next piece)"
+              },
+              "tokens": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "description": "Filled only with `return_tokens` or `stream`"
+              },
+              "stop": {
+                "type": "boolean",
+                "description": "true on the final object (not the request's `stop`)"
+              },
+              "model": {
+                "type": "string"
+              },
+              "stop_type": {
+                "enum": [
+                  "none",
+                  "eos",
+                  "limit",
+                  "word"
+                ]
+              },
+              "stopping_word": {
+                "type": "string"
+              },
+              "tokens_predicted": {
+                "type": "integer"
+              },
+              "tokens_evaluated": {
+                "type": "integer"
+              },
+              "tokens_cached": {
+                "type": "integer"
+              },
+              "truncated": {
+                "type": "boolean"
+              },
+              "generation_settings": {
+                "$ref": "#/$defs/llama_sampling_params"
+              },
+              "timings": {
+                "$ref": "#/$defs/llama_timings"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /tokenize": {
+      "$comment": "llama-server POST /tokenize (README § POST /tokenize; server-context.cpp post_tokenize): tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG).",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "content"
+          ],
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "add_special": {
+              "type": "boolean",
+              "default": false,
+              "description": "Insert BOS"
+            },
+            "parse_special": {
+              "type": "boolean",
+              "default": true
+            },
+            "with_pieces": {
+              "type": "boolean",
+              "default": false,
+              "description": "Return `{id, piece}` objects instead of bare ids"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "tokens"
+            ],
+            "properties": {
+              "tokens": {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "required": [
+                        "id",
+                        "piece"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        },
+                        "piece": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "array",
+                              "items": {
+                                "type": "integer"
+                              }
+                            }
+                          ],
+                          "description": "A string, or its bytes when not valid UTF-8"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "description": "Ids, or `{id, piece}` with `with_pieces`"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /detokenize": {
+      "$comment": "llama-server POST /detokenize (README § POST /detokenize; server-context.cpp post_detokenize): tools/server/README.md and tools/server/server-{context,task}.cpp at unslothai/llama.cpp b10840-mix-d5c17a0; images ghcr.io/ggml-org/llama.cpp:server-cuda (glm5.2: a moving tag, not pinned) and Unsloth's mix builds b10796-mix-659e406 (qwen3.8-flash, LLAMA_UNSLOTH_TAG) / b10840-mix-d5c17a0 (glm5.3-flash, qwen3.5-4b, LLAMA_UNSLOTH_CPU_TAG).",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "tokens"
+          ],
+          "properties": {
+            "tokens": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "content"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,224 @@
+{
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for supabase.postman_collection.json, rendered into its items' descriptions and SUPABASE_SCHEMAS.md (linked from SUPABASE.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render supabase. An OPEN subset (additionalProperties: true) of the upstream services behind the Envoy gateway, each entry's `$comment` naming its source and the image tag pinned in docker-compose.supabase.yml; the `hello` function is this repo's code, so its body is closed. Table rows: shapes only, never values. No request bodies (every call is a GET). Checked by unit-tests/apidocs only (tier 1); an image-tag bump re-checks them (ai/supabase/CLAUDE.md).",
+  "service": "supabase",
+  "doc": "SUPABASE.md",
+  "endpoints": {
+    "GET /auth/v1/health": {
+      "$comment": "GoTrue internal/api/api.go HealthCheck at the v2.196.0 tag; image supabase/gotrue:v2.196.0.",
+      "description": "No key.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "version",
+              "name",
+              "description"
+            ],
+            "properties": {
+              "version": {
+                "type": "string",
+                "description": "GoTrue's version"
+              },
+              "name": {
+                "const": "GoTrue"
+              },
+              "description": {
+                "const": "GoTrue is a user registration and authentication API"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /rest/v1/": {
+      "$comment": "PostgREST's root: its OpenAPI 2.0 (Swagger) description of the exposed schemas; image postgrest/postgrest:v14.17.",
+      "description": "The tables and views of SUPABASE_PGRST_DB_SCHEMAS, as the `apikey`'s role sees them (nearly empty here: this repo creates no application tables).",
+      "responses": {
+        "200": {
+          "content_type": "application/openapi+json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "swagger",
+              "info",
+              "paths"
+            ],
+            "properties": {
+              "swagger": {
+                "const": "2.0"
+              },
+              "info": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "paths": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "One per table / view / function"
+              },
+              "definitions": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "One per table / view: its columns"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /rest/v1/:table": {
+      "$comment": "PostgREST's read of a table or view; image postgrest/postgrest:v14.17.",
+      "description": "One object per row, the columns `select` names (`*`: all); at most SUPABASE_PGRST_DB_MAX_ROWS (1000) whatever `limit` says. An empty array where rows exist is row-level security filtering the role.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "A row: column name -> value"
+            }
+          }
+        }
+      }
+    },
+    "GET /storage/v1/status": {
+      "$comment": "storage-api src/app.ts (`/status`) at the v1.74.0 tag; image supabase/storage-api:v1.74.0.",
+      "responses": {
+        "200": {
+          "description": "the API is up"
+        }
+      }
+    },
+    "GET /functions/v1/hello": {
+      "$comment": "This repo's edge function (ai/supabase/volumes/functions/hello/index.ts) behind the vendored router (volumes/functions/main/index.ts); image supabase/edge-runtime:v1.76.2.",
+      "description": "Unauthenticated while SUPABASE_FUNCTIONS_VERIFY_JWT is false (this deployment's default).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "$comment": "ours: the whole body",
+            "required": [
+              "message",
+              "method",
+              "timestamp"
+            ],
+            "properties": {
+              "message": {
+                "const": "hello from supabase edge functions"
+              },
+              "method": {
+                "type": "string",
+                "description": "The request's method"
+              },
+              "timestamp": {
+                "type": "string",
+                "description": "UTC ISO 8601 (`toISOString()`)"
+              }
+            }
+          }
+        },
+        "401": {
+          "content_type": "application/json",
+          "description": "only with SUPABASE_FUNCTIONS_VERIFY_JWT=true: no, or a bad, Bearer token (the same code in the `sb-error-code` header)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "$comment": "main/index.ts getAuthErrorResponse",
+            "required": [
+              "code",
+              "message",
+              "msg"
+            ],
+            "properties": {
+              "code": {
+                "enum": [
+                  "UNAUTHORIZED_LEGACY_JWT",
+                  "UNAUTHORIZED_ASYMMETRIC_JWT",
+                  "UNAUTHORIZED_INVALID_JWT_FORMAT",
+                  "UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM",
+                  "UNAUTHORIZED_NO_AUTH_HEADER"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "msg": {
+                "type": "string",
+                "description": "Deprecated copy of `message`"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /realtime/v1/api/tenants/realtime-dev/health": {
+      "$comment": "Realtime lib/realtime_web/controllers/tenant_controller.ex health and lib/realtime/tenants.ex health_check at the v2.134.10 tag; image supabase/realtime:v2.134.10.",
+      "description": "`healthy: false, db_connected: false` after a SUPABASE_JWT_SECRET rotation is the one-shot-secret trap (SUPABASE.md § Secrets that are one-shot). 404 for an unknown tenant.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "healthy",
+                  "db_connected",
+                  "connected_cluster"
+                ],
+                "properties": {
+                  "healthy": {
+                    "type": "boolean"
+                  },
+                  "db_connected": {
+                    "type": "boolean"
+                  },
+                  "replication_connected": {
+                    "type": "boolean"
+                  },
+                  "connected_cluster": {
+                    "type": "integer",
+                    "description": "Clients connected to the tenant"
+                  },
+                  "region": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "node": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /": {
+      "$comment": "Envoy basic auth in front of Studio; images envoyproxy/envoy:v1.39.1, supabase/studio:2026.09.07-sha-7996410.",
+      "description": "Basic auth: SUPABASE_DASHBOARD_USERNAME / SUPABASE_DASHBOARD_PASSWORD (401 without).",
+      "responses": {
+        "200": {
+          "content_type": "text/html",
+          "description": "Studio's page"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1701 @@
+{
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for open-terminal.postman_collection.json, rendered into its items' descriptions and OPEN_TERMINAL_SCHEMAS.md (linked from OPEN_TERMINAL.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render open-terminal. An OPEN subset (additionalProperties: true) of an upstream server, image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION). Sources: the box's GET /openapi.json (info.version 0.13.0) lists only 16 paths (the rest carry include_in_schema=False upstream, and it declares no response bodies), so its request schemas are used for those (titles dropped) and everything else is read from open_terminal/main.py at the v0.13.0 tag and open_terminal/utils/*.py; each entry's `$comment` says which. Checked by unit-tests/apidocs only (tier 1); an image-tag bump re-checks them (ai/open-terminal/CLAUDE.md).",
+  "service": "open-terminal",
+  "doc": "OPEN_TERMINAL.md",
+  "$defs": {
+    "dir_entry": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "UserFS.listdir entry (open_terminal/utils/fs.py)",
+      "required": [
+        "name",
+        "type",
+        "size",
+        "modified",
+        "writable"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "file",
+            "directory"
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "description": "Bytes (st_size)"
+        },
+        "modified": {
+          "type": "number",
+          "description": "Unix seconds (st_mtime)"
+        },
+        "writable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "exec_result": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "execute() / get_status() in open_terminal/main.py; output from open_terminal/utils/log.py read_log",
+      "required": [
+        "id",
+        "command",
+        "status",
+        "exit_code",
+        "output",
+        "truncated",
+        "next_offset",
+        "log_path"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "`YYYYMMDD-HHMMSS-<6 hex>`"
+        },
+        "command": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "done",
+            "killed"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "null while running"
+        },
+        "output": {
+          "type": "array",
+          "description": "Output entries since `offset` (the last `tail` of them when `tail` is set)",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "type",
+              "data"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "stdout",
+                  "stderr",
+                  "output"
+                ],
+                "description": "`output` when the command runs on a PTY"
+              },
+              "data": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Entries were skipped: rotated out of the log, or cut by `tail`"
+        },
+        "next_offset": {
+          "type": "integer",
+          "description": "Pass back as `offset` to read only new output"
+        },
+        "log_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The process's JSONL log file"
+        }
+      }
+    },
+    "pty_session": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "an interactive PTY session (create_terminal in open_terminal/main.py)",
+      "required": [
+        "id",
+        "created_at",
+        "pid"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "8 characters; the WebSocket attach path's `{session_id}`"
+        },
+        "created_at": {
+          "type": "string",
+          "description": "UTC ISO 8601 with a `Z`"
+        },
+        "pid": {
+          "type": "integer"
+        }
+      }
+    },
+    "pty_error": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "the PTY routes answer errors as `{\"error\"}`, not `{\"detail\"}`",
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "skill_summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "SkillSummary in open_terminal/main.py",
+      "required": [
+        "id",
+        "name",
+        "description",
+        "location",
+        "scope",
+        "source"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "`terminal:<url-quoted name>`"
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "description": "From the SKILL.md frontmatter, at most 1024 chars"
+        },
+        "location": {
+          "type": "string",
+          "description": "The SKILL.md path"
+        },
+        "scope": {
+          "const": "global"
+        },
+        "source": {
+          "const": "terminal"
+        }
+      }
+    },
+    "path_size": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "path",
+        "size"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The resolved absolute path"
+        },
+        "size": {
+          "type": "integer",
+          "description": "Bytes written"
+        }
+      }
+    }
+  },
+  "endpoints": {
+    "GET /health": {
+      "$comment": "health(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "No authentication (no API key dependency).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /openapi.json": {
+      "$comment": "FastAPI's generated document (app = FastAPI(...) in open_terminal/main.py at the v0.13.0 tag); checked against the box's GET /openapi.json (info.version 0.13.0); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "No authentication (FastAPI serves it without the routes' API-key dependency). Lists only the routes without `include_in_schema=False` -- on the box 16 paths: `/info`, the file read / write / search tools, `/execute*` and `/api/terminals/user/*` -- which Open WebUI turns into the model's tools.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "$comment": "OpenAPI 3.1 document",
+            "required": [
+              "openapi",
+              "info",
+              "paths"
+            ],
+            "properties": {
+              "openapi": {
+                "type": "string",
+                "description": "`3.1.0`"
+              },
+              "info": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "title",
+                  "version"
+                ],
+                "properties": {
+                  "title": {
+                    "const": "Open Terminal"
+                  },
+                  "version": {
+                    "type": "string"
+                  }
+                }
+              },
+              "paths": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "components": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /api/config": {
+      "$comment": "get_config(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "No authentication (no API key dependency).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "features"
+            ],
+            "properties": {
+              "features": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "terminal",
+                  "notebooks",
+                  "system"
+                ],
+                "properties": {
+                  "terminal": {
+                    "type": "boolean",
+                    "description": "OPEN_TERMINAL_ENABLE_TERMINAL"
+                  },
+                  "notebooks": {
+                    "type": "boolean",
+                    "description": "OPEN_TERMINAL_ENABLE_NOTEBOOKS"
+                  },
+                  "system": {
+                    "type": "boolean",
+                    "description": "OPEN_TERMINAL_ENABLE_SYSTEM_PROMPT"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /system": {
+      "$comment": "get_system() / get_system_prompt(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "Mounted only with OPEN_TERMINAL_ENABLE_SYSTEM_PROMPT (else 404).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "prompt"
+            ],
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "description": "OS, kernel, architecture, host, user, shell and Python version, then OPEN_TERMINAL_INFO; or OPEN_TERMINAL_SYSTEM_PROMPT with its `{{...}}` variables filled"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /info": {
+      "$comment": "get_info(): the box's GET /openapi.json (info.version 0.13.0) declares no body; response from open_terminal/main.py at the v0.13.0 tag; image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "Mounted only when OPEN_TERMINAL_INFO is non-empty (else 404). The model's `get_info` tool.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "info"
+            ],
+            "properties": {
+              "info": {
+                "type": "string",
+                "description": "OPEN_TERMINAL_INFO, verbatim"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /ports": {
+      "$comment": "list_ports() (open_terminal/main.py, open_terminal/utils/port.py): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "ports"
+            ],
+            "properties": {
+              "ports": {
+                "type": "array",
+                "description": "TCP ports listening in the container that the caller owns: X-User-Id's account in multi-user mode, else the server's descendant processes",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "port",
+                    "pid",
+                    "process"
+                  ],
+                  "properties": {
+                    "port": {
+                      "type": "integer"
+                    },
+                    "pid": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "process": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "The process name"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/cwd": {
+      "$comment": "get_cwd(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "cwd",
+              "home"
+            ],
+            "properties": {
+              "cwd": {
+                "type": "string",
+                "description": "X-Session-Id's working directory, else the home"
+              },
+              "home": {
+                "type": "string"
+              },
+              "root": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "The file browser's visual root (OPEN_TERMINAL_FILE_BROWSER_ROOT); absent for `filesystem`. A UI hint, not a restriction",
+                "required": [
+                  "path",
+                  "label"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /files/cwd": {
+      "$comment": "set_cwd() (body: MkdirRequest): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "404 when the directory does not exist (single-user mode only).",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "MkdirRequest, reused: here the directory to remember",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Directory path to create. Parent directories are created automatically."
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "cwd"
+            ],
+            "properties": {
+              "cwd": {
+                "type": "string",
+                "description": "The resolved path"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/list": {
+      "$comment": "list_files(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `list_files` tool. 404 when the directory does not exist.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "dir",
+              "writable",
+              "entries"
+            ],
+            "properties": {
+              "dir": {
+                "type": "string",
+                "description": "The resolved directory"
+              },
+              "writable": {
+                "type": "boolean"
+              },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/dir_entry"
+                },
+                "description": "Sorted by name"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/read": {
+      "$comment": "read_file(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `read_file` tool. A text file, or a document whose text it extracts (PDF, Office, OpenDocument, …), answers JSON; a binary whose type starts with an OPEN_TERMINAL_BINARY_MIME_PREFIXES entry (`image` by default) answers its raw bytes with that type; any other binary is a 415.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "description": "or, for an image, its bytes",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "path",
+              "total_lines",
+              "content"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "total_lines": {
+                "type": "integer",
+                "description": "Lines in the whole file"
+              },
+              "content": {
+                "type": "string",
+                "description": "Lines `start_line`..`end_line` (1-indexed, inclusive)"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/view": {
+      "$comment": "view_file(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "Any file's raw bytes, for the UI (none of `/files/read`'s restrictions). 404 when the file is not there.",
+      "responses": {
+        "200": {
+          "content_type": "application/octet-stream",
+          "description": "the bytes, typed by the file's extension (`application/octet-stream` when unknown); with `preview=true` a DOCX / PPTX that LibreOffice renders comes back as `application/pdf`"
+        }
+      }
+    },
+    "GET /files/serve/:filePath": {
+      "$comment": "serve_file(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "`/files/view` addressed by path (`/files/serve/home/user/x.html` serves `/home/user/x.html`), never a preview.",
+      "responses": {
+        "200": {
+          "content_type": "application/octet-stream",
+          "description": "the bytes, typed by the file's extension"
+        }
+      }
+    },
+    "GET /files/display": {
+      "$comment": "display_file(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `display_file` tool: serves nothing; Open WebUI opens the file in its preview pane.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "path",
+              "exists"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "exists": {
+                "type": "boolean",
+                "description": "Whether it is a file"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /files/write": {
+      "$comment": "write_file(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `write_file` tool. 400 on an OS error.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or relative path to write to. Parent directories are created automatically."
+            },
+            "content": {
+              "type": "string",
+              "description": "Text content to write to the file."
+            }
+          },
+          "type": "object",
+          "required": [
+            "path",
+            "content"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/path_size"
+          }
+        }
+      }
+    },
+    "POST /files/replace": {
+      "$comment": "replace_file_content(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `replace_file_content` tool. 404 when the file is not there; 400 when a target is not found, or found more than once without `allow_multiple`.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file to modify."
+            },
+            "replacements": {
+              "items": {
+                "properties": {
+                  "target": {
+                    "type": "string",
+                    "description": "Exact string to find. Must match precisely, including whitespace."
+                  },
+                  "replacement": {
+                    "type": "string",
+                    "description": "Content to replace the target with."
+                  },
+                  "start_line": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1.0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Narrow the search to lines at or after this (1-indexed)."
+                  },
+                  "end_line": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1.0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Narrow the search to lines at or before this (1-indexed)."
+                  },
+                  "allow_multiple": {
+                    "type": "boolean",
+                    "description": "If true, replaces all occurrences. If false, errors when multiple matches are found.",
+                    "default": false
+                  }
+                },
+                "type": "object",
+                "required": [
+                  "target",
+                  "replacement"
+                ],
+                "additionalProperties": true
+              },
+              "type": "array",
+              "description": "List of find-and-replace operations to apply sequentially."
+            }
+          },
+          "type": "object",
+          "required": [
+            "path",
+            "replacements"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "description": "`size`: the new file's bytes",
+          "schema": {
+            "$ref": "#/$defs/path_size"
+          }
+        }
+      }
+    },
+    "POST /files/mkdir": {
+      "$comment": "mkdir() (body: MkdirRequest): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "400 on an OS error.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "MkdirRequest",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Directory path to create. Parent directories are created automatically."
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /files/move": {
+      "$comment": "move_entry() (body: MoveRequest): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "404 when the source is missing, 400 when the destination's parent is, 409 when the destination exists.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "MoveRequest",
+          "required": [
+            "source",
+            "destination"
+          ],
+          "properties": {
+            "source": {
+              "type": "string",
+              "description": "Path to the file or directory to move."
+            },
+            "destination": {
+              "type": "string",
+              "description": "Destination path (new location)."
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "source",
+              "destination"
+            ],
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "destination": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "DELETE /files/delete": {
+      "$comment": "delete_entry(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "Recursive, no undo. 404 when the path is not there, 400 on an OS error.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "path",
+              "type"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "file",
+                  "directory"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /files/upload": {
+      "$comment": "upload_file(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "`directory` (a query parameter) is created when missing; the file keeps its own basename. 403 on a permission error, 400 on another OS error.",
+      "request": {
+        "content_type": "multipart/form-data",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "file"
+          ],
+          "properties": {
+            "file": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream",
+              "description": "The file to upload."
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/path_size"
+          }
+        }
+      }
+    },
+    "POST /files/archive": {
+      "$comment": "archive_paths() (body: ArchiveRequest): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "400 for an empty `paths`, 404 when any path is not there.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "ArchiveRequest",
+          "required": [
+            "paths"
+          ],
+          "properties": {
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of file or directory paths to include in the ZIP archive."
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/zip",
+          "description": "`attachment; filename=\"<name>.zip\"`: the basename of a single path, else `download.zip`"
+        }
+      }
+    },
+    "POST /files/compare": {
+      "$comment": "compare_files() (body: CompareRequest): open_terminal/main.py and open_terminal/utils/file_compare.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "A line diff of two files' text (documents through their text extractor), run as the caller's account in a 60 s worker. 404 / 403 for a missing / forbidden file, 422 when the text cannot be extracted, 408 past 60 s.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "CompareRequest (open_terminal/utils/file_compare.py)",
+          "required": [
+            "original",
+            "revised"
+          ],
+          "properties": {
+            "original": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The first file's path"
+            },
+            "revised": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The second file's path"
+            },
+            "ignore_whitespace": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "original",
+              "revised",
+              "additions",
+              "deletions",
+              "hunks"
+            ],
+            "properties": {
+              "original": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "path",
+                  "name",
+                  "notices"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "notices": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "What the text extraction leaves out"
+                  }
+                }
+              },
+              "revised": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "path",
+                  "name",
+                  "notices"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "notices": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "What the text extraction leaves out"
+                  }
+                }
+              },
+              "additions": {
+                "type": "integer"
+              },
+              "deletions": {
+                "type": "integer"
+              },
+              "hunks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "header",
+                    "lines"
+                  ],
+                  "properties": {
+                    "header": {
+                      "type": "string",
+                      "description": "`@@ -a,b +c,d @@`"
+                    },
+                    "lines": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "required": [
+                          "type",
+                          "oldNumber",
+                          "newNumber",
+                          "content",
+                          "segments"
+                        ],
+                        "properties": {
+                          "type": {
+                            "enum": [
+                              "context",
+                              "removed",
+                              "added"
+                            ]
+                          },
+                          "oldNumber": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "newNumber": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "content": {
+                            "type": "string"
+                          },
+                          "revisedContent": {
+                            "type": "string",
+                            "description": "On `context` lines only"
+                          },
+                          "segments": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "additionalProperties": true,
+                              "required": [
+                                "text",
+                                "changed"
+                              ],
+                              "properties": {
+                                "text": {
+                                  "type": "string"
+                                },
+                                "changed": {
+                                  "type": "boolean"
+                                }
+                              }
+                            },
+                            "description": "Word-level changes of a removed / added pair"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/grep": {
+      "$comment": "grep_search(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `grep_search` tool. 404 when the path is not there, 400 for a bad regex.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "query",
+              "path",
+              "matches",
+              "truncated"
+            ],
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "matches": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "file"
+                  ],
+                  "properties": {
+                    "file": {
+                      "type": "string"
+                    },
+                    "line": {
+                      "type": "integer",
+                      "description": "With `match_per_line` (the default)"
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "The matching line, with `match_per_line`"
+                    }
+                  }
+                }
+              },
+              "truncated": {
+                "type": "boolean",
+                "description": "`max_results` was reached"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/glob": {
+      "$comment": "glob_search(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `glob_search` tool. 404 when the directory is not there.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "pattern",
+              "path",
+              "matches",
+              "truncated"
+            ],
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "matches": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "path",
+                    "type",
+                    "size",
+                    "modified"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "Relative to `path`"
+                    },
+                    "type": {
+                      "enum": [
+                        "file",
+                        "directory"
+                      ]
+                    },
+                    "size": {
+                      "type": "integer"
+                    },
+                    "modified": {
+                      "type": "number"
+                    }
+                  }
+                }
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/search": {
+      "$comment": "search_files(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `search_files` tool: ranked filename matches (git-tracked files when the directory is a repo). 404 when the directory is not there.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "results"
+            ],
+            "properties": {
+              "results": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "path",
+                    "name",
+                    "type",
+                    "size",
+                    "modified"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "file",
+                        "directory"
+                      ]
+                    },
+                    "size": {
+                      "type": "integer"
+                    },
+                    "modified": {
+                      "type": "number"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /files/matches": {
+      "$comment": "match_files(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `match_files` tool: ranked name, path and content matches, paged by `offset` / `limit` (at most 100). 400 for a blank query, 404 when the directory is not there.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "results",
+              "next_offset"
+            ],
+            "properties": {
+              "results": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "path",
+                    "relative_path",
+                    "name",
+                    "type",
+                    "name_match",
+                    "content_matches"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "relative_path": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "file",
+                        "directory"
+                      ]
+                    },
+                    "name_match": {
+                      "type": "boolean"
+                    },
+                    "content_matches": {
+                      "type": "array",
+                      "description": "At most 3 per file",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "required": [
+                          "line",
+                          "column",
+                          "text"
+                        ],
+                        "properties": {
+                          "line": {
+                            "type": "integer"
+                          },
+                          "column": {
+                            "type": "integer"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "next_offset": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "null on the last page"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /skills": {
+      "$comment": "list_skills(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/skill_summary"
+            },
+            "description": "Skills under ~/.agents/skills, ~/.cptr/skills, ~/.claude/skills and ~/.codex/skills with a described SKILL.md; the first of a name wins"
+          }
+        }
+      }
+    },
+    "GET /skills/read": {
+      "$comment": "read_skill(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "404 when no skill has that name.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/skill_summary"
+              }
+            ],
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "content",
+              "resources"
+            ],
+            "properties": {
+              "content": {
+                "type": "string",
+                "description": "SKILL.md without its frontmatter"
+              },
+              "resources": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The skill folder's other files, relative"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /execute": {
+      "$comment": "execute(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `run_command` tool. The command always runs in the background; `wait` (seconds, 0-300; OPEN_TERMINAL_EXECUTE_TIMEOUT when absent) only holds the answer.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections.",
+              "examples": [
+                "echo hello",
+                "ls -la && whoami"
+              ]
+            },
+            "cwd": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Working directory for the command. Defaults to the server's current directory if not set."
+            },
+            "env": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Extra environment variables merged into the subprocess environment."
+            }
+          },
+          "type": "object",
+          "required": [
+            "command"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/exec_result"
+          }
+        }
+      }
+    },
+    "GET /execute": {
+      "$comment": "list_processes(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `list_processes` tool: this X-User-Id + X-Session-Id pair's processes; a finished one is dropped 5 minutes after it ends.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": [
+                "id",
+                "command",
+                "status",
+                "exit_code",
+                "log_path"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "command": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "running",
+                    "done",
+                    "killed"
+                  ]
+                },
+                "exit_code": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "log_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /execute/:processId/status": {
+      "$comment": "get_status(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `get_process_status` tool. 404 for an unknown process, or one of another user / session.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/exec_result"
+          }
+        }
+      }
+    },
+    "POST /execute/:processId/input": {
+      "$comment": "send_input(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `send_process_input` tool. Literal escapes (`\\n`, `\\x03`) are turned into the characters. 404 for an unknown process; 400 when it has exited or its stdin is closed.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "properties": {
+            "input": {
+              "type": "string",
+              "description": "Text to send to the process's stdin. Include newline characters as needed."
+            }
+          },
+          "type": "object",
+          "required": [
+            "input"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          }
+        }
+      }
+    },
+    "DELETE /execute/:processId": {
+      "$comment": "kill_process(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `kill_process` tool: SIGTERM, or SIGKILL with `force=true`. 404 for an unknown process.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "also for a process that had already finished",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "killed"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /api/terminals": {
+      "$comment": "create_terminal(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "Attach over the WebSocket `/api/terminals/{id}` (first-message auth), which a collection request cannot exercise.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/pty_session"
+          }
+        },
+        "429": {
+          "content_type": "application/json",
+          "description": "OPEN_TERMINAL_MAX_SESSIONS live sessions already exist",
+          "schema": {
+            "$ref": "#/$defs/pty_error"
+          }
+        },
+        "503": {
+          "content_type": "application/json",
+          "description": "no PTY available (out of PTY devices, or the platform has none)",
+          "schema": {
+            "$ref": "#/$defs/pty_error"
+          }
+        }
+      }
+    },
+    "GET /api/terminals": {
+      "$comment": "list_terminals(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "This X-User-Id + X-Session-Id pair's live sessions; dead ones are reaped.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/pty_session"
+            }
+          }
+        }
+      }
+    },
+    "GET /api/terminals/:terminalSessionId": {
+      "$comment": "get_terminal(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "$ref": "#/$defs/pty_session"
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "description": "unknown, dead, or another user / session's: `Session not found`",
+          "schema": {
+            "$ref": "#/$defs/pty_error"
+          }
+        }
+      }
+    },
+    "DELETE /api/terminals/:terminalSessionId": {
+      "$comment": "delete_terminal(): open_terminal/main.py at the v0.13.0 tag -- not in the box's GET /openapi.json (include_in_schema=False upstream); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "deleted"
+              }
+            }
+          }
+        },
+        "404": {
+          "content_type": "application/json",
+          "description": "unknown, or another user / session's: `Session not found`",
+          "schema": {
+            "$ref": "#/$defs/pty_error"
+          }
+        }
+      }
+    },
+    "GET /api/terminals/user/output": {
+      "$comment": "read_user_terminal(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `read_user_terminal` tool. 404 `No connected user shell` when this user / session has no attached live PTY.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "output"
+            ],
+            "properties": {
+              "output": {
+                "type": "string",
+                "description": "The shell's recent output, decoded leniently"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /api/terminals/user/input": {
+      "$comment": "send_user_terminal_input(): request from the box's GET /openapi.json (info.version 0.13.0); response from open_terminal/main.py at the v0.13.0 tag (the box's document declares no response body); image open-terminal-zeo:0.13.0 (ai/open-terminal/Dockerfile.open-terminal on ghcr.io/open-webui/open-terminal:0.13.0, OPEN_TERMINAL_VERSION).",
+      "description": "The model's `send_user_terminal_input` tool: literal text, no escape decoding. 404 with no connected shell, 409 when it disconnected.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "properties": {
+            "input": {
+              "type": "string",
+              "description": "Text to send to the process's stdin. Include newline characters as needed."
+            }
+          },
+          "type": "object",
+          "required": [
+            "input"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

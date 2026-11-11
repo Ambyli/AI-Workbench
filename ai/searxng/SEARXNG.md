@@ -132,3 +132,9 @@ These are two separate failures that happen to correlate:
 - It's not on the LiteLLM fan-out. Models never call SearXNG directly; Open WebUI enriches the prompt with search results server-side before dispatching to LiteLLM.
 - If public search engines start rate-limiting your egress IP, individual engines can be disabled in `settings.yml` under `engines:` — see the [upstream engine list](https://docs.searxng.org/user/configured_engines.html). `duckduckgo` already is, per the troubleshooting note above.
 - Wider infrastructure map: [`AI_INFRA.md`](AI_INFRA.md).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`SEARXNG_SCHEMAS.md`](SEARXNG_SCHEMAS.md), generated from [`searxng.schemas.json`](searxng.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

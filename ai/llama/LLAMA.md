@@ -430,3 +430,9 @@ curl http://localhost:4001/v1/chat/completions \
 ### No tests
 
 There is no automated test suite. Verify by hitting `/v1/chat/completions` after `make up llama glm5.2` and confirming a coherent response. `curl http://localhost:8010/health` should return `{"status":"ok"}` once the model has finished loading. For `glm5.3-flash` use port 8020 and expect the first `/health` OK to take a good while after the download — the mlock pass touches every page of the file before the server starts answering. For `qwen3.5-4b` use port 8028 and follow [its own checklist](#qwen35-4b--a-small-cpu-model-for-route-policy): thinking must be off, and the classifier must list it as available.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`LLAMA_SCHEMAS.md`](LLAMA_SCHEMAS.md), generated from [`llama.schemas.json`](llama.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

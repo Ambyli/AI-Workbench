@@ -1,0 +1,825 @@
+{
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for litellm.postman_collection.json, rendered into its items' descriptions and LITELLM_SCHEMAS.md (linked from LITELLM.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render litellm. An OPEN subset (additionalProperties: true) of an upstream server, LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0): request schemas checked against the box's GET /openapi.json (621 paths; it declares response bodies only for /key/generate and /user/info), the rest read from LiteLLM's source at the v1.95.0 tag; each entry's `$comment` says which. The OpenAI chat-completions and models entries point to the subset shared with vLLM and llama.cpp (vllm.schemas.json), and the pass-through health items to each service's own entry (same_as). Admin endpoints: shapes only, never values. Checked by unit-tests/apidocs only (tier 1); an image-tag bump re-checks them (ai/litellm/CLAUDE.md).",
+  "service": "litellm",
+  "doc": "LITELLM.md",
+  "$defs": {
+    "key_metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Free-form; stored as sent",
+      "properties": {
+        "allowed_passthrough_routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The pass-through prefixes this key may call (`/v1/classifier`, …). Set it INSIDE `metadata`, never as the top-level field of the same name (Enterprise-only, 403 unlicensed); only a proxy admin may set it. LITELLM.md § Pass-through auth"
+        }
+      }
+    },
+    "key_fields": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "the GenerateKeyRequest / UpdateKeyRequest fields this stack uses (~50 in all)",
+      "properties": {
+        "key_alias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The `model_name`s / chain aliases the key may call; empty: all"
+        },
+        "max_budget": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "spend": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "user_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "$ref": "#/$defs/key_metadata"
+        },
+        "tpm_limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm_limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_parallel_requests": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "budget_duration": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "health_endpoint": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "One deployment's health check, its `litellm_params` minus credentials (`api_base` only for an admin)",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "The deployment's `litellm_params.model`"
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": "string",
+          "description": "On an unhealthy endpoint: why"
+        }
+      }
+    }
+  },
+  "endpoints": {
+    "GET /health": {
+      "$comment": "litellm/proxy/health_endpoints/_health_endpoints.py at the v1.95.0 tag health_endpoint (the box's GET /openapi.json declares no body); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "Needs a key. Pings every deployment the key may use (or answers the background check's last result).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "healthy_endpoints",
+              "unhealthy_endpoints",
+              "healthy_count",
+              "unhealthy_count"
+            ],
+            "properties": {
+              "healthy_endpoints": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/health_endpoint"
+                }
+              },
+              "unhealthy_endpoints": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/health_endpoint"
+                }
+              },
+              "healthy_count": {
+                "type": "integer"
+              },
+              "unhealthy_count": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /health/liveliness": {
+      "$comment": "litellm/proxy/health_endpoints/_health_endpoints.py at the v1.95.0 tag health_liveliness; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "No key. The container healthcheck's target.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "const": "I'm alive!",
+            "description": "a JSON string"
+          }
+        },
+        "503": {
+          "content_type": "application/json",
+          "description": "this copy is shutting down (SIGTERM: a swap deploy retiring it, or a stop)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "shutting_down"
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /health/readiness": {
+      "$comment": "litellm/proxy/health_endpoints/_health_endpoints.py at the v1.95.0 tag health_readiness (the public, low-detail payload: general_settings.allow_public_health_readiness_details is not set); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "No key.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status",
+              "db"
+            ],
+            "properties": {
+              "status": {
+                "const": "healthy"
+              },
+              "db": {
+                "enum": [
+                  "connected",
+                  "disconnected",
+                  "Not connected"
+                ],
+                "description": "`disconnected` answers 503 with this same body; `Not connected`: no database configured"
+              }
+            }
+          }
+        },
+        "503": {
+          "content_type": "application/json",
+          "description": "this copy is shutting down (SIGTERM: a swap deploy retiring it, or a stop)",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "const": "shutting_down"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/chat/completions": {
+      "same_as": "vllm: POST /v1/chat/completions"
+    },
+    "POST /v1/embeddings": {
+      "$comment": "OpenAI Embeddings: request checked against the box's GET /openapi.json (its documented model types `input` as a list of strings; the proxy passes a string through as OpenAI allows); response litellm.types.utils.EmbeddingResponse; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "Answers only for a `model_list` entry whose backend serves embeddings; none of this deployment's vLLM / llama.cpp chat servers is started with an embedding task, so the collection's `qwen3.6` item gets the backend's error.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "model",
+            "input"
+          ],
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "input": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              ]
+            },
+            "encoding_format": {
+              "enum": [
+                "float",
+                "base64"
+              ]
+            },
+            "dimensions": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "object",
+              "data",
+              "model"
+            ],
+            "properties": {
+              "object": {
+                "const": "list"
+              },
+              "data": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "object",
+                    "index",
+                    "embedding"
+                  ],
+                  "properties": {
+                    "object": {
+                      "const": "embedding"
+                    },
+                    "index": {
+                      "type": "integer"
+                    },
+                    "embedding": {
+                      "anyOf": [
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        },
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "description": "Floats, or a base64 string with `encoding_format: base64`"
+                    }
+                  }
+                }
+              },
+              "model": {
+                "type": "string"
+              },
+              "usage": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "prompt_tokens": {
+                    "type": "integer"
+                  },
+                  "total_tokens": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/models": {
+      "same_as": "vllm: GET /v1/models"
+    },
+    "POST /v1/audio/speech": {
+      "$comment": "OpenAI Speech: request checked against the box's GET /openapi.json (which declares no body for it); response litellm/proxy/proxy_server.py at the v1.95.0 tag audio_speech; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "Routed by `model` (`kokoro` -> kokoro-api's `POST /v1/audio/speech`, kokoro.schemas.json).",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "model",
+            "input"
+          ],
+          "properties": {
+            "model": {
+              "type": "string",
+              "description": "`kokoro`"
+            },
+            "input": {
+              "type": "string",
+              "description": "The text to speak"
+            },
+            "voice": {
+              "type": "string",
+              "description": "An OpenAI alias or a Kokoro voice name"
+            },
+            "response_format": {
+              "type": "string",
+              "description": "Ignored by Kokoro, which only makes WAV"
+            },
+            "speed": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "audio/mpeg",
+          "description": "the backend's audio bytes, labelled `audio/mpeg` by LiteLLM whatever they are (only a Gemini TTS model gets `audio/wav`): from kokoro they are WAV (`RIFF…WAVE`)"
+        }
+      }
+    },
+    "POST /key/generate": {
+      "$comment": "GenerateKeyRequest / GenerateKeyResponse from the box's GET /openapi.json, trimmed to the fields this stack uses (see litellm/proxy/management_endpoints/key_management_endpoints.py at the v1.95.0 tag); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "Master key (or an admin). The response is the only time the secret `key` is shown.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/key_fields"
+            }
+          ],
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "duration": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "`30d`, `1h`, …; null: never expires"
+            },
+            "key": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Set the secret yourself (else generated)"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/key_fields"
+              }
+            ],
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "key"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "The new virtual key (`sk-…`): store it now"
+              },
+              "key_name": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A masked form of the key"
+              },
+              "expires": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "ISO 8601"
+              },
+              "token": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The key's hash, its id in /key/* calls' results"
+              },
+              "created_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /key/info": {
+      "$comment": "litellm/proxy/management_endpoints/key_management_endpoints.py at the v1.95.0 tag info_key_fn (the box's GET /openapi.json declares no body); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "`?key=` names the key (without it: the calling key). 404 for an unknown key.",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "info"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "As asked"
+              },
+              "info": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/key_fields"
+                  }
+                ],
+                "type": "object",
+                "additionalProperties": true,
+                "description": "The key's row without its hash (`token`)",
+                "properties": {
+                  "key_name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "expires": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "created_at": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "updated_at": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /key/update": {
+      "$comment": "UpdateKeyRequest from the box's GET /openapi.json, trimmed; response litellm/proxy/management_endpoints/key_management_endpoints.py at the v1.95.0 tag update_key_fn; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "Every field given replaces the stored one (`metadata` as a whole: read it with /key/info first). 404 for an unknown key.",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/key_fields"
+            }
+          ],
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "The key to change"
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/key_fields"
+              }
+            ],
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "key"
+            ],
+            "description": "`key` plus the updated fields",
+            "properties": {
+              "key": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /key/delete": {
+      "$comment": "KeyRequest from the box's GET /openapi.json; response litellm/proxy/management_endpoints/key_management_endpoints.py at the v1.95.0 tag delete_key_fn; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "request": {
+        "content_type": "application/json",
+        "schema": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "keys": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "description": "Keys (`sk-…`) or their hashes"
+            },
+            "key_aliases": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "deleted_keys"
+            ],
+            "properties": {
+              "deleted_keys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /user/info": {
+      "$comment": "UserInfoResponse from the box's GET /openapi.json; LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "`?user_id=` names the user (without it: the calling key's).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "user_id",
+              "user_info",
+              "keys",
+              "teams"
+            ],
+            "properties": {
+              "user_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "user_info": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": true,
+                "description": "The user's row: spend, max_budget, models, …"
+              },
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "description": "The user's keys (hashes, not secrets)"
+              },
+              "teams": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /model/info": {
+      "$comment": "litellm/proxy/proxy_server.py at the v1.95.0 tag model_info_v1 (the box's GET /openapi.json declares no body); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "Every deployment: the config file's `model_list` and the database's (`store_model_in_db`).",
+      "responses": {
+        "200": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "model_name",
+                    "litellm_params",
+                    "model_info"
+                  ],
+                  "properties": {
+                    "model_name": {
+                      "type": "string",
+                      "description": "What a request's `model` names (a chain alias groups several deployments)"
+                    },
+                    "litellm_params": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "`model`, `api_base`, `order`, … (credentials removed)"
+                    },
+                    "model_info": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "`id` (the `x-litellm-model-id` header), `mode`, `max_input_tokens`, …"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/classifier/health": {
+      "same_as": "classifier: GET /v1/classifier/health"
+    },
+    "GET /v1/madlad/health": {
+      "same_as": "madlad: GET /v1/madlad/health"
+    },
+    "GET /v1/interceptor/health": {
+      "same_as": "interceptor: GET /v1/interceptor/health"
+    },
+    "GET /v1/roofix/health": {
+      "same_as": "roofix: GET /health"
+    },
+    "GET /v1/sandbox/health": {
+      "same_as": "sandbox-runner: GET /v1/sandbox/health"
+    },
+    "GET /mcp/kokoro_tts": {
+      "$comment": "litellm/proxy/_experimental/mcp_server/server.py at the v1.95.0 tag handle_streamable_http_mcp, which hands a GET to the MCP Python SDK's streamable-HTTP transport (mcp>=1.28.1; 1.29.0 read here: mcp/server/streamable_http.py _handle_get_request); LiteLLM v1.95.0 (ai/litellm/Dockerfile.litellm: FROM docker.litellm.ai/berriai/litellm:v1.95.0; the box's container reports info.version 1.95.0).",
+      "description": "The URL to register (`claude mcp add --transport http … {{litellm}}/mcp/<server>`), not an API: MCP clients POST JSON-RPC here. A plain GET is the MCP stream a client opens for server-sent messages, so it needs `Accept: text/event-stream`; Postman's default `*/*` gets the 406. Every `/mcp/<server>` item answers alike, after LiteLLM's own checks: a bad key or one not allowed the server is its 401 / 403, and `gmail` (OAuth delegated to Google) answers a request with no bearer 401 with a `WWW-Authenticate` challenge.",
+      "responses": {
+        "200": {
+          "content_type": "text/event-stream",
+          "description": "with `Accept: text/event-stream`: an open stream for server-to-client JSON-RPC messages, which on LiteLLM's stateless path (no `mcp-session-id`) carries nothing and never ends"
+        },
+        "406": {
+          "content_type": "application/json",
+          "description": "without `text/event-stream` in `Accept`",
+          "schema": {
+            "type": "object",
+            "additionalProperties": true,
+            "$comment": "mcp.types.JSONRPCError",
+            "required": [
+              "jsonrpc",
+              "id",
+              "error"
+            ],
+            "properties": {
+              "jsonrpc": {
+                "const": "2.0"
+              },
+              "id": {
+                "const": "server-error"
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "code",
+                  "message"
+                ],
+                "properties": {
+                  "code": {
+                    "const": -32600
+                  },
+                  "message": {
+                    "const": "Not Acceptable: Client must accept text/event-stream"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /mcp/madlad_translate": {
+      "same_as": "GET /mcp/kokoro_tts"
+    },
+    "GET /mcp/detector": {
+      "same_as": "GET /mcp/kokoro_tts"
+    },
+    "GET /mcp/interceptor": {
+      "same_as": "GET /mcp/kokoro_tts"
+    },
+    "GET /mcp/sandbox": {
+      "same_as": "GET /mcp/kokoro_tts"
+    },
+    "GET /mcp/trino": {
+      "same_as": "GET /mcp/kokoro_tts"
+    },
+    "GET /mcp/phoenix": {
+      "same_as": "GET /mcp/kokoro_tts"
+    },
+    "GET /mcp/gmail": {
+      "same_as": "GET /mcp/kokoro_tts"
+    }
+  }
+}

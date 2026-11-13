@@ -96,14 +96,25 @@ from typing import Any, Iterable, Optional, Sequence
 
 from common.logprobs import Distribution, OptionReadout, Unresolved, softmax_temperature
 
-from config import DETAIL_FLOAT_DECIMALS
+# The score scale (SCORE_LO..SCORE_HI; the verdict bands are
+# utils.verdict_from_score's, from the same section), the fast readout's
+# scale (FAST_DIGITS, score = digit + FAST_SCORE_OFFSET) and the reason it
+# reports (it writes none: decision 2, 2026-11-12) are config.py's — § The
+# score scale and the verdict bands, § Prompt wording and § Fast mode.
+from config import (
+    DETAIL_FLOAT_DECIMALS,
+    FAST_DIGITS,
+    FAST_REASON,
+    FAST_SCORE_OFFSET,
+    SCORE_HI,
+    SCORE_LO,
+)
 from llm.models import ConfidenceConfig
 from utils import verdict_from_score
 
 # The scoring field, as the prompt asks for it (llm.prompts) and
-# llm.validate.clamp_answer clamps it.
+# llm.validate.clamp_answer clamps it to config's SCORE_LO..SCORE_HI.
 SCORE_KEY = "score"
-SCORE_LO, SCORE_HI = 1, 10
 BANDS: tuple[str, ...] = ("PASS", "MARGINAL", "FAIL")
 
 # The private keys llm.client puts on a scoring answer for this module. They
@@ -126,14 +137,6 @@ SAMPLES_KEYS: tuple[str, ...] = ("asked", "answered", "agreement", "stated_mean"
 # missing from the top-k could hold (``rate_readout``). Only a fast result
 # carries it, so a reasoned result's block is exactly BLOCK_KEYS.
 READOUT_BLOCK_KEYS: tuple[str, ...] = BLOCK_KEYS + ("unseen_bound",)
-
-# The fast readout's labels for the 1-10 rating — score = digit + 1 — and
-# the reason a readout reports (it writes none: decision 2, 2026-11-12). The
-# band probabilities ARE the judgement, so a `score: false` criterion (whose
-# judgement is not reported) gets the line without them.
-FAST_DIGITS: tuple[str, ...] = tuple("0123456789")
-FAST_REASON = "Fast readout (no reasoning): PASS {PASS:.2f}, MARGINAL {MARGINAL:.2f}, FAIL {FAIL:.2f}."
-FAST_REASON_UNJUDGED = "Fast readout (no reasoning)."
 
 
 def _r(value: Optional[float]) -> Optional[float]:
@@ -349,7 +352,8 @@ def combined_answer(answer: dict[str, Any], members: Iterable[dict[str, Any]]) -
 
 
 def rate_readout(readout: OptionReadout, calibration: Optional[Any] = None) -> dict[str, Any]:
-    """A 1-10 rating from a digit readout (``FAST_DIGITS``; score = digit + 1).
+    """A 1-10 rating from a digit readout (``config.FAST_DIGITS``; score =
+    digit + ``config.FAST_SCORE_OFFSET``, i.e. digit + 1).
 
     ``calibration`` is the entry's ``fast.calibration["rating"]`` (a
     ``llm.models.FastCalibration``) or None. When given, the digits' raw
@@ -361,7 +365,7 @@ def rate_readout(readout: OptionReadout, calibration: Optional[Any] = None) -> d
       * ``score`` — the most probable score inside that band (a tie to the
         lower score);
       * ``confidence`` — ``round(100 × that band's probability)``;
-      * ``reason`` — ``FAST_REASON``: the three bands' probabilities (a
+      * ``reason`` — ``config.FAST_REASON``: the three bands' probabilities (a
         readout writes no reason of its own);
       * ``block`` — ``detail.confidence`` in its usual shape (``signals``
         over the score distribution) with ``method`` / ``source``
@@ -374,7 +378,7 @@ def rate_readout(readout: OptionReadout, calibration: Optional[Any] = None) -> d
         probs = {d: scaled.get(d, 0.0) for d in FAST_DIGITS}
     else:
         probs = {d: float(readout.probs.get(d, 0.0)) for d in FAST_DIGITS}
-    by_score = {int(d) + 1: p for d, p in probs.items()}
+    by_score = {int(d) + FAST_SCORE_OFFSET: p for d, p in probs.items()}
     bands = {band: 0.0 for band in BANDS}
     for value, p in by_score.items():
         bands[verdict_from_score(value)] += p

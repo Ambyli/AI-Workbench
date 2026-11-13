@@ -36,7 +36,10 @@ both. That is this package.
                                 (capped at ``max_render_pixels``), with its
                                 ``<text>`` as native text and one entry in
                                 ``Document.warnings`` per external reference
-                                it did not draw — MuPDF fetches nothing;
+                                it did not draw, its URL cut to
+                                ``max_warning_url_chars`` (default
+                                ``DEFAULT_MAX_WARNING_URL_CHARS``, 200) —
+                                MuPDF fetches nothing;
                                 images are one page with no text; txt/docx
                                 are one page with text and no image. The
                                 image decoder is injectable so a caller can
@@ -119,6 +122,7 @@ from .detect import (
 from .loaders import (
     DEFAULT_MAX_PAGES,
     DEFAULT_MAX_RENDER_PIXELS,
+    DEFAULT_MAX_WARNING_URL_CHARS,
     DEFAULT_RENDER_DPI,
     NATIVE_LINE_SPLIT_GAP,
     ImageDecoder,
@@ -176,6 +180,7 @@ __all__ = [
     # loaders
     "DEFAULT_MAX_PAGES",
     "DEFAULT_MAX_RENDER_PIXELS",
+    "DEFAULT_MAX_WARNING_URL_CHARS",
     "DEFAULT_RENDER_DPI",
     "NATIVE_LINE_SPLIT_GAP",
     "ImageDecoder",

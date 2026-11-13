@@ -47,7 +47,7 @@ from typing import Any, AsyncIterator, Optional
 
 import asyncpg
 
-from config import DB_DSN, DB_POOL_HEADROOM, MAX_CONCURRENT
+from config import DB_DSN, DB_POOL_CLOSE_TIMEOUT_S, DB_POOL_HEADROOM, MAX_CONCURRENT
 from logger import logger
 
 
@@ -64,11 +64,6 @@ def pool_max() -> int:
     from llm.models import get_registry
 
     return MAX_CONCURRENT + get_registry().total_concurrency() + DB_POOL_HEADROOM
-
-# Seconds ``close()`` waits for borrowed connections to come back before it
-# terminates the pool. Shutdown cancels the workers first, so this only bites
-# on a request that is still mid-query when the container stops.
-_CLOSE_TIMEOUT_S = 10.0
 
 
 class DatabaseNotConfigured(RuntimeError):
@@ -150,8 +145,9 @@ class Database:
         logger.info("db: pool ready (max_size=%d)", max_size)
 
     async def close(self) -> None:
-        """Close the pool. Idempotent. Waits up to ``_CLOSE_TIMEOUT_S`` for
-        borrowed connections, then terminates the rest."""
+        """Close the pool. Idempotent. Waits up to
+        ``config.DB_POOL_CLOSE_TIMEOUT_S`` for borrowed connections, then
+        terminates the rest."""
         pool, loop = self._pool, self._loop
         self._pool, self._loop = None, None
         if pool is None:
@@ -164,9 +160,11 @@ class Database:
             pool.terminate()
             return
         try:
-            await asyncio.wait_for(pool.close(), timeout=_CLOSE_TIMEOUT_S)
+            await asyncio.wait_for(pool.close(), timeout=DB_POOL_CLOSE_TIMEOUT_S)
         except asyncio.TimeoutError:
-            logger.warning("db: pool did not close within %.0fs — terminating", _CLOSE_TIMEOUT_S)
+            logger.warning(
+                "db: pool did not close within %.0fs — terminating", DB_POOL_CLOSE_TIMEOUT_S
+            )
             pool.terminate()
 
     @asynccontextmanager

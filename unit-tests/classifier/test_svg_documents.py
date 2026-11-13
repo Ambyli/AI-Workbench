@@ -370,3 +370,16 @@ def test_a_reference_fetches_at_submit_too(client, model, fetch_on):
         "external image not fetched (blocked: URL hostname could not be resolved): "
         f"{DIAGRAM_LOGO}"
     ]
+
+
+def test_the_loaders_not_rendered_lines_use_the_config_url_cap(monkeypatch):
+    """common.documents' own "not rendered" lines cut their URLs to the
+    classifier's SVG_WARNING_URL_MAX_CHARS, the bound its fetch warnings use."""
+    long_url = "https://cdn.test/" + "y" * 300 + ".png"
+    raw = _svg(f'<image width="10" height="10" href="{long_url}"/>')
+    prefix = "external image not rendered: "
+    doc = loading.load_document_bytes(raw, "d.svg")
+    assert doc.warnings == [prefix + long_url[: config.SVG_WARNING_URL_MAX_CHARS] + "…"]
+    monkeypatch.setattr(loading, "SVG_WARNING_URL_MAX_CHARS", 20)
+    doc = loading.load_document_bytes(raw, "d.svg")
+    assert doc.warnings == [prefix + long_url[:20] + "…"]

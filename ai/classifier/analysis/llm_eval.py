@@ -130,6 +130,7 @@ from analysis.result_specs import (
 from analysis.outcome import EvaluationError
 from api.criterion_options import box_loop_settings
 from api.schemas import CriterionInput
+from config import FAST_DIGITS, FAST_REASON_UNJUDGED
 # Modules, not names: a test scripts the model by replacing
 # `llm.client.call_model` / `call_model_json`, and must reach the one object
 # every caller uses; the registry is looked up at call time (tests swap it).
@@ -249,7 +250,7 @@ async def evaluate_with(
     false`` unit's judgement afterwards (``analysis.scheduler._unjudged``) but
     keeps its reason — a model-written explanation. A fast readout's reason is
     nothing but its band probabilities, i.e. the judgement, so an unjudged
-    fast unit is given ``FAST_REASON_UNJUDGED`` instead.
+    fast unit is given ``config.FAST_REASON_UNJUDGED`` instead.
 
     Raises:
         llm.client.LLMCallError: The scoring call failed (HTTP error, or no
@@ -296,7 +297,7 @@ async def evaluate_with(
         )
         if not judged:
             # The band line IS the judgement `score: false` withholds.
-            answer["reason"] = llm_confidence.FAST_REASON_UNJUDGED
+            answer["reason"] = FAST_REASON_UNJUDGED
         if reference is not None:
             reference_detail = reference.unapplied_detail()
     elif reference is not None and reference.applied:
@@ -458,7 +459,7 @@ async def _fast(
     )
     try:
         readout = await llm_client.call_readout(
-            prompt, labels=llm_confidence.FAST_DIGITS, label=f"fast/{name}", model=spec,
+            prompt, labels=FAST_DIGITS, label=f"fast/{name}", model=spec,
         )
     except llm_client.ReadoutIncomplete as exc:
         raise EvaluationError(f"{exc.summary} — use mode 'reasoned' for this criterion") from exc

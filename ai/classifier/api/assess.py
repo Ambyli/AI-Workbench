@@ -87,12 +87,11 @@ from starlette.datastructures import UploadFile
 from common.documents import UnsupportedDocumentError, detect_kind, pdf_page_count
 
 from analysis import load_input_bytes, resolve_svg_images, validate_content_type
-from api.criterion_options import MODE_NOT_REQUEST_LEVEL
 from api.schemas import AssessRequest, ClassifierMetadata, DocumentInput, validation_message
 # A module, not names: SVG_FETCH_IMAGES is read at call time, so a test (or a
 # future live-reload) can flip it without re-importing this module.
 import config
-from config import MAX_ITEMS
+from config import MAX_ITEMS, MODE_NOT_REQUEST_LEVEL
 from cv import get_detector
 # A module, not names: is_configured() reads DETECTOR_URL at call time.
 from detector import client as detector_client

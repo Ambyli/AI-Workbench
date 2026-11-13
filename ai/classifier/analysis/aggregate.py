@@ -74,7 +74,7 @@ from analysis.outcome import Outcome
 from analysis.result_specs import aggregated_detail, member_value, with_metric
 from analysis.text_eval import score_text
 from api.schemas import CriterionInput
-from config import DETAIL_FLOAT_DECIMALS
+from config import DETAIL_FLOAT_DECIMALS, SCORE_HI, SCORE_LO
 from utils import verdict_from_score
 
 
@@ -207,7 +207,7 @@ def aggregate_level(
     if which == "mean":
         scores = [float(m.outcome.score) for m in scored]
         mean = sum(scores) / len(scores)
-        score = max(1, min(10, round(mean)))
+        score = max(SCORE_LO, min(SCORE_HI, round(mean)))
         confidences = [m.outcome.confidence for m in scored if m.outcome.confidence is not None]
         # `value` is the mean of the members' headline numbers — their
         # measurement (cv), count (text), best box (detector) or score (llm).

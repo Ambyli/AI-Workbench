@@ -115,9 +115,11 @@ DEFAULT_MAX_RENDER_PIXELS = 25_000_000
 # How many external SVG references get a warning line of their own before the
 # rest are summarised as "+N more". A malicious file can carry thousands.
 _MAX_REF_WARNINGS = 10
-# A reported URL is cut to this many characters — a data-exfiltration URL can
-# be kilobytes long, and the warning only has to identify it.
-_MAX_WARNING_URL = 200
+# A reported URL is cut to this many characters by default — a
+# data-exfiltration URL can be kilobytes long, and the warning only has to
+# identify it. A service passes its own bound as load_document's
+# max_warning_url_chars, so every warning line it reports cuts URLs alike.
+DEFAULT_MAX_WARNING_URL_CHARS = 200
 
 # A native line is split wherever the gap between two neighbouring words is
 # more than this many times the line's height. PyMuPDF's (block, line) is
@@ -346,20 +348,26 @@ def _svg_zoom(width_pt: float, height_pt: float, render_dpi: int, max_pixels: in
     return zoom
 
 
-def _ref_warnings(raw: bytes) -> list[str]:
-    """One "not rendered" line per external reference, capped."""
+def _ref_warnings(raw: bytes, max_url_chars: int = DEFAULT_MAX_WARNING_URL_CHARS) -> list[str]:
+    """One "not rendered" line per external reference, capped; each URL cut
+    to ``max_url_chars``."""
     refs = find_external_refs(raw)
     lines = []
     for ref in refs[:_MAX_REF_WARNINGS]:
         what = "image" if ref.tag in ("image", "feImage") else f"<{ref.tag}> reference"
-        url = ref.url if len(ref.url) <= _MAX_WARNING_URL else ref.url[:_MAX_WARNING_URL] + "…"
+        url = ref.url if len(ref.url) <= max_url_chars else ref.url[:max_url_chars] + "…"
         lines.append(f"external {what} not rendered: {url}")
     if len(refs) > _MAX_REF_WARNINGS:
         lines.append(f"+{len(refs) - _MAX_REF_WARNINGS} more external reference(s) not rendered")
     return lines
 
 
-def _load_svg(raw: bytes, render_dpi: int, max_pixels: int) -> tuple[list[Page], list[str]]:
+def _load_svg(
+    raw: bytes,
+    render_dpi: int,
+    max_pixels: int,
+    max_url_chars: int = DEFAULT_MAX_WARNING_URL_CHARS,
+) -> tuple[list[Page], list[str]]:
     """Render an SVG as one page — image plus native text — like a 1-page PDF.
 
     MuPDF opens the SVG as a one-page document: ``get_text`` reads its
@@ -436,7 +444,7 @@ def _load_svg(raw: bytes, render_dpi: int, max_pixels: int) -> tuple[list[Page],
         height=height,
         native_lines=lines,
     )
-    return [page_out], _ref_warnings(raw)
+    return [page_out], _ref_warnings(raw, max_url_chars)
 
 
 def _load_txt(raw: bytes) -> list[Page]:
@@ -513,6 +521,7 @@ def load_document(
     image_decoder: Optional[ImageDecoder] = None,
     keep_source: bool = False,
     max_render_pixels: int = DEFAULT_MAX_RENDER_PIXELS,
+    max_warning_url_chars: int = DEFAULT_MAX_WARNING_URL_CHARS,
 ) -> Document:
     """Detect what ``raw`` is and load it into a ``Document``.
 
@@ -537,6 +546,11 @@ def load_document(
         max_render_pixels:
                        Ceiling on one SVG render's ``width × height``; past it
                        the zoom shrinks to fit (``_svg_zoom``). PDFs ignore it.
+        max_warning_url_chars:
+                       An SVG warning line cuts its URL to this many
+                       characters (default ``DEFAULT_MAX_WARNING_URL_CHARS``,
+                       200). A service that writes warnings of its own passes
+                       its bound, so both kinds cut alike.
 
     Returns:
         A ``Document`` with at least one page. An SVG's ``warnings`` list its
@@ -556,7 +570,10 @@ def load_document(
     elif resolved_kind == "pdf":
         pages, truncated = _load_pdf(raw, max_pages=max_pages, render_dpi=render_dpi)
     elif resolved_kind == "svg":
-        pages, warnings = _load_svg(raw, render_dpi=render_dpi, max_pixels=max_render_pixels)
+        pages, warnings = _load_svg(
+            raw, render_dpi=render_dpi, max_pixels=max_render_pixels,
+            max_url_chars=max_warning_url_chars,
+        )
     elif resolved_kind == "txt":
         pages = _load_txt(raw)
     elif resolved_kind == "docx":

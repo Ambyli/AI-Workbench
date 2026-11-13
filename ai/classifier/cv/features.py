@@ -57,6 +57,8 @@ from config import (
     CV_WATER_HSV_UPPER,
     CV_WATER_MAX_TEXTURE_VARIANCE,
     CV_WATER_MIN_CONTOUR_AREA_PX,
+    SCORE_HI,
+    SCORE_LO,
 )
 from cv.regions import _box_region, _mask_regions
 from cv.result import DetectorSpec, Measurement, cv_result, describes
@@ -120,13 +122,13 @@ def detect_vegetation(image) -> dict:
     ratio = green_pixels / total_pixels
 
     if ratio > CV_VEGETATION_PASS_ABOVE:
-        score = min(10, int(7 + (ratio - CV_VEGETATION_PASS_ABOVE) / 0.05))
+        score = min(SCORE_HI, int(7 + (ratio - CV_VEGETATION_PASS_ABOVE) / 0.05))
         verdict, confidence = "PASS", min(95, int(60 + ratio * 150))
     elif ratio >= CV_VEGETATION_MARGINAL_FROM:
         score = int(4 + (ratio - CV_VEGETATION_MARGINAL_FROM) / 0.01)
         verdict, confidence = "MARGINAL", 65
     else:
-        score = max(1, int(ratio / CV_VEGETATION_MARGINAL_FROM * 3))
+        score = max(SCORE_LO, int(ratio / CV_VEGETATION_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 75
 
     result = cv_result(
@@ -200,13 +202,13 @@ def detect_sky(image) -> dict:
     ratio = sky_pixels / total
 
     if ratio > CV_SKY_PASS_ABOVE:
-        score = min(10, int(7 + (ratio - CV_SKY_PASS_ABOVE) / 0.10))
+        score = min(SCORE_HI, int(7 + (ratio - CV_SKY_PASS_ABOVE) / 0.10))
         verdict, confidence = "PASS", min(90, int(70 + ratio * 20))
     elif ratio >= CV_SKY_MARGINAL_FROM:
         score = int(4 + (ratio - CV_SKY_MARGINAL_FROM) / 0.10)
         verdict, confidence = "MARGINAL", 65
     else:
-        score = max(1, int(ratio / CV_SKY_MARGINAL_FROM * 3))
+        score = max(SCORE_LO, int(ratio / CV_SKY_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 70
 
     result = cv_result(
@@ -294,7 +296,7 @@ def detect_faces(image) -> dict:
         logger.error("detect_faces: Haar cascade file not found at %s", cascade_path)
         return cv_result(
             detector="detect_faces",
-            score=1, verdict="FAIL", confidence=0,
+            score=SCORE_LO, verdict="FAIL", confidence=0,
             reason="Haar cascade file not found — face detection unavailable",
             metric="faces_count",
             measurements={"faces_count": 0, "faces_high_count": None, "faces_low_count": None},
@@ -449,13 +451,13 @@ def detect_water(image) -> dict:
     ratio = qualifying_pixels / total_pixels
 
     if ratio > CV_WATER_PASS_ABOVE:
-        score = min(10, int(7 + (ratio - CV_WATER_PASS_ABOVE) / 0.05))
+        score = min(SCORE_HI, int(7 + (ratio - CV_WATER_PASS_ABOVE) / 0.05))
         verdict, confidence = "PASS", min(85, int(65 + ratio * 100))
     elif ratio >= CV_WATER_MARGINAL_FROM:
         score = int(4 + (ratio - CV_WATER_MARGINAL_FROM) / 0.033)
         verdict, confidence = "MARGINAL", 60
     else:
-        score = max(1, int(ratio / CV_WATER_MARGINAL_FROM * 3))
+        score = max(SCORE_LO, int(ratio / CV_WATER_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 70
 
     result = cv_result(
@@ -567,13 +569,13 @@ def detect_text(image) -> dict:
         ]
 
     if ratio > CV_TEXT_PASS_ABOVE:
-        score = min(10, int(7 + (ratio - CV_TEXT_PASS_ABOVE) / 0.05))
+        score = min(SCORE_HI, int(7 + (ratio - CV_TEXT_PASS_ABOVE) / 0.05))
         verdict, confidence = "PASS", min(85, int(65 + ratio * 150))
     elif ratio >= CV_TEXT_MARGINAL_FROM:
         score = int(4 + (ratio - CV_TEXT_MARGINAL_FROM) / 0.023)
         verdict, confidence = "MARGINAL", 60
     else:
-        score = max(1, int(ratio / CV_TEXT_MARGINAL_FROM * 3))
+        score = max(SCORE_LO, int(ratio / CV_TEXT_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 75
 
     result = cv_result(

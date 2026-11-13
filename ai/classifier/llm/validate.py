@@ -35,6 +35,7 @@ Process flow position: passed to ``llm.client.call_model`` as its
 import difflib
 from typing import Any
 
+from config import SCORE_HI, SCORE_LO
 from logger import logger
 from utils import verdict_from_score as _verdict_from_score
 
@@ -83,7 +84,7 @@ def clamp_answer(entry: dict) -> dict:
     consumer of ``detail.confidence`` can tell a model's 50 from ours.
     """
     try:
-        score = max(1, min(10, int(round(float(entry.get("score", 5))))))
+        score = max(SCORE_LO, min(SCORE_HI, int(round(float(entry.get("score", 5))))))
     except (TypeError, ValueError):
         logger.warning("clamp_answer: invalid score %r, defaulting to 5", entry.get("score"))
         score = 5

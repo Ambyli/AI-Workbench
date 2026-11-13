@@ -50,13 +50,15 @@ ONE generated token, a digit read from its probabilities
 (``llm.client.call_readout``), on a model with a ``models.yaml`` ``fast:``
 block only (``api.schemas.check_model_rules`` names the ones that have
 one). Per criterion only: a request-level ``mode`` and a top-level
-criterion ``mode`` are named 400s (``MODE_NOT_REQUEST_LEVEL`` /
-``MODE_IN_OPTIONS``), and so is ``options.mode`` on cv / text / detector. A
-fast criterion is never guided by references (``guided_by_references``;
-``options.reference`` on one is ``FAST_NOT_GUIDED``). Like ``model`` it
-appears in ``resolve()`` only when sent, and it is not part of a
-criterion's identity. Every check is on the VALUE (no ``model_fields_set``):
-criteria are ``model_dump()``ed into payloads and validated again.
+criterion ``mode`` are named 400s (``config.MODE_NOT_REQUEST_LEVEL`` /
+``MODE_IN_OPTIONS``), and so is ``options.mode`` on cv / text / detector
+(``MODE_REFUSED_BY_TYPE``). A fast criterion is never guided by references
+(``guided_by_references``; ``options.reference`` on one is
+``config.FAST_NOT_GUIDED``). The values, the default and those 400s' wording
+are ``config.py`` § Fast mode. Like ``model`` it appears in ``resolve()``
+only when sent, and it is not part of a criterion's identity. Every check is
+on the VALUE (no ``model_fields_set``): criteria are ``model_dump()``ed into
+payloads and validated again.
 
 ``reference`` (``ReferenceOptions``) says how the request's ``references`` —
 stored worked examples, see ``references/`` — guide THIS criterion: whether
@@ -117,12 +119,14 @@ from common.documents import MAX_PATTERN_CHARS
 # default by patching them here.
 from config import (
     CRITERION_NAME_MAX_CHARS as NAME_MAX_CHARS,
+    DEFAULT_MODE,
     DETECTOR_MIN_SCORE,
     LLM_BBOX_MARKS_MAX,
     LLM_BBOX_MAX_ATTEMPTS,
     LLM_BBOX_REFINE_MODE,
     LLM_BBOX_VERIFY_MIN_SPAN,
     LLM_BBOX_VERIFY_PARTIAL,
+    MODES,
     REFERENCE_BOX_ASK,
     REFERENCE_BOX_REFINE,
     REFERENCE_BOX_TEXT,
@@ -144,26 +148,10 @@ from detector import client as detector_client
 
 OcrMode = Literal["auto", "always", "never"]
 RefineMode = Literal["grid", "marks"]
-# How an llm criterion's model answers (options.mode). null = "reasoned".
+# How an llm criterion's model answers (options.mode), null = config.DEFAULT_MODE.
+# Written out for type checkers (a Literal cannot take a variable); a test
+# pins typing.get_args(Mode) == config.MODES.
 Mode = Literal["reasoned", "fast"]
-MODES: tuple[str, ...] = ("reasoned", "fast")
-DEFAULT_MODE = "reasoned"
-
-# The 400s a mode can earn, worded once (api.schemas / api.reference_schemas
-# raise them too).
-MODE_NOT_REQUEST_LEVEL = (
-    "mode is per criterion: set options.mode on each llm criterion. A request has a "
-    "`model` default because job-wide calls (the references \"auto\" selection) need one; "
-    "nothing job-wide has a mode"
-)
-MODE_IN_OPTIONS = (
-    "mode belongs in options: options.mode on an llm criterion (reasoned | fast)"
-)
-FAST_NOT_GUIDED = (
-    "references guide the reasoned scoring call, and options.mode 'fast' is a one-token "
-    "readout with no reasoning for an example to steer; drop options.reference or use "
-    "mode 'reasoned'"
-)
 
 # Server caps a caller cannot exceed — NAME_MAX_CHARS and MIN_COUNT_CAP are
 # the config env knobs under their local names (api.schemas imports them here).

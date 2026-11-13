@@ -60,7 +60,7 @@ from analysis.result_specs import (
     with_metric,
 )
 from api.schemas import CriterionInput
-from config import FUZZY_CREDIT_FLOOR, TEXT_REGION_MAX_HITS
+from config import FUZZY_CREDIT_FLOOR, SCORE_HI, SCORE_LO, SCORE_PASS_MIN, TEXT_REGION_MAX_HITS
 from logger import logger
 from utils import verdict_from_score as _verdict_from_score
 
@@ -127,23 +127,27 @@ def _confidence(layer: TextLayer) -> int:
 def score_text(count: int, best_ratio: float, opts: dict, searched_chars: int) -> tuple[int, str]:
     """``(score, reason)`` for ``count`` hits against ``opts["min_count"]``."""
     if count >= max(1, opts["min_count"]):
-        return 10, (
+        return SCORE_HI, (
             f"Found {count}x via {opts['match']} match"
             + (f" (best ratio {best_ratio:.2f})" if opts["match"] == "fuzzy" else "")
             + "."
         )
     if opts["match"] == "fuzzy" and best_ratio >= FUZZY_CREDIT_FLOOR:
-        # Scale the near miss into 2-6 so "almost there" outranks "absent".
+        # Scale the near miss from SCORE_LO up to just under the PASS line
+        # (1-6: a near miss never PASSes) so "almost there" outranks "absent".
         # Below FUZZY_CREDIT_FLOOR there is no credit at all: difflib gives any
         # unrelated pair of phrases ~0.3-0.5, so anything less is noise.
+        near_miss_top = SCORE_PASS_MIN - 1
         span = max(1e-6, opts["fuzzy_threshold"] - FUZZY_CREDIT_FLOOR)
         closeness = min(1.0, (best_ratio - FUZZY_CREDIT_FLOOR) / span)
-        score = max(1, min(6, int(round(1 + 5 * closeness))))
+        score = max(SCORE_LO, min(near_miss_top, int(round(
+            SCORE_LO + (near_miss_top - SCORE_LO) * closeness
+        ))))
         return score, (
             f"Best fuzzy match scored {best_ratio:.2f}, below the "
             f"{opts['fuzzy_threshold']:.2f} threshold."
         )
-    return 1, (
+    return SCORE_LO, (
         f"'{opts['pattern']}' not found in {searched_chars} characters of document text "
         f"({opts['match']} match, min_count={opts['min_count']})."
     )
@@ -153,7 +157,7 @@ def _no_text(c: CriterionInput, opts: dict, source: str, ref: dict) -> Outcome:
     logger.info("text_eval: '%s' — no text layer under ocr=%s", c.name, opts["ocr"])
     return Outcome(
         method="text",
-        score=1,
+        score=SCORE_LO,
         verdict="FAIL",
         confidence=0,
         reason=(

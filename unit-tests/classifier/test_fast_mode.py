@@ -62,6 +62,7 @@ import numpy as np
 import pytest
 
 import analysis
+import config
 from api.schemas import AssessRequest, CriterionInput
 from llm import client as llm_client
 from llm import confidence as llm_confidence
@@ -900,7 +901,7 @@ def test_score_false_clears_a_fast_judgement(registry, monkeypatch):
     assert entry["score"] is None and entry["detail"]["value"] is None
     assert entry["detail"]["confidence"] is None and entry["detail"]["mode"] == "fast"
     # The band line IS the judgement: the reason keeps no band probabilities.
-    assert entry["reason"] == llm_confidence.FAST_REASON_UNJUDGED == "Fast readout (no reasoning)."
+    assert entry["reason"] == config.FAST_REASON_UNJUDGED == "Fast readout (no reasoning)."
     assert not any(band in entry["reason"] for band in ("PASS", "MARGINAL", "FAIL"))
     # The loop still ran on the readout's (withheld) score.
     assert entry["localization"]["accepted_attempt"] == 1
@@ -1073,7 +1074,8 @@ def test_a_fast_criterion_is_answered_but_never_guided(registry):
 
 
 def test_the_job_guide_notes_why_a_fast_criterion_is_not_guided(registry):
-    from analysis.references import FAST_NOT_GUIDED_NOTE, JobReferences
+    from analysis.references import JobReferences
+    from config import FAST_NOT_GUIDED_NOTE
 
     for mode in ("explicit", "auto"):
         refs = JobReferences(plan={"mode": mode, "criteria": {}})
@@ -1312,3 +1314,14 @@ def test_from_job_never_copies_an_errored_fast_units_observation(client, monkeyp
     warnings = ref["record"]["warnings"]
     assert any("fast readout" in w and "your breakdown is the answer" in w for w in warnings)
     assert not model.readouts()
+
+
+def test_the_literal_types_spell_out_their_config_tuples():
+    """``Mode`` and ``FastAnswerType`` are written out for type checkers (a
+    ``Literal`` cannot take a variable); config.py is still the one source."""
+    import typing
+
+    from api import criterion_options
+
+    assert typing.get_args(criterion_options.Mode) == config.MODES
+    assert typing.get_args(llm_models.FastAnswerType) == config.FAST_ANSWER_TYPES

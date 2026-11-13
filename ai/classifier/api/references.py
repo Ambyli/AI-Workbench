@@ -108,7 +108,7 @@ from common.vision import content_type_for
 from analysis import load_input_bytes, resolve_svg_images, validate_content_type
 from analysis.loading import _validate_image_dimensions
 from api.assess import _json_filename
-from api.criterion_options import MODE_NOT_REQUEST_LEVEL, identity
+from api.criterion_options import identity
 from api.reference_schemas import ReferencePatch, ReferenceRequest
 from api.schemas import (
     ClassifierMetadata,
@@ -123,6 +123,7 @@ import config
 from config import (
     LLM_BBOX_GRID,
     LLM_BBOX_MAX_ATTEMPTS,
+    MODE_NOT_REQUEST_LEVEL,
     PDF_RENDER_DPI,
     REFERENCE_MAX_COUNT,
 )

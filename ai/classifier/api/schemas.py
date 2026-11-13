@@ -61,10 +61,7 @@ from pydantic import (
 from common.documents import Document, InvalidPatternError, match_text
 
 from api.criterion_options import (
-    FAST_NOT_GUIDED,
     LEGACY_TOP_LEVEL_KEYS,
-    MODE_IN_OPTIONS,
-    MODE_NOT_REQUEST_LEVEL,
     NAME_MAX_CHARS,
     NOT_GUIDED,
     OPTIONS_MODELS,
@@ -77,6 +74,10 @@ from api.criterion_options import (
 )
 from config import (
     DEFAULT_CRITERIA,
+    FAST_NOT_GUIDED,
+    MODE_IN_OPTIONS,
+    MODE_NOT_REQUEST_LEVEL,
+    MODE_REFUSED_BY_TYPE,
     REFERENCE_MAX_PER_REQUEST,
     REFERENCE_MAX_TAGS,
     REFERENCE_TAG_MAX_CHARS,
@@ -128,19 +129,6 @@ def _format_errors(exc: ValidationError, prefix: str = "") -> str:
             msg = msg[len("Value error, "):]
         parts.append(f"{where}: {msg}" if where else msg)
     return "; ".join(parts)
-
-
-# Why options.mode is refused on each type that has none (a named 400, not
-# a bare "extra inputs").
-_NO_MODE: dict[str, str] = {
-    "text": "only an llm criterion has a mode (reasoned | fast); a text criterion is a "
-            "deterministic search of the text layer — no model answers it",
-    "detector": "only an llm criterion has a mode (reasoned | fast); a detector criterion is "
-                "answered by the open-vocabulary detector — no model reasons about it",
-    "cv": "only an llm criterion has a mode (reasoned | fast); a cv criterion is answered by "
-          "an OpenCV detector, the detector service or its llm fallback, which always runs "
-          "reasoned — use an llm criterion for a fast readout",
-}
 
 
 def clean_key(value: Any, where: str = "a key", unset: str = "omit it") -> Any:
@@ -260,7 +248,9 @@ class CriterionInput(BaseModel):
         if "reference" in raw and self.type in ("text", "detector"):
             raise ValueError(f"options.reference: {NOT_GUIDED} (a {self.type} criterion)")
         if "mode" in raw and self.type != "llm":
-            raise ValueError(f"options.mode: {_NO_MODE[self.type]}")
+            # Named per type (config.MODE_REFUSED_BY_TYPE), not a bare
+            # "extra inputs".
+            raise ValueError(f"options.mode: {MODE_REFUSED_BY_TYPE[self.type]}")
         try:
             self.options = model.model_validate(raw)
         except ValidationError as exc:

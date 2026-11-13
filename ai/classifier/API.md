@@ -276,7 +276,8 @@ ai/classifier/
   logger.py            the one "classifier" logger every module imports
   middleware.py        correlation IDs: the ContextVar, the filter, the middleware
   metrics.py           the Prometheus objects produced in one module, read in none
-  utils.py             verdict_from_score — the PASS/MARGINAL/FAIL line
+  utils.py             verdict_from_score — the PASS/MARGINAL/FAIL line (its thresholds and the
+                       1-10 scale are config.py's SCORE_* constants)
   api/                 the HTTP layer
     schemas.py         AssessRequest (a documents list), DocumentInput, CriterionInput + the cross-criterion rules
     criterion_options.py  LLMOptions / TextOptions / CVOptions / DetectorOptions: defaults, caps,

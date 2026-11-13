@@ -121,7 +121,7 @@ from common.logprobs import (
     resolve_path,
 )
 
-from config import HTTP_CONNECT_TIMEOUT, MAX_LLM_RETRIES
+from config import HTTP_CONNECT_TIMEOUT, MAX_LLM_RETRIES, SCORE_HI, SCORE_LO
 from llm import confidence as llm_confidence
 from llm import usage as llm_usage
 from llm.models import ModelSpec, get_registry
@@ -628,7 +628,7 @@ def _logprob_distribution(data: dict, spec: ModelSpec):
         if isinstance(message, dict) and isinstance(message.get("content"), str):
             content = message["content"]
         dist = int_field_distribution(
-            entries, llm_confidence.SCORE_KEY, llm_confidence.SCORE_LO, llm_confidence.SCORE_HI,
+            entries, llm_confidence.SCORE_KEY, SCORE_LO, SCORE_HI,
             content=content, top_key=cfg.top_key, number_tokens=cfg.number_tokens,
         )
     except Exception as exc:  # noqa: BLE001 — a measurement never fails the call
@@ -696,9 +696,7 @@ def _measure(responses: list[dict], validator, measure: Optional[str], spec: Mod
         "verdicts": [a.get("verdict") for a in scored],
         "stated": [a.get("confidence") for a in scored],
     }
-    dist = from_samples(
-        [a["score"] for a in scored], llm_confidence.SCORE_LO, llm_confidence.SCORE_HI,
-    ) if scored else None
+    dist = from_samples([a["score"] for a in scored], SCORE_LO, SCORE_HI) if scored else None
     note = None if dist is not None else "sampling: no sample carried a score"
     return {**reported, llm_confidence.DIST_KEY: dist, llm_confidence.SAMPLES_KEY: samples,
             llm_confidence.NOTE_KEY: note}

@@ -46,7 +46,9 @@ writes numbers, how many samples) is a knob with a default. Load refuses a
 ``headline: calibrated`` without points, a calibration ``signal`` the method
 cannot produce, a reserved body key in ``logprobs.request`` /
 ``sampling.extra_body``, and ``sampling`` via ``n_param`` with ``n`` above
-``max_concurrent`` (one such call holds n slots). See ``llm.confidence``.
+``max_concurrent`` (one such call holds n slots). The defaults and the bounds
+of ``sampling.n`` are ``config.py`` § Measured confidence. See
+``llm.confidence``.
 
 **Fast is configuration too.** An entry's optional ``fast:`` block
 (``FastConfig``) says it can answer with reasoning OFF and ONE generated
@@ -61,7 +63,8 @@ is a 400 on that entry; nothing branches on a model name. Load refuses a
 reserved key in ``fast.extra_body`` (as in ``confidence.logprobs.request``,
 plus ``logprobs`` / ``top_logprobs``), ``top_logprobs`` under 11, a
 ``max_unseen_mass`` of 0 (it would cap every readout) and an unknown
-calibration answer type.
+calibration answer type. The defaults, that floor (11) and the answer types
+are ``config.py`` § Fast mode.
 
 **Replaced settings.** The registry replaced ``VISION_LLM_API``,
 ``VISION_LLM_MODEL``, ``VISION_LLM_REASONING_STRENGTH`` /
@@ -74,8 +77,11 @@ logs one WARNING naming whichever are still set, so a stale ``.env`` is
 visible rather than silently ignored.
 
 Process flow position: a leaf of the ``llm`` package — it imports no other
-classifier module but ``logger``, so ``config``-level code (``db``'s pool
-size) can ask it for the total concurrency without an import cycle.
+classifier module but ``logger`` and ``config`` (the ``confidence:`` and
+``fast:`` blocks' defaults; ``config`` imports only the standard library and
+``common.net``),
+so ``config``-level code (``db``'s pool size) can ask it for the total
+concurrency without an import cycle.
 """
 
 from __future__ import annotations
@@ -93,6 +99,26 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from common.jobs.limits import ConcurrencyLimit
 
+from config import (
+    CONFIDENCE_DEFAULT_HEADLINE,
+    CONFIDENCE_DEFAULT_METHOD,
+    CONFIDENCE_FALLBACK,
+    CONFIDENCE_LOGPROBS_DEFAULT_ENTRIES_PATH,
+    CONFIDENCE_LOGPROBS_DEFAULT_MIN_COVERAGE,
+    CONFIDENCE_LOGPROBS_DEFAULT_NUMBER_TOKENS,
+    CONFIDENCE_LOGPROBS_DEFAULT_REQUEST,
+    CONFIDENCE_LOGPROBS_DEFAULT_TOP_KEY,
+    CONFIDENCE_SAMPLING_DEFAULT_N,
+    CONFIDENCE_SAMPLING_DEFAULT_VIA,
+    CONFIDENCE_SAMPLING_MAX_N,
+    CONFIDENCE_SAMPLING_MIN_N,
+    FAST_ANSWER_TYPES,
+    FAST_DEFAULT_EXTRA_BODY,
+    FAST_DEFAULT_MAX_UNSEEN_MASS,
+    FAST_DEFAULT_MIN_COVERAGE,
+    FAST_DEFAULT_TOP_LOGPROBS,
+    FAST_MIN_TOP_LOGPROBS,
+)
 from logger import logger
 
 # The checked-in registry. The container bind-mounts the box's copy over this
@@ -193,7 +219,9 @@ class MaxTokens(_Strict):
 # signal is acquired and every knob has a default. An entry without the block
 # is `method: stated` — nothing extra is requested, which is safe on any
 # provider. What each method produces is `llm.confidence`'s job; the request
-# body changes (score calls only) are `ModelSpec.body`'s.
+# body changes (score calls only) are `ModelSpec.body`'s. The defaults, and
+# the bounds of sampling.n, are config.py § Measured confidence
+# (CONFIDENCE_*); an entry's own value wins. The Literals stay written out.
 
 CONFIDENCE_METHODS: tuple[str, ...] = ("logprobs", "sampling", "stated")
 
@@ -229,16 +257,16 @@ class LogprobsConfig(_Strict):
     """``confidence.logprobs`` — reading the score's token distribution."""
 
     request: dict[str, Any] = Field(
-        default_factory=lambda: {"logprobs": True, "top_logprobs": 20},
+        default_factory=lambda: dict(CONFIDENCE_LOGPROBS_DEFAULT_REQUEST),
         description="Merged into the SCORE request body only — whatever this provider's API wants.",
     )
     entries_path: str = Field(
-        default="choices.0.logprobs.content", min_length=1,
+        default=CONFIDENCE_LOGPROBS_DEFAULT_ENTRIES_PATH, min_length=1,
         description="Dotted path to the [{token, logprob, <top_key>}] list in the response.",
     )
-    top_key: str = Field(default="top_logprobs", min_length=1)
-    number_tokens: Literal["auto", "single", "digits"] = "auto"
-    min_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
+    top_key: str = Field(default=CONFIDENCE_LOGPROBS_DEFAULT_TOP_KEY, min_length=1)
+    number_tokens: Literal["auto", "single", "digits"] = CONFIDENCE_LOGPROBS_DEFAULT_NUMBER_TOKENS
+    min_coverage: float = Field(default=CONFIDENCE_LOGPROBS_DEFAULT_MIN_COVERAGE, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _body(self) -> "LogprobsConfig":
@@ -249,8 +277,12 @@ class LogprobsConfig(_Strict):
 class SamplingConfig(_Strict):
     """``confidence.sampling`` — the empirical distribution of n answers."""
 
-    n: int = Field(default=5, ge=2, le=32)
-    via: Literal["n_param", "repeat"] = "n_param"
+    n: int = Field(
+        default=CONFIDENCE_SAMPLING_DEFAULT_N,
+        ge=CONFIDENCE_SAMPLING_MIN_N,
+        le=CONFIDENCE_SAMPLING_MAX_N,
+    )
+    via: Literal["n_param", "repeat"] = CONFIDENCE_SAMPLING_DEFAULT_VIA
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -291,11 +323,11 @@ class ConfidenceConfig(_Strict):
     """An entry's ``confidence:`` block. Every knob has a default; no block at
     all is ``method: stated``."""
 
-    method: Literal["logprobs", "sampling", "stated"] = "stated"
+    method: Literal["logprobs", "sampling", "stated"] = CONFIDENCE_DEFAULT_METHOD
     logprobs: LogprobsConfig = Field(default_factory=LogprobsConfig)
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
-    fallback: Literal["stated"] = "stated"
-    headline: Literal["stated", "calibrated"] = "stated"
+    fallback: Literal["stated"] = CONFIDENCE_FALLBACK
+    headline: Literal["stated", "calibrated"] = CONFIDENCE_DEFAULT_HEADLINE
     calibration: Optional[CalibrationConfig] = None
 
     @model_validator(mode="after")
@@ -344,15 +376,15 @@ class ConfidenceConfig(_Strict):
 # off — Muse Glimmer's lowest level is `low` — simply has none). How the body
 # is built is `ModelSpec.fast_body`; what the readout must look like before
 # it is believed is `min_coverage` / `max_unseen_mass` (llm.client.call_readout).
+# The defaults, the top_logprobs floor and the calibratable answer types are
+# config.py § Fast mode (FAST_DEFAULT_*, FAST_MIN_TOP_LOGPROBS,
+# FAST_ANSWER_TYPES); an entry's own value wins.
 
-# The answer types a fast calibration may be fitted for. Phase 1 reads the
-# 1-10 rating only (digits 0-9); typed answers (yes / no, choice, levels)
-# join when they exist.
-FAST_ANSWER_TYPES: tuple[str, ...] = ("rating",)
-
-# The fewest alternatives a readout may ask for: all ten digits must fit in
-# the list with room for one more token.
-FAST_MIN_TOP_LOGPROBS = 11
+# A fast.calibration key: one of config.FAST_ANSWER_TYPES (the 1-10 rating
+# only today; typed answers — yes / no, choice, levels — join when they exist).
+# Written out for type checkers (a Literal cannot take a variable); a test
+# pins typing.get_args(FastAnswerType) == config.FAST_ANSWER_TYPES.
+FastAnswerType = Literal["rating"]
 
 # Body keys fast.extra_body may not set: the confidence block's reserved keys
 # (model / messages / the token field / response_format / chat_template_kwargs
@@ -387,24 +419,24 @@ class FastConfig(_Strict):
                     "reasoning off, e.g. {enable_thinking: false}.",
     )
     extra_body: dict[str, Any] = Field(
-        default_factory=lambda: {"temperature": 0},
+        default_factory=lambda: dict(FAST_DEFAULT_EXTRA_BODY),
         description="Merged into a fast body after the entry's extra_body. Default "
                     "{temperature: 0}: greedy, so a written answer is the most probable "
                     "path (the logprobs read are raw, before temperature).",
     )
     top_logprobs: int = Field(
-        default=20, ge=FAST_MIN_TOP_LOGPROBS,
+        default=FAST_DEFAULT_TOP_LOGPROBS, ge=FAST_MIN_TOP_LOGPROBS,
         description="Alternatives asked for at the answer position. Never above the "
                     "server's --max-logprobs (vLLM's default is 20; a request over it is "
                     "a 400).",
     )
     min_coverage: float = Field(
-        default=0.5, ge=0.0, le=1.0,
+        default=FAST_DEFAULT_MIN_COVERAGE, ge=0.0, le=1.0,
         description="The share of the answer position's probability that must fall on "
                     "the labels; below it the readout is incomplete.",
     )
     max_unseen_mass: float = Field(
-        default=0.02, gt=0.0, le=1.0,
+        default=FAST_DEFAULT_MAX_UNSEEN_MASS, gt=0.0, le=1.0,
         description="The probability cap: what labels missing from the top_logprobs list "
                     "hold is estimated as n_unseen × the smallest listed probability "
                     "(capped by 1 − coverage; one spelling per label, so a heuristic, not "
@@ -418,7 +450,7 @@ class FastConfig(_Strict):
                     "criterion name and the text layer): chat-template markers that would "
                     "turn reasoning back on.",
     )
-    calibration: dict[Literal["rating"], FastCalibration] = Field(
+    calibration: dict[FastAnswerType, FastCalibration] = Field(
         default_factory=dict,
         description="Per answer type: {temperature, bias, n, fitted_on, ground_truth}. "
                     "{} = uncalibrated (the raw readout is reported).",

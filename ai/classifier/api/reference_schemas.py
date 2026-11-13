@@ -42,7 +42,7 @@ from typing import Annotated, Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from api.criterion_options import MODE_NOT_REQUEST_LEVEL, NAME_MAX_CHARS, check_model_id
+from api.criterion_options import NAME_MAX_CHARS, check_model_id
 from api.schemas import (
     CriterionInput,
     DocumentInput,
@@ -53,19 +53,19 @@ from api.schemas import (
 )
 from config import (
     LLM_BBOX_GRID,
+    MODE_NOT_REQUEST_LEVEL,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_MAX_TAGS,
+    REFERENCE_REASON_MAX_CHARS,
     REFERENCE_TAG_MAX_CHARS,
     REFERENCE_TITLE_MAX_CHARS,
+    SCORE_HI,
+    SCORE_LO,
 )
 from utils import verdict_from_score
 
 # A job id is common.jobs' 12 hex.
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-
-# The longest breakdown reason a caller may store; it is pasted into the
-# example's caption, so it is kept to a few sentences.
-REASON_MAX_CHARS = 1000
 
 
 class BreakdownInput(BaseModel):
@@ -74,14 +74,14 @@ class BreakdownInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    score: int = Field(ge=1, le=10, description="The expected 1-10 score.")
+    score: int = Field(ge=SCORE_LO, le=SCORE_HI, description="The expected 1-10 score.")
     verdict: Optional[Literal["PASS", "MARGINAL", "FAIL"]] = Field(
         default=None,
         description="Optional; must be the score's verdict (7-10 PASS, 4-6 MARGINAL, 1-3 FAIL).",
     )
     reason: Optional[str] = Field(
         default=None,
-        max_length=REASON_MAX_CHARS,
+        max_length=REFERENCE_REASON_MAX_CHARS,
         description="Why — shown to the model as the example's caption.",
     )
 

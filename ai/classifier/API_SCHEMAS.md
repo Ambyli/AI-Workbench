@@ -55,7 +55,8 @@ Response `200` (`application/json`):
           "timeout_s",
           "max_concurrent",
           "in_flight",
-          "confidence"
+          "confidence",
+          "fast"
         ],
         "properties": {
           "id": {
@@ -86,12 +87,22 @@ Response `200` (`application/json`):
           "supports": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["boxes", "references", "contrastive_references", "text_only_scoring"],
+            "required": [
+              "boxes",
+              "references",
+              "contrastive_references",
+              "text_only_scoring",
+              "fast"
+            ],
             "properties": {
               "boxes": {"type": "boolean"},
               "references": {"type": "boolean"},
               "contrastive_references": {"type": "boolean"},
-              "text_only_scoring": {"type": "boolean"}
+              "text_only_scoring": {"type": "boolean"},
+              "fast": {
+                "type": "boolean",
+                "description": "options.mode \"fast\" may run here: the entry has a models.yaml `fast` block"
+              }
             }
           },
           "reasoning": {
@@ -128,6 +139,36 @@ Response `200` (`application/json`):
               "headline": {"enum": ["stated", "calibrated"]},
               "calibrated": {"type": "boolean", "description": "A calibration is fitted"}
             }
+          },
+          "fast": {
+            "type": ["object", "null"],
+            "description": "The one-token readout (options.mode \"fast\", `FastConfig.public`): null without a models.yaml `fast` block — never the body extras",
+            "additionalProperties": false,
+            "required": ["top_logprobs", "min_coverage", "max_unseen_mass", "calibrated"],
+            "properties": {
+              "top_logprobs": {
+                "type": "integer",
+                "minimum": 11,
+                "description": "Alternatives asked for at the answer position (never above the server's --max-logprobs)"
+              },
+              "min_coverage": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Below this share of the answer position's probability on the labels, the readout is incomplete (the unit errors)"
+              },
+              "max_unseen_mass": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "description": "The probability cap: at or above it, the readout's estimate of what labels missing from the top-k hold (unseen_bound, a heuristic), the readout is refused (the unit errors)"
+              },
+              "calibrated": {
+                "type": "array",
+                "items": {"enum": ["rating"]},
+                "description": "The answer types with a fitted fast.calibration"
+              }
+            }
           }
         }
       },
@@ -153,6 +194,7 @@ Response `200` (`application/json`):
     "reference",
     "box_loop",
     "model",
+    "mode",
     "detector_configured",
     "aggregate_detail"
   ],
@@ -514,6 +556,36 @@ Response `200` (`application/json`):
           "items": {"type": "string"}
         },
         "catalog": {"type": "string"},
+        "identity": {"type": "string"}
+      }
+    },
+    "mode": {
+      "type": "object",
+      "description": "options.mode on llm criteria — per criterion only",
+      "additionalProperties": false,
+      "required": [
+        "applies_to",
+        "values",
+        "default",
+        "request_level",
+        "fast_models",
+        "fast",
+        "identity"
+      ],
+      "properties": {
+        "applies_to": {"type": "string"},
+        "values": {
+          "type": "array",
+          "items": {"enum": ["reasoned", "fast"]}
+        },
+        "default": {"const": "reasoned"},
+        "request_level": {"const": false, "description": "There is no request-level mode"},
+        "fast_models": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Where \"fast\" may run on THIS container: the available entries with a models.yaml `fast` block (GET /models supports.fast), in file order"
+        },
+        "fast": {"type": "string"},
         "identity": {"type": "string"}
       }
     },
@@ -3695,8 +3767,12 @@ The definitions (`#/$defs/<name>`) that the schemas above too large to show inli
     },
     "confidence": {
       "type": ["object", "null"],
-      "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated, headline: stated | calibrated, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; the whole block is null for a `score: false` criterion",
+      "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated | readout, headline: stated | calibrated | readout, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; under options.mode 'fast' method and source are `readout` (the one-token readout's digit probabilities, score = digit + 1), `stated` is null, headline is `readout` (or `calibrated` after the entry's fast.calibration.rating), and the block adds `unseen_bound` (an estimate of what the digits missing from the top-k hold); the whole block is null for a `score: false` criterion",
       "additionalProperties": true
+    },
+    "mode": {
+      "type": "string",
+      "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent (present only when options.mode was sent)"
     },
     "reference": {
       "type": "object",
@@ -3735,6 +3811,10 @@ The definitions (`#/$defs/<name>`) that the schemas above too large to show inli
     "image_sent": {
       "type": "boolean",
       "description": "Whether the page image was attached (never, for a text-only model)"
+    },
+    "mode": {
+      "type": "string",
+      "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent (present only when options.mode was sent)"
     },
     "aggregate": {
       "type": "object",

@@ -56,12 +56,18 @@ request, never a creation job that fails a minute later:
                      ``options_used``, with a warning on the reference (no
                      ``depends_on``; ``weight`` only where the breakdown kept
                      it). Inherited criteria keep their ``key``s, and two
-                     sharing one is a 400 (send ``criteria`` explicitly).
+                     sharing one is a 400 (send ``criteria`` explicitly),
+                     and lose ``options.reference`` and ``options.mode``.
                      Each criterion whose type, ``score`` and resolved
                      options match the job's takes the job's answer on that
                      item and its ACCEPTED regions there as supplied (the key
                      is not compared: it changes how a reference is found,
-                     not the question);
+                     not the question) — except a criterion the job ran as
+                     a fast readout (its ``options.mode: "fast"``, so an
+                     errored readout too), whose answer and observation
+                     are never copied (a warning says so; the creation job
+                     scores it reasoned unless the caller's breakdown
+                     answers it);
   4. every breakdown / regions key names a criterion; every pixel region lies
      inside the page (``grid`` regions are converted to pixels here) — 400;
   5. register the creation job ("staging", metadata type "reference" —
@@ -102,7 +108,7 @@ from common.vision import content_type_for
 from analysis import load_input_bytes, resolve_svg_images, validate_content_type
 from analysis.loading import _validate_image_dimensions
 from api.assess import _json_filename
-from api.criterion_options import without_model
+from api.criterion_options import MODE_NOT_REQUEST_LEVEL, identity
 from api.reference_schemas import ReferencePatch, ReferenceRequest
 from api.schemas import (
     ClassifierMetadata,
@@ -247,6 +253,8 @@ async def _from_json(request: Request) -> tuple[ReferenceRequest, Optional[_Uplo
 async def _from_form(request: Request) -> tuple[ReferenceRequest, Optional[_Upload]]:
     form = await request.form()
     keys = list(form.keys())
+    if "mode" in keys:
+        raise _bad(f"Invalid reference: {MODE_NOT_REQUEST_LEVEL}")
     if "text" in keys:
         raise _bad("A reference is one page image; inline 'text' has none. Send a 'file'.")
     unknown = sorted({k for k in keys if k not in _FORM_FIELDS})
@@ -381,13 +389,28 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
 def _same_question(a: CriterionInput, b: CriterionInput) -> bool:
     """Whether a job's answer to ``b`` answers ``a`` — same type, same
     ``score``, same resolved options. Weight and depends_on change how an
-    answer counts, not what it is; ``options.model`` changes who answered,
-    not the question (``without_model``); a ``key`` changes how a reference
-    is found, not the question, so it is not compared either."""
+    answer counts, not what it is; ``options.model`` / ``options.mode``
+    change who answered and how, not the question (``identity``); a ``key``
+    changes how a reference is found, not the question, so it is not
+    compared either."""
     return (
         a.type == b.type and a.score == b.score
-        and without_model(a.resolved_options()) == without_model(b.resolved_options())
+        and identity(a.resolved_options()) == identity(b.resolved_options())
     )
+
+
+def _as_reference_criterion(c: CriterionInput) -> CriterionInput:
+    """A job's criterion as a reference's: ``options.reference`` dropped (a
+    reference's own criteria are never guided) and ``options.mode`` dropped
+    (a reference records reasoned answers; the creation job scores it
+    reasoned). The rest — the question — is unchanged."""
+    update = {
+        key: None for key in ("reference", "mode")
+        if getattr(c.options, key, None) is not None
+    }
+    if not update:
+        return c
+    return c.model_copy(update={"options": c.options.model_copy(update=update)})
 
 
 def _legacy_criteria(job_id: str, result: dict) -> tuple[list[CriterionInput], str]:
@@ -480,13 +503,18 @@ async def _resolve_from_job(model: ReferenceRequest) -> _Source:
     else:
         job_criteria, warning = _legacy_criteria(job_id, result)
         warnings.append(warning)
+    # Which of the job's criteria ran as fast readouts — read from the job's
+    # OWN criteria, before the mode is stripped below: an errored fast unit
+    # (an incomplete or capped readout) has `detail: {}`, so its unit cannot
+    # say it was fast, and its observation must not be copied either.
+    fast_names = {
+        c.name for c in job_criteria if getattr(c.options, "mode", None) == "fast"
+    }
     # A guided job's criteria carry options.reference; a reference's own
     # criteria are never guided, so it is dropped (the answer still stands).
-    job_criteria = [
-        c.model_copy(update={"options": c.options.model_copy(update={"reference": None})})
-        if getattr(c.options, "reference", None) is not None else c
-        for c in job_criteria
-    ]
+    # options.mode is dropped too: a reference records reasoned answers (a
+    # fast unit's answer is not copied below).
+    job_criteria = [_as_reference_criterion(c) for c in job_criteria]
     criteria = list(model.criteria) if model.criteria is not None else job_criteria
     if model.criteria is None:
         try:
@@ -517,6 +545,26 @@ async def _resolve_from_job(model: ReferenceRequest) -> _Source:
             (u for u in (per.get(c.name) or {}).get("items") or [] if u.get("item") == item),
             None,
         )
+        if unit is not None and (
+            c.name in fast_names or (unit.get("detail") or {}).get("mode") == "fast"
+        ):
+            # A fast readout's answer is never an expected answer: its reason
+            # is service-written ("Fast readout (no reasoning): …") and would
+            # become a caption in later prompts. Neither it nor the unit's
+            # observation is copied — an errored readout's included; the
+            # creation job scores the criterion (reasoned — its mode was
+            # dropped above) unless the caller supplies the answer. Regions
+            # still are.
+            then = (
+                "your breakdown is the answer" if c.name in model.breakdown
+                else f"the creation job scores it reasoned; send breakdown[{c.name!r}] "
+                     "to set it yourself"
+            )
+            warnings.append(
+                f"{c.name!r}: job {job_id!r} ran it as a fast readout (options.mode 'fast'), "
+                f"which is never copied as an expected answer or an observation — {then}"
+            )
+            unit = None
         if unit is not None:
             entry["observed"] = {
                 "status": unit.get("status"), "method": unit.get("method"),

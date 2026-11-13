@@ -9,6 +9,23 @@ model's ``text_char_budget``, scored on the rubric ITS ``options.hint``
 selects. A model that cannot answer fails this criterion alone. The model's
 registry id is ``detail.model``.
 
+**``options.mode: "fast"``** replaces that scoring call with ONE readout
+(``_fast``): the same prompt prefix asking for a digit 0-9 with reasoning off
+(``build_llm_prompt(style="fast")``, ``ModelSpec.fast_body``), read from the
+token's probabilities (``llm.client.call_readout`` — posted once, never
+retried) and rated by ``llm.confidence.rate_readout``: the band with the most
+mass is the verdict, the most probable score inside it the score,
+``round(100 × that mass)`` the confidence, a service-written line of the
+band probabilities the reason (for a ``score: false`` criterion, whose
+judgement is not reported, the line without them); ``detail.confidence``
+keeps its shape with source ``readout`` (plus ``unseen_bound``). An
+incomplete or capped readout
+fails the unit, naming mode ``reasoned``. A fast criterion is never guided by
+references (its ``detail.reference``, in a request with references, is
+``applied: false`` with the reason). ``detail.mode`` echoes ``options.mode``
+only when it was sent. The box loop after a fast score runs reasoned,
+exactly as it does after a reasoned one.
+
 A TEXT-ONLY model (``vision: false``) is sent the text layer and no image;
 an item with no text at all fails the unit ("no text available for a
 text-only model"), and the box loop never runs for it (the submit refuses
@@ -73,6 +90,7 @@ imports ``analysis``) — left out under the criterion's ``options.ocr:
                        how a `cv` criterion's "llm" fallback reaches it (its
                        ``reference`` guide passed through).
     _guided()        — the reference-guided scoring calls, combined.
+    _fast()          — the one-token readout (``options.mode: "fast"``).
     _box_reference_entry() — what the loop was shown: the unit's
                        ``localization.references`` entry, references.json
                        rows and the metric.
@@ -169,14 +187,23 @@ LLM_RESULT = ResultSpec(
         ),
         "confidence": FieldSpec(
             "How sure the model was, measured per models.yaml `confidence.method` "
-            "(llm.confidence): `{method, source: logprobs | sampling | stated, headline: "
-            "stated | calibrated, stated, stated_defaulted, calibrated, "
+            "(llm.confidence): `{method, source: logprobs | sampling | stated | readout, "
+            "headline: stated | calibrated | readout, stated, stated_defaulted, calibrated, "
             "verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: "
             "{\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, "
             "unresolved: [{values, mass}], samples: null | {asked, answered, agreement, "
             "stated_mean}, note}` — the distribution keys are null when source is "
-            "`stated`; the whole block is null for a `score: false` criterion",
+            "`stated`; under options.mode 'fast' method and source are `readout` (the "
+            "one-token readout's digit probabilities, score = digit + 1), `stated` is "
+            "null, headline is `readout` (or `calibrated` after the entry's "
+            "fast.calibration.rating), and the block adds `unseen_bound` (an estimate of "
+            "what the digits missing from the top-k hold); the whole block is null for a "
+            "`score: false` criterion",
             "object", nullable=True,
+        ),
+        "mode": FieldSpec(
+            "How the model answered: `reasoned` | `fast` — the criterion's options.mode "
+            "as sent", "string", stable=True, when="options.mode was sent",
         ),
         "reference": REFERENCE_FIELD,
         "aggregate": AGGREGATE_FIELD,
@@ -187,6 +214,11 @@ LLM_RESULT = ResultSpec(
         "The top-level confidence is detail.confidence.stated unless the model's "
         "models.yaml entry says `headline: calibrated` and this answer has the "
         "calibration's signal (then detail.confidence.calibrated).",
+        "Under options.mode 'fast' the answer is a one-token readout: the verdict is the "
+        "band with the most probability, the score the most probable score inside it, "
+        "the confidence round(100 × that band's probability) and the reason a "
+        "service-written line of the three band probabilities (without them for a "
+        "`score: false` criterion).",
         "Box-loop results are in `localization`, not `detail`.",
         "A cv criterion answered by the llm fallback has this shape, `reference` included.",
     ),
@@ -198,7 +230,7 @@ async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """Score ``c`` with one model call (or its guided calls); locate it when
     ``options.boxes``."""
     guide = ctx.references.guide(c, ctx.item) if ctx.references is not None else None
-    return await evaluate_with(c.name, c.resolved_options(), ctx, reference=guide)
+    return await evaluate_with(c.name, c.resolved_options(), ctx, reference=guide, judged=c.score)
 
 
 @result_spec(LLM_RESULT)
@@ -208,16 +240,24 @@ async def evaluate_with(
     ctx: DocumentContext,
     *,
     reference: Optional[CriterionGuide] = None,
+    judged: bool = True,
 ) -> Outcome:
     """Score under RESOLVED llm options — one call, or the reference-guided
     calls combined — then the loop if asked.
+
+    ``judged`` is the criterion's ``score``. The scheduler clears a ``score:
+    false`` unit's judgement afterwards (``analysis.scheduler._unjudged``) but
+    keeps its reason — a model-written explanation. A fast readout's reason is
+    nothing but its band probabilities, i.e. the judgement, so an unjudged
+    fast unit is given ``FAST_REASON_UNJUDGED`` instead.
 
     Raises:
         llm.client.LLMCallError: The scoring call failed (HTTP error, or no
             parseable answer after MAX_LLM_RETRIES) — for guided calls, every
             one of them did. The scheduler turns it into ``status: "error"``.
-        EvaluationError: A guiding reference was deleted after submit, or the
-            model is text-only and the item has no text at all.
+        EvaluationError: A guiding reference was deleted after submit, the
+            model is text-only and the item has no text at all, or a fast
+            readout was incomplete / capped.
     """
     spec = model_for(opts, ctx)
     _, layer = await ctx.text_document(opts["ocr"])
@@ -245,8 +285,21 @@ async def evaluate_with(
             model=spec,
         )
 
+    mode = opts.get("mode")
     reference_detail: Optional[dict] = None
-    if reference is not None and reference.applied:
+    if mode == "fast":
+        # The one-token readout: never guided (a fast criterion's guide is
+        # an empty one whose note says so), posted once, no retry.
+        answer, confidence_block, headline = await _fast(
+            name, opts, spec, page_b64, text, document_kind=ctx.doc.kind,
+            text_truncated=truncated,
+        )
+        if not judged:
+            # The band line IS the judgement `score: false` withholds.
+            answer["reason"] = llm_confidence.FAST_REASON_UNJUDGED
+        if reference is not None:
+            reference_detail = reference.unapplied_detail()
+    elif reference is not None and reference.applied:
         answer, reference_detail = await _guided(name, reference, ctx, prompt, image_b64, spec)
     else:
         answer = await llm_client.call_model(
@@ -260,10 +313,12 @@ async def evaluate_with(
     # fallback) the cap makes this a label update only.
     progress.checkpoint(f"{name}: scored", logger=logger)
 
-    # What the model's own sampling says about this answer (models.yaml
-    # `confidence`), and which number is the headline: the stated one, until
-    # the entry is flipped to `headline: calibrated` with a fitted curve.
-    confidence_block, headline = llm_confidence.assess(answer, spec.confidence)
+    if mode != "fast":
+        # What the model's own sampling says about this answer (models.yaml
+        # `confidence`), and which number is the headline: the stated one,
+        # until the entry is flipped to `headline: calibrated` with a fitted
+        # curve.
+        confidence_block, headline = llm_confidence.assess(answer, spec.confidence)
 
     outcome = Outcome(
         method="llm",
@@ -285,6 +340,9 @@ async def evaluate_with(
                     "source": layer.source,
                 },
                 "confidence": confidence_block,
+                # Only when the criterion sent options.mode, so a result
+                # without it is exactly what it always was.
+                **({"mode": mode} if mode is not None else {}),
                 **({"reference": reference_detail} if reference_detail is not None else {}),
             },
             "llm", answer["score"],
@@ -360,6 +418,57 @@ async def evaluate_with(
             _box_reference_entry(name, ctx, reference, box_guide, loc, knobs_on)
         ]
     return outcome
+
+
+async def _fast(
+    name: str,
+    opts: dict,
+    spec: ModelSpec,
+    page_b64: Optional[str],
+    text: str,
+    *,
+    document_kind: str,
+    text_truncated: bool,
+) -> tuple[dict, dict, int]:
+    """The fast readout for one unit: ``(answer, detail.confidence, headline)``.
+
+    ONE ``llm.client.call_readout`` (label ``fast/<name>``, kind ``fast``) of
+    ``build_llm_prompt(style="fast")`` — the digits 0-9, score = digit + 1 —
+    and ``llm.confidence.rate_readout`` over it, after the entry's
+    ``fast.calibration.rating`` temperature when one is fitted. ``answer``
+    has the scoring answer's keys (score, verdict, confidence, reason), so
+    the box loop's gate reads it as it reads a reasoned one.
+
+    Raises:
+        EvaluationError: The model has no ``fast:`` block any more (the
+            registry changed after submit), or the readout was incomplete or
+            capped — the message ends "— use mode 'reasoned' for this
+            criterion".
+        llm.client.LLMCallError: The request failed (a server refusing
+            ``top_logprobs`` is named).
+    """
+    if spec.fast is None:
+        raise EvaluationError(
+            f"model {spec.id!r} has no fast block in models.yaml any more (the registry "
+            "changed after this job was submitted) — use mode 'reasoned' for this criterion"
+        )
+    prompt = build_llm_prompt(
+        page_b64, name, opts["hint"], text,
+        document_kind=document_kind, text_truncated=text_truncated, model=spec, style="fast",
+    )
+    try:
+        readout = await llm_client.call_readout(
+            prompt, labels=llm_confidence.FAST_DIGITS, label=f"fast/{name}", model=spec,
+        )
+    except llm_client.ReadoutIncomplete as exc:
+        raise EvaluationError(f"{exc.summary} — use mode 'reasoned' for this criterion") from exc
+    rated = llm_confidence.rate_readout(readout, spec.fast.calibration.get("rating"))
+    logger.info(
+        "llm_eval: '%s' fast readout on %s → %s (%s, confidence %d, coverage %.3f)",
+        name, spec.id, rated["score"], rated["verdict"], rated["confidence"], readout.coverage,
+    )
+    answer = {k: rated[k] for k in ("score", "verdict", "confidence", "reason")}
+    return answer, rated["block"], rated["confidence"]
 
 
 def _box_reference_entry(

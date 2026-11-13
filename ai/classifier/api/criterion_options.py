@@ -8,7 +8,7 @@ for that path:
 
     llm       LLMOptions       hint, boxes, max_attempts, refine,
                                verify_partial, verify_min_span, ocr,
-                               reference, model, aggregate
+                               reference, model, mode, aggregate
     text      TextOptions      pattern, match, case_sensitive, fuzzy_threshold,
                                min_count, ocr, scope, aggregate
     cv        CVOptions        fallback, reference, model, aggregate
@@ -41,8 +41,22 @@ answers the criterion — on ``llm``, and on a ``cv`` name answered by its llm
 fallback. Precedence: ``options.model``, then the request's ``model``, then
 the registry default. An unknown or unavailable id is a 400 naming the valid
 ones. Like ``reference`` it appears in ``resolve()`` only when sent, and it
-is NOT part of a criterion's identity (``without_model``): the same question
+is NOT part of a criterion's identity (``identity``): the same question
 asked of another model is the same criterion.
+
+``mode`` (``llm`` only) is how the model answers: ``reasoned`` (null, the
+default — what every criterion always did) or ``fast`` — reasoning off and
+ONE generated token, a digit read from its probabilities
+(``llm.client.call_readout``), on a model with a ``models.yaml`` ``fast:``
+block only (``api.schemas.check_model_rules`` names the ones that have
+one). Per criterion only: a request-level ``mode`` and a top-level
+criterion ``mode`` are named 400s (``MODE_NOT_REQUEST_LEVEL`` /
+``MODE_IN_OPTIONS``), and so is ``options.mode`` on cv / text / detector. A
+fast criterion is never guided by references (``guided_by_references``;
+``options.reference`` on one is ``FAST_NOT_GUIDED``). Like ``model`` it
+appears in ``resolve()`` only when sent, and it is not part of a
+criterion's identity. Every check is on the VALUE (no ``model_fields_set``):
+criteria are ``model_dump()``ed into payloads and validated again.
 
 ``reference`` (``ReferenceOptions``) says how the request's ``references`` —
 stored worked examples, see ``references/`` — guide THIS criterion: whether
@@ -130,6 +144,26 @@ from detector import client as detector_client
 
 OcrMode = Literal["auto", "always", "never"]
 RefineMode = Literal["grid", "marks"]
+# How an llm criterion's model answers (options.mode). null = "reasoned".
+Mode = Literal["reasoned", "fast"]
+MODES: tuple[str, ...] = ("reasoned", "fast")
+DEFAULT_MODE = "reasoned"
+
+# The 400s a mode can earn, worded once (api.schemas / api.reference_schemas
+# raise them too).
+MODE_NOT_REQUEST_LEVEL = (
+    "mode is per criterion: set options.mode on each llm criterion. A request has a "
+    "`model` default because job-wide calls (the references \"auto\" selection) need one; "
+    "nothing job-wide has a mode"
+)
+MODE_IN_OPTIONS = (
+    "mode belongs in options: options.mode on an llm criterion (reasoned | fast)"
+)
+FAST_NOT_GUIDED = (
+    "references guide the reasoned scoring call, and options.mode 'fast' is a one-token "
+    "readout with no reasoning for an example to steer; drop options.reference or use "
+    "mode 'reasoned'"
+)
 
 # Server caps a caller cannot exceed — NAME_MAX_CHARS and MIN_COUNT_CAP are
 # the config env knobs under their local names (api.schemas imports them here).
@@ -492,6 +526,20 @@ class LLMOptions(_Options):
 
     model: Optional[str] = _model_field("scores this criterion (and runs its box loop)")
 
+    mode: Optional[Mode] = Field(
+        default=None,
+        description=(
+            "How the model answers. 'reasoned' (the default; null is the same): the "
+            "model reasons and writes {score, verdict, confidence, reason}. 'fast': "
+            "reasoning off and ONE generated token — a digit 0-9 read from its "
+            "probabilities (score = digit + 1), ~0.2-0.6 s instead of seconds, no "
+            "model-written reason; only on a model with a models.yaml `fast` block "
+            "(GET /models supports.fast — a 400 otherwise), never guided by "
+            "references. Per criterion only: there is no request-level mode. The box "
+            "loop (boxes: true) still runs reasoned after a fast score."
+        ),
+    )
+
     @field_validator("model")
     @classmethod
     def _known_model(cls, value: Optional[str]) -> Optional[str]:
@@ -559,7 +607,10 @@ class LLMOptions(_Options):
             "ocr": self.ocr,
             "aggregate": self.resolved_aggregate(default_aggregate("llm", self.hint)),
         }
-        return _with_model(_with_reference(resolved, self.reference, name), self.model)
+        resolved = _with_model(_with_reference(resolved, self.reference, name), self.model)
+        # Like `model`: present only when sent, so a criterion without it
+        # resolves (and echoes options_used) exactly as it always did.
+        return resolved if self.mode is None else {**resolved, "mode": self.mode}
 
     @classmethod
     def caps(cls) -> dict[str, Any]:
@@ -736,14 +787,26 @@ def _with_model(resolved: dict[str, Any], model: Optional[str]) -> dict[str, Any
     return {**resolved, "model": model}
 
 
-def without_model(resolved: dict[str, Any]) -> dict[str, Any]:
-    """Resolved options with ``model`` dropped — a criterion's IDENTITY.
+# The resolved keys that say HOW a question is answered, not what it is —
+# never part of a criterion's identity (``identity``).
+_NOT_IDENTITY = frozenset({"model", "mode"})
 
-    Which model answers a question does not change the question, so two
-    criteria that differ only in ``options.model`` are the same criterion:
-    a reference saved under one model guides the criterion under any other
-    (``references.resolve``, ``api.references``)."""
-    return {k: v for k, v in resolved.items() if k != "model"}
+
+def identity(resolved: dict[str, Any]) -> dict[str, Any]:
+    """Resolved options with ``model`` and ``mode`` dropped — a criterion's
+    IDENTITY.
+
+    Which model answers a question, and whether it reasons first or reads
+    one token, do not change the question: two criteria that differ only in
+    ``options.model`` / ``options.mode`` are the same criterion — so an
+    explicit ``mode: "reasoned"`` equals unset, and a reference saved under
+    one model guides the criterion under any other (``references.resolve``,
+    ``api.references``)."""
+    return {k: v for k, v in resolved.items() if k not in _NOT_IDENTITY}
+
+
+# The name it had before ``mode`` joined it.
+without_model = identity
 
 
 def box_loop_settings(resolved: dict[str, Any]) -> dict[str, Any]:
@@ -782,14 +845,28 @@ NOT_GUIDED = (
 
 
 def answered_by_llm(type_: str, name: str, resolved: dict[str, Any]) -> bool:
-    """Whether the vision model answers the criterion — the only kind a
-    reference can guide: ``llm``, or a ``cv`` name with no OpenCV detector
-    whose fallback resolves to the llm."""
+    """Whether a registry model answers the criterion (so its model rules
+    apply): ``llm``, or a ``cv`` name with no OpenCV detector whose fallback
+    resolves to the llm."""
     if type_ == "llm":
         return True
     if type_ == "cv":
         return get_detector(name) is None and resolved.get("fallback") == "llm"
     return False
+
+
+def is_fast(type_: str, resolved: dict[str, Any]) -> bool:
+    """Whether an llm criterion answers by the one-token readout
+    (``options.mode: "fast"``)."""
+    return type_ == "llm" and resolved.get("mode") == "fast"
+
+
+def guided_by_references(type_: str, name: str, resolved: dict[str, Any]) -> bool:
+    """Whether references can guide the criterion: the model answers it
+    (:func:`answered_by_llm`) by its REASONED scoring call — a fast readout
+    has no reasoning for an example to steer, so it is not guided (the same
+    precedent as a cv name an OpenCV detector answers)."""
+    return answered_by_llm(type_, name, resolved) and not is_fast(type_, resolved)
 
 
 OPTIONS_MODELS: dict[str, type[_Options]] = {
@@ -954,6 +1031,22 @@ def criterion_types() -> dict[str, Any]:
             "catalog": "GET /models",
             "identity": "options.model is not part of a criterion's identity: references "
                         "match across models",
+        },
+        # options.mode on llm criteria — per criterion only.
+        "mode": {
+            "applies_to": "llm criteria (a 400 on cv / text / detector, and at the top "
+                          "level of a request or a criterion)",
+            "values": list(MODES),
+            "default": DEFAULT_MODE,
+            "request_level": False,
+            # Where "fast" may run on THIS container: the available entries
+            # with a models.yaml `fast` block (GET /models supports.fast).
+            "fast_models": llm_models.get_registry().fast_ids(),
+            "fast": "reasoning off, one token: a digit 0-9 read from its probabilities "
+                    "(score = digit + 1); no model-written reason; never guided by "
+                    "references; the box loop still runs reasoned",
+            "identity": "options.mode is not part of a criterion's identity ('reasoned' "
+                        "equals unset)",
         },
         "detector_configured": detector_client.is_configured(),
     }

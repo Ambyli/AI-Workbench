@@ -26,7 +26,8 @@ collection body, the rendered copies -- are ``unit-tests/apidocs``).
       against ``assess_result`` -- every type, scored / unscored, an
       aggregate under every rule, ``mean`` across documents, document-scope
       text, dependencies, the box loop (one and several items), a guided
-      (references) run, measured confidence, a failed model, a cv criterion
+      (references) run, measured confidence, a fast readout (``options.mode:
+      "fast"``, alone and under ``mean``), a failed model, a cv criterion
       on a text document;
     * the four artifact routes (``api.artifacts.build_artifacts_router`` over
       a registry stub that returns the job): the manifest, scoped and not,
@@ -446,6 +447,40 @@ def test_guided_and_measured_confidence(schema_file, monkeypatch):
     entry = _entries(guided)["has a meter"]
     assert entry["detail"]["reference"]["applied"] is True and guided["references"]["mode"] == "explicit"
     assert entry["detail"]["confidence"]["source"] == "logprobs"
+
+
+def test_a_fast_readout(schema_file, monkeypatch):
+    """options.mode "fast" (one token, read from its probabilities): the
+    result, ``detail.mode`` and the readout's ``detail.confidence``, alone and
+    beside an explicit ``reasoned`` criterion, under ``mean`` across two
+    documents too (``detail_llm_mean`` keeps ``mode``)."""
+    from api.schemas import CriterionInput as C
+    from llm import client as llm_client
+    from llm.models import get_registry
+
+    fast_model = next(mid for mid in get_registry().fast_ids() if get_registry().get(mid).vision)
+    top = {"9": 0.90, "8": 0.05, "[9": 0.02, "5": 0.02, "1": 0.01}
+
+    async def send(prompt):
+        if prompt.get("logprobs") is True and "response_format" not in prompt:
+            row = {"token": "9", "logprob": math.log(0.9),
+                   "top_logprobs": [{"token": t, "logprob": math.log(p)} for t, p in top.items()]}
+            return {"choices": [{"message": {"content": "9"}, "finish_reason": "length",
+                                 "logprobs": {"content": [row]}}]}
+        return {"choices": [{"message": {"content": json.dumps(
+            {"score": 8, "verdict": "PASS", "confidence": 80, "reason": "I see it."})}}]}
+
+    monkeypatch.setattr(llm_client, "_send", send)
+    one = check_result(schema_file, _run([_doc(_png(), "p.png")], [
+        C(name="has a meter", type="llm", options={"hint": "presence", "model": fast_model, "mode": "fast"}),
+        C(name="has a roof", type="llm", options={"model": fast_model, "mode": "reasoned"})]))
+    fast, reasoned = _entries(one)["has a meter"], _entries(one)["has a roof"]
+    assert fast["detail"]["mode"] == "fast" and fast["detail"]["confidence"]["source"] == "readout"
+    assert fast["reason"].startswith("Fast readout (no reasoning): PASS ")
+    assert reasoned["detail"]["mode"] == "reasoned" and reasoned["reason"] == "I see it."
+    mean = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [
+        C(name="mean quality", type="llm", options={"model": fast_model, "mode": "fast", "aggregate": "mean"})]))
+    assert _entries(mean)["mean quality"]["detail"]["mode"] == "fast"
 
 
 # -- (b) the artifact routes ---------------------------------------------------------------------

@@ -19,7 +19,14 @@ caller and a multipart caller can never be treated differently:
 
 A criterion's top level is only what every type shares — ``name``, ``type``,
 ``weight``, ``depends_on``, ``score``; everything type-specific is in
-``options``, validated per type by ``api.criterion_options``. The optional
+``options``, validated per type by ``api.criterion_options`` — ``mode``
+included: a ``mode`` on the request or at a criterion's top level, and
+``options.mode`` on a cv / text / detector criterion, are each a named 400,
+and ``options.mode: "fast"`` on a model without a ``fast:`` block is
+``check_model_rules``'. Three questions are kept apart:
+``answered_by_model()`` (the model rules apply), ``is_fast()`` (the
+one-token readout) and ``guided_by_llm()`` (references can guide it — a
+fast criterion cannot). The optional
 ``key`` is a caller's label used ONLY to match reference examples
 (``references.resolve``): never shown to the model, never a file name, and
 results, ``depends_on`` and prompts stay on ``name``. The
@@ -54,7 +61,10 @@ from pydantic import (
 from common.documents import Document, InvalidPatternError, match_text
 
 from api.criterion_options import (
+    FAST_NOT_GUIDED,
     LEGACY_TOP_LEVEL_KEYS,
+    MODE_IN_OPTIONS,
+    MODE_NOT_REQUEST_LEVEL,
     NAME_MAX_CHARS,
     NOT_GUIDED,
     OPTIONS_MODELS,
@@ -62,6 +72,8 @@ from api.criterion_options import (
     answered_by_llm,
     can_locate,
     check_model_id,
+    guided_by_references,
+    is_fast,
 )
 from config import (
     DEFAULT_CRITERIA,
@@ -116,6 +128,19 @@ def _format_errors(exc: ValidationError, prefix: str = "") -> str:
             msg = msg[len("Value error, "):]
         parts.append(f"{where}: {msg}" if where else msg)
     return "; ".join(parts)
+
+
+# Why options.mode is refused on each type that has none (a named 400, not
+# a bare "extra inputs").
+_NO_MODE: dict[str, str] = {
+    "text": "only an llm criterion has a mode (reasoned | fast); a text criterion is a "
+            "deterministic search of the text layer — no model answers it",
+    "detector": "only an llm criterion has a mode (reasoned | fast); a detector criterion is "
+                "answered by the open-vocabulary detector — no model reasons about it",
+    "cv": "only an llm criterion has a mode (reasoned | fast); a cv criterion is answered by "
+          "an OpenCV detector, the detector service or its llm fallback, which always runs "
+          "reasoned — use an llm criterion for a fast readout",
+}
 
 
 def clean_key(value: Any, where: str = "a key", unset: str = "omit it") -> Any:
@@ -201,8 +226,11 @@ class CriterionInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _legacy_keys(cls, data: Any) -> Any:
-        """Name the old top-level keys instead of a bare 'extra inputs' error."""
+        """Name the old top-level keys instead of a bare 'extra inputs' error
+        — and ``mode``, which was never top-level but belongs in options."""
         if isinstance(data, dict):
+            if "mode" in data:
+                raise ValueError(MODE_IN_OPTIONS)
             stray = [k for k in data if k in LEGACY_TOP_LEVEL_KEYS]
             if stray:
                 raise ValueError(
@@ -231,13 +259,17 @@ class CriterionInput(BaseModel):
             raise ValueError(f"options must be an object, got {type(raw).__name__}")
         if "reference" in raw and self.type in ("text", "detector"):
             raise ValueError(f"options.reference: {NOT_GUIDED} (a {self.type} criterion)")
+        if "mode" in raw and self.type != "llm":
+            raise ValueError(f"options.mode: {_NO_MODE[self.type]}")
         try:
             self.options = model.model_validate(raw)
         except ValidationError as exc:
             raise ValueError(_format_errors(exc, "options.")) from None
+        if self.type == "llm" and self.options.mode == "fast" and self.options.reference is not None:
+            raise ValueError(f"options.reference: {FAST_NOT_GUIDED} ('{self.name}')")
         if self.type == "text":
             _check_pattern(self.name, self.options)
-        if self.type == "cv" and not self.guided_by_llm():
+        if self.type == "cv" and not self.answered_by_model():
             answered = (
                 "an OpenCV detector" if get_detector(self.name) is not None
                 else "the detector service (options.fallback)"
@@ -262,10 +294,23 @@ class CriterionInput(BaseModel):
         """Whether this criterion can produce any geometry at all."""
         return can_locate(self.type, self.name, self.resolved_options())
 
-    def guided_by_llm(self) -> bool:
-        """Whether the vision model answers it — the only criteria a reference
-        can guide (``llm``, or a ``cv`` name answered by the llm fallback)."""
+    def answered_by_model(self) -> bool:
+        """Whether a registry model answers it (``llm``, or a ``cv`` name
+        answered by the llm fallback) — the criteria the model rules
+        (``check_model_rules``) apply to, fast ones included."""
         return answered_by_llm(self.type, self.name, self.resolved_options())
+
+    def is_fast(self) -> bool:
+        """Whether it answers by the one-token readout (``options.mode:
+        "fast"``)."""
+        return is_fast(self.type, self.resolved_options())
+
+    def guided_by_llm(self) -> bool:
+        """Whether references can guide it: the model answers it
+        (:meth:`answered_by_model`) by its REASONED scoring call. A fast
+        criterion is not guided — explicit and ``auto`` references skip it
+        with a note, and it is never a reference's example."""
+        return guided_by_references(self.type, self.name, self.resolved_options())
 
     def reference_options(self) -> Optional[dict[str, Any]]:
         """The resolved ``options.reference``, or None when it was not sent."""
@@ -274,7 +319,7 @@ class CriterionInput(BaseModel):
     def model_id(self, job_model: Optional[str] = None) -> Optional[str]:
         """The registry id this criterion's model calls go to: its own
         ``options.model``, else ``job_model``; None means the registry
-        default. Only meaningful when :meth:`guided_by_llm`."""
+        default. Only meaningful when :meth:`answered_by_model`."""
         return self.resolved_options().get("model") or job_model
 
     def scope(self) -> str:
@@ -395,6 +440,14 @@ class AssessRequest(BaseModel):
             "the references \"auto\" selection call. Omitted: the registry default."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_request_mode(cls, data: Any) -> Any:
+        """A request-level ``mode`` is a named 400, not a bare 'extra inputs'."""
+        if isinstance(data, dict) and "mode" in data:
+            raise ValueError(MODE_NOT_REQUEST_LEVEL)
+        return data
 
     @field_validator("model")
     @classmethod
@@ -584,7 +637,13 @@ def check_model_rules(
       * ``references: "auto"`` with a text-only JOB model — its per-item
         selection call sends the page image;
       * ``require_vision`` (POST /references): any text-only model at all —
-        a reference is an image example, and its creation job locates on it.
+        a reference is an image example, and its creation job locates on it;
+      * ``options.mode: "fast"`` on an effective model with no ``fast:``
+        block in ``models.yaml`` — named with where the model came from
+        (``options.model``, the request's ``model``, the registry default)
+        and the fast-capable ids.
+
+    A fast criterion is never guided, so the references rule skips it.
 
     The one rule that needs the uploaded documents (a text-only model on an
     image-only document with no OCR) is ``api.assess._check_documents``'s.
@@ -603,11 +662,24 @@ def check_model_rules(
             "to a vision model"
         )
     for c in criteria:
-        if not c.guided_by_llm():
+        if not c.answered_by_model():
             continue
         spec = registry.resolve(c.model_id(job_model))
         opts = c.resolved_options()
         where = f"criterion {c.name!r} runs on model {spec.id!r}"
+        if c.is_fast() and spec.fast is None:
+            source = (
+                "its options.model" if opts.get("model") else
+                "the request's `model`" if job_model else "the registry default"
+            )
+            capable = registry.fast_ids()
+            raise ValueError(
+                f"criterion {c.name!r} has options.mode 'fast', and its model {spec.id!r} "
+                f"({source}) has no `fast` block in models.yaml — its reasoning cannot be "
+                f"turned off; fast-capable models: {capable or 'none on this container'} "
+                "(GET /models supports.fast) — set options.model to one, or use mode "
+                "'reasoned'"
+            )
         if not spec.vision:
             if require_vision:
                 raise ValueError(
@@ -625,7 +697,7 @@ def check_model_rules(
                     f"{where}, which is text-only, so it cannot locate (options.boxes "
                     "sends page crops); drop boxes or pick a vision model"
                 )
-        if references and (opts.get("reference") or {}).get("use", True):
+        if references and c.guided_by_llm() and (opts.get("reference") or {}).get("use", True):
             if not spec.supports_references:
                 why = (
                     "is text-only" if not spec.vision

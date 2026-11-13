@@ -135,6 +135,14 @@ services:
       timeout: 10s
       retries: 10
       start_period: 300s
+    # --max-logprobs 64 is the ceiling on `top_logprobs` one request may ask
+    # for (vLLM's default is 20; over it is a 400; -1 = no cap). The
+    # classifier's fast readout (ai/classifier/models.yaml, this entry's
+    # fast.top_logprobs: 64) asks for exactly 64 alternatives at the answer
+    # position, so the two are coupled: fast.top_logprobs <= --max-logprobs.
+    # Raise this first (`make up vllm qwen3.8-solo`), then the classifier
+    # entry (`docker restart classifier`); lower the entry first. Chat
+    # requests never ask for logprobs, so it changes nothing for them.
     command: >
       cyankiwi/Qwen3.8-27B-AWQ-INT4
       --served-model-name qwen3.8-solo
@@ -150,6 +158,7 @@ services:
       --tool-call-parser qwen3_coder
       --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
       --chat-template /config/qwen_fixed_chat_template.jinja
+      --max-logprobs 64
 
   # Recreated (with downtime) by `make up`: it holds the model in GPU memory
   # and publishes a host port; a second copy would need a second copy's worth of

@@ -33,7 +33,9 @@ request rather than a job that fails in a worker a minute later:
      names, dependencies, cycles, ``score: false`` only where there is
      geometry, the static reference rules, the ``model`` / ``options.model``
      ids and what each criterion's effective model can do — boxes and
-     references need vision) — ``AssessRequest``;
+     references need vision, ``options.mode: "fast"`` needs a ``fast:``
+     block; a request-level ``mode``, JSON or multipart, is a named 400) —
+     ``AssessRequest``;
   1b. resolve ``references`` against the store (``references.resolve``):
      unknown ids 400, not-ready 409, inherited criteria merged and
      re-validated, the per-criterion example cap, position against a
@@ -85,6 +87,7 @@ from starlette.datastructures import UploadFile
 from common.documents import UnsupportedDocumentError, detect_kind, pdf_page_count
 
 from analysis import load_input_bytes, resolve_svg_images, validate_content_type
+from api.criterion_options import MODE_NOT_REQUEST_LEVEL
 from api.schemas import AssessRequest, ClassifierMetadata, DocumentInput, validation_message
 # A module, not names: SVG_FETCH_IMAGES is read at call time, so a test (or a
 # future live-reload) can flip it without re-importing this module.
@@ -201,6 +204,8 @@ async def _from_form(request: Request) -> tuple[AssessRequest, list[_Upload]]:
     """Multipart form → the SAME model, each upload a base64 document."""
     form = await request.form()
     keys = list(form.keys())
+    if "mode" in keys:
+        raise _bad(f"Invalid request: {MODE_NOT_REQUEST_LEVEL}")
     removed = [k for k in keys if k in _REMOVED_FORM_FIELDS]
     if removed:
         raise _bad(
@@ -370,7 +375,7 @@ def _check_documents(model: AssessRequest, uploads: list[_Upload]) -> list[Submi
         blind_text = [
             f"{c.name!r} (model {spec.id!r})"
             for c in model.criteria
-            if c.guided_by_llm()
+            if c.answered_by_model()
             and not (spec := registry.resolve(c.model_id(model.model))).vision
             and (not config.OCR_ENGINE or config.OCR_ENGINE == "none"
                  or c.resolved_options().get("ocr") == "never")

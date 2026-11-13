@@ -11,7 +11,16 @@ other:
                             EXAMPLES (``ReferenceExample``), each a captioned
                             image with its known answer. The answer is one
                             flat JSON object — score, verdict, confidence,
-                            reason.
+                            reason. With ``style="fast"`` (an llm
+                            criterion's ``options.mode: "fast"``) the same
+                            prefix asks for ONE digit 0-9 instead (score =
+                            digit + 1), reasoning off, read from the token's
+                            probabilities (``ModelSpec.fast_body``,
+                            ``llm.client.call_readout``) — wording in
+                            config.py § Prompt wording (``FAST_*``).
+    strip_markers()       — a fast prompt's caller text minus the entry's
+                            ``fast.strip_markers`` (template markers that
+                            would turn reasoning back on).
     ReferenceExample      — one example as the prompt needs it: a plain
                             dataclass, so ``llm`` never imports ``references``.
     build_bbox_prompt()   — the enforcement loop's "where is it?": one
@@ -138,6 +147,10 @@ from config import (
     BOX_SYSTEM_SENTENCE,
     CANDIDATE_HEADING,
     DOCUMENT_TEXT_HEADING,
+    FAST_INSTRUCTION,
+    FAST_RUBRICS,
+    FAST_SYSTEM_LINE,
+    FAST_TEXT_ONLY_SENTENCE,
     HINT_RUBRICS,
     LLM_BBOX_GRID,
     MARKS_FEEDBACK_HEADING,
@@ -293,6 +306,22 @@ def _example_parts(references: list[BoxExample]) -> list[dict]:
     return parts
 
 
+def strip_markers(text: str, markers) -> str:
+    """``text`` with every one of ``markers`` removed (a fast prompt's
+    ``fast.strip_markers``: chat-template markers that would turn reasoning
+    back on). Repeated until none is left, so a marker split around another
+    (``<|think<|think_on|>_on|>``) cannot reassemble."""
+    if not text or not markers:
+        return text
+    previous = None
+    while previous != text:
+        previous = text
+        for marker in markers:
+            if marker:
+                text = text.replace(marker, "")
+    return text
+
+
 def build_llm_prompt(
     image_b64: str | None,
     name: str,
@@ -303,8 +332,22 @@ def build_llm_prompt(
     text_truncated: bool = False,
     references: Optional[list[ReferenceExample]] = None,
     model: Optional[ModelSpec] = None,
+    style: str = "reasoned",
 ) -> dict:
     """Assemble the chat completion request for ONE criterion.
+
+    ``style`` is ``"reasoned"`` (the default: everything below, byte for byte
+    what it always was) or ``"fast"`` (``options.mode: "fast"``): the same
+    layout — system prompt, page image, context line, DOCUMENT TEXT block —
+    so every fast criterion on a page shares that prefix, then the digit
+    rubric (``config.FAST_RUBRICS``), ``CRITERION:`` and
+    ``FAST_INSTRUCTION`` ("Answer with one digit."); the system prompt ends
+    in ``FAST_SYSTEM_LINE`` instead of the confidence / JSON sentences, a
+    ``system_line`` model's reasoning line is NOT appended, the entry's
+    ``fast.strip_markers`` are removed from the criterion name and the text
+    layer, and the body is ``ModelSpec.fast_body`` (one token, logprobs, no
+    response_format). A fast prompt takes no ``references`` (a readout is
+    never guided) and needs a model with a ``fast:`` block.
 
     The user text is laid out context line → DOCUMENT TEXT block → rubric →
     ``CRITERION:`` → instructions + answer scaffold, so system prompt, image,
@@ -339,11 +382,26 @@ def build_llm_prompt(
         text_truncated: True when document_text was cut at the char budget.
         references:     Worked examples to show before the candidate.
         model:          The registry entry the request is for (None: default).
+        style:          "reasoned" (default) | "fast".
 
     Returns:
         A dict ready to POST to the model's chat-completions endpoint.
+
+    Raises:
+        ValueError: ``style`` is unknown, or "fast" with references or on a
+            model without a ``fast:`` block.
     """
     spec = _model(model)
+    if style not in ("reasoned", "fast"):
+        raise ValueError(f"style must be 'reasoned' or 'fast', got {style!r}")
+    fast = style == "fast"
+    if fast:
+        if spec.fast is None:
+            raise ValueError(f"model {spec.id!r} has no fast block in models.yaml")
+        if references:
+            raise ValueError("a fast readout is never reference-guided")
+        name = strip_markers(name, spec.fast.strip_markers)
+        document_text = strip_markers(document_text, spec.fast.strip_markers)
     # A text-only model reads the text of an image page; the page itself is
     # not sent.
     text_only_page = bool(image_b64) and not spec.vision
@@ -360,7 +418,8 @@ def build_llm_prompt(
         len(document_text),
     )
 
-    rubric_def = HINT_RUBRICS.get(hint) or HINT_RUBRICS["auto"]
+    rubrics = FAST_RUBRICS if fast else HINT_RUBRICS
+    rubric_def = rubrics.get(hint) or rubrics["auto"]
     rubric = f"{rubric_def['heading']}:\n  {rubric_def['rubric']}"
     if rubric_def["extra"]:
         rubric += f"\n  {rubric_def['extra']}"
@@ -398,6 +457,12 @@ def build_llm_prompt(
             "---\n"
         )
 
+    if fast:
+        return _fast_prompt(
+            spec, image_b64, name, document_text, rubric,
+            context_line=context_line, text_block=text_block, text_only_page=text_only_page,
+        )
+
     scaffold = json.dumps(SCORING_SCAFFOLD, indent=2)
     # ORDER IS DELIBERATE — prefix caching. Everything up to the rubric
     # (system prompt, page image, context line, DOCUMENT TEXT block) depends
@@ -420,31 +485,7 @@ def build_llm_prompt(
         f"{scaffold}"
     )
 
-    if text_only_page:
-        source_sentence = (
-            "You are given one page of a document as extracted text only — you cannot "
-            "see the page. Judge the criterion from that text; a criterion about how the "
-            "page LOOKS cannot be judged from it, so say so and score it 5 (uncertain). "
-            "The text may be OCR output and can contain recognition errors — judge "
-            "meaning, not exact spelling. "
-        )
-    elif document_text.strip():
-        # Both modalities are available: say so explicitly, and warn that the
-        # text may be OCR output so the model treats near-misses sensibly.
-        source_sentence = (
-            "You are given a document as an image and as extracted text. Use BOTH: "
-            "the image for anything visual (legibility, lighting, framing, stamps, "
-            "signatures) and the text for anything about content (wording, amounts, "
-            "dates, clauses). The text may be OCR output and can contain recognition "
-            "errors — judge meaning, not exact spelling. "
-            if image_b64
-            else
-            "You are given a document as extracted text only — it has no page image. "
-            "Judge the criterion from that text. It may be OCR output and can "
-            "contain recognition errors — judge meaning, not exact spelling. "
-        )
-    else:
-        source_sentence = "Analyze the provided image and score it against the criterion. "
+    source_sentence = _source_sentence(image_b64, document_text, text_only_page)
 
     system_prompt = (
         "You are a document assessment expert. "
@@ -496,6 +537,85 @@ def build_llm_prompt(
             {"role": "user", "content": user_content},
         ],
         "score",
+    )
+
+
+def _source_sentence(image_b64: str | None, document_text: str, text_only_page: bool) -> str:
+    """The scoring system prompt's sentence about what the model is given —
+    the page image, its text, or both (the reasoned wording; the fast prompt
+    swaps only the text-only one, ``FAST_TEXT_ONLY_SENTENCE``)."""
+    if text_only_page:
+        return (
+            "You are given one page of a document as extracted text only — you cannot "
+            "see the page. Judge the criterion from that text; a criterion about how the "
+            "page LOOKS cannot be judged from it, so say so and score it 5 (uncertain). "
+            "The text may be OCR output and can contain recognition errors — judge "
+            "meaning, not exact spelling. "
+        )
+    if document_text.strip():
+        # Both modalities are available: say so explicitly, and warn that the
+        # text may be OCR output so the model treats near-misses sensibly.
+        return (
+            "You are given a document as an image and as extracted text. Use BOTH: "
+            "the image for anything visual (legibility, lighting, framing, stamps, "
+            "signatures) and the text for anything about content (wording, amounts, "
+            "dates, clauses). The text may be OCR output and can contain recognition "
+            "errors — judge meaning, not exact spelling. "
+            if image_b64
+            else
+            "You are given a document as extracted text only — it has no page image. "
+            "Judge the criterion from that text. It may be OCR output and can "
+            "contain recognition errors — judge meaning, not exact spelling. "
+        )
+    return "Analyze the provided image and score it against the criterion. "
+
+
+def _fast_prompt(
+    spec: ModelSpec,
+    image_b64: str | None,
+    name: str,
+    document_text: str,
+    rubric: str,
+    *,
+    context_line: str,
+    text_block: str,
+    text_only_page: bool,
+) -> dict:
+    """``build_llm_prompt(style="fast")``'s request: the reasoned prompt's
+    layout (image, context line, DOCUMENT TEXT block first — the cached
+    prefix), then the digit rubric, ``CRITERION:`` and ``FAST_INSTRUCTION``;
+    ``ModelSpec.fast_body``. The name and the text arrive with the entry's
+    ``fast.strip_markers`` already removed, and ``rubric`` is the hint's
+    ``FAST_RUBRICS`` entry (heading, rubric, extra)."""
+    user_text = (
+        f"{context_line}"
+        f"{text_block}\n\n"
+        f"{rubric}\n\n"
+        f"CRITERION: {name}\n\n"
+        f"{FAST_INSTRUCTION}"
+    )
+    source_sentence = (
+        FAST_TEXT_ONLY_SENTENCE if text_only_page
+        else _source_sentence(image_b64, document_text, text_only_page)
+    )
+    # No reasoning line, even for a `system_line` model: the readout is the
+    # answer with reasoning OFF (fast.chat_template_kwargs), and a reasoning
+    # line would ask for the opposite.
+    system_prompt = f"You are a document assessment expert. {source_sentence}{FAST_SYSTEM_LINE}"
+    user_content: list[dict] = []
+    if image_b64:
+        user_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+            }
+        )
+    user_content.append({"type": "text", "text": user_text})
+    return spec.fast_body(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
     )
 
 

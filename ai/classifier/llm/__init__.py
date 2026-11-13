@@ -9,9 +9,11 @@
                  and the enforcement loop's two small prompts, which live next
                  to it so they cannot drift from it.
     client.py    the transport: each request holds a slot of ITS model's
-                 limit, ``call_model`` for the scoring call and
-                 ``call_model_json`` for the small ones, the image encoder,
-                 and the Prometheus objects that count both.
+                 limit, ``call_model`` for the scoring call,
+                 ``call_readout`` for the one-token fast readout
+                 (``options.mode: "fast"``) and ``call_model_json`` for the
+                 small ones, the image encoder, and the Prometheus objects
+                 that count them.
     usage.py     what each request cost, durably: the ``llm_calls`` table
                  (one row per request, linked to its job, criterion and
                  item through context vars), written by ``client._post``.

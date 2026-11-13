@@ -55,8 +55,11 @@ examples), the first that is set deciding, every comparison case-folded:
 
 Only reference criteria that are ``usable`` (they guide the llm and have an
 expected answer) are examples. A criterion the model does not answer is
-never guided, and one with no matching example simply scores without one
-(``detail.reference.applied: false`` says why). The plan records the rule
+never guided — nor is a fast one (``options.mode: "fast"``, a one-token
+readout: ``CriterionInput.guided_by_llm`` is false, so it gets no plan entry
+and no ``auto`` pool target; the worker notes why on its
+``detail.reference``) — and one with no matching example simply scores
+without one (``detail.reference.applied: false`` says why). The plan records the rule
 per criterion (``matched_by``); a plan written before keys has none, and the
 worker reads that as ``"name"``.
 
@@ -72,7 +75,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
-from api.criterion_options import ReferenceOptions, without_model
+from api.criterion_options import ReferenceOptions, identity
 from api.schemas import AssessRequest, CriterionInput, validation_message
 from config import REFERENCE_AUTO_POOL_MAX, REFERENCE_MAX_PER_CRITERION
 from references.model import Reference
@@ -131,10 +134,10 @@ def _matches(by: str, value: str, ref_name: str, entry: dict[str, Any]) -> bool:
 
 
 def _same(a: CriterionInput, b: CriterionInput) -> bool:
-    """Whether two references hold the SAME criterion. ``options.model`` is
-    not part of a criterion's identity (``without_model``): the same question
-    answered on two models is one criterion — the first reference's options
-    (model included) are the ones inherited. The ``key`` is part of it
+    """Whether two references hold the SAME criterion. ``options.model`` /
+    ``options.mode`` are not part of a criterion's identity (``identity``):
+    the same question answered on two models is one criterion — the first
+    reference's options (model included) are the ones inherited. The ``key`` is part of it
     (compared case-folded): one name keyed two ways would be found two ways.
 
     The box loop's per-criterion settings (``refine``, ``verify_partial``,
@@ -147,7 +150,7 @@ def _same(a: CriterionInput, b: CriterionInput) -> bool:
     references that would run the loop differently today are a conflict."""
     return (
         a.type == b.type
-        and without_model(a.resolved_options()) == without_model(b.resolved_options())
+        and identity(a.resolved_options()) == identity(b.resolved_options())
         and a.weight == b.weight
         and a.score == b.score
         and a.depends_on == b.depends_on

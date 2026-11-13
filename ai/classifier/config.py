@@ -458,6 +458,69 @@ VERIFY_PARTIAL_REJECT: str = (
     "label and every digit"
 )
 
+# ── The fast readout (an llm criterion's options.mode "fast";
+#    build_llm_prompt(style="fast")) ─────────────────────────────────────
+# Reasoning off, ONE generated token: a digit 0-9 whose probabilities are the
+# answer (llm.client.call_readout; score = digit + 1, so the bands are the
+# 1-10 rubric's moved down by one — 0-2 FAIL, 3-5 MARGINAL, 6-9 PASS). Only
+# a fast criterion is sent any of this; the reasoned prompt is untouched
+# (pinned by hash). The prefix stays the reasoned prompt's layout — system
+# prompt, page image, context line, DOCUMENT TEXT block, all per item — so
+# every fast criterion on one page shares a cached prefix; only the rubric,
+# the CRITERION line and FAST_INSTRUCTION differ per criterion. There is no
+# JSON, no confidence and no reason in the answer.
+#
+# The system prompt is "You are a document assessment expert. " + the
+# reasoned prompt's source sentence (image / text / both) + FAST_SYSTEM_LINE;
+# a text-only page uses FAST_TEXT_ONLY_SENTENCE instead of the reasoned one
+# (which says "say so and score it 5", which a one-digit answer cannot do).
+FAST_SYSTEM_LINE: str = "Answer with one character, nothing else."
+FAST_TEXT_ONLY_SENTENCE: str = (
+    "You are given one page of a document as extracted text only — you cannot see the "
+    "page. Judge the criterion from that text; a criterion about how the page LOOKS cannot "
+    "be judged from it, so answer 4 (uncertain). The text may be OCR output and can contain "
+    "recognition errors — judge meaning, not exact spelling. "
+)
+# The rubric per hint, on the digit scale — the same shape as HINT_RUBRICS
+# (heading, rubric, extra). GET /hints serves HINT_RUBRICS only.
+FAST_RUBRICS: dict[str, dict[str, str]] = {
+    "quality": {
+        "heading": "QUALITY criterion — rate image quality on a 0-9 scale",
+        "rubric":  "0-2 = FAIL (poor quality)  |  3-5 = MARGINAL  |  6-9 = PASS (good quality)",
+        "extra":   "",
+    },
+    "presence": {
+        "heading": "PRESENCE criterion — detect whether the feature is present in the document",
+        "rubric":  (
+            "9 = clearly present (PASS)  |  "
+            "4 = uncertain or partially present (MARGINAL)  |  "
+            "0 = clearly absent (FAIL)"
+        ),
+        "extra":   (
+            "When DOCUMENT TEXT is provided above, a phrase in that text counts as "
+            "evidence just as a visual observation does."
+        ),
+    },
+    "auto": {
+        "heading": "INFERRED criterion — determine the appropriate rubric from the criterion name",
+        "rubric":  (
+            "Quality/clarity criteria (e.g. 'image sharpness'): rate quality 0-9.\n"
+            "  Presence/absence criteria (e.g. 'has X'): "
+            "9=present, 4=uncertain, 0=absent."
+        ),
+        "extra":   (
+            "A criterion about content ('mentions X', 'includes a total') can be judged "
+            "from the DOCUMENT TEXT block when one is provided; a criterion about the "
+            "image itself (sharpness, lighting, framing) must be judged from the image."
+        ),
+    },
+}
+# After the CRITERION line: the scale once more, and the one-token answer.
+FAST_INSTRUCTION: str = (
+    "Rate this one criterion on the 0-9 scale above: 0-2 is FAIL, 3-5 is MARGINAL, "
+    "6-9 is PASS. Answer with one digit."
+)
+
 # ---------------------------------------------------------------------------
 # LLM call behaviour
 # ---------------------------------------------------------------------------

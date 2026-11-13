@@ -405,7 +405,8 @@ def test_keys_reach_the_headers_and_never_get_models():
     assert by_id["raw"]["endpoint"] == {"scheme": "https", "host": "raw.example.com",
                                         "port": None}
     assert set(by_id["a"]["supports"]) == {"boxes", "references", "contrastive_references",
-                                           "text_only_scoring"}
+                                           "text_only_scoring", "fast"}
+    assert by_id["a"]["supports"]["fast"] is False and by_id["a"]["fast"] is None
 
 
 def test_the_startup_warning_names_removed_env_vars(monkeypatch, caplog):

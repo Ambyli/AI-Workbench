@@ -152,6 +152,13 @@ from utils import verdict_from_score
 
 _SQRT2 = math.sqrt(2.0)
 
+# detail.reference's note on a fast criterion (options.mode "fast") in a
+# request with references: answered, never guided.
+FAST_NOT_GUIDED_NOTE = (
+    "options.mode 'fast' is not guided by references: a one-token readout has no "
+    "reasoning for an example to steer — use mode 'reasoned' for a guided criterion"
+)
+
 
 # ---------------------------------------------------------------------------
 # Planning and combining the guided calls (pure)
@@ -427,7 +434,11 @@ class JobReferences:
 
     def guide(self, c: CriterionInput, item: Optional[int] = None) -> Optional[CriterionGuide]:
         """The guidance for ``c`` (on ``item``, for ``auto``); None when the
-        model does not answer it."""
+        model does not answer it. A fast criterion (``options.mode: "fast"``)
+        is answered but never guided: an empty guide whose note says so, so
+        its ``detail.reference`` reads ``applied: false`` with the reason."""
+        if c.answered_by_model() and c.is_fast():
+            return CriterionGuide(c.name, self.mode, self._options(c), [], note=FAST_NOT_GUIDED_NOTE)
         if not c.guided_by_llm():
             return None
         entry = (self.plan.get("criteria") or {}).get(c.name)

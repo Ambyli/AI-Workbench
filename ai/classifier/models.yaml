@@ -39,8 +39,10 @@
 #                          it scores from the page's text layer alone, and
 #                          boxes, references and visual cv fallbacks are
 #                          refused at submit
-#   max_images_per_prompt  images one request may carry; must match the
-#                          server's --limit-mm-per-prompt. 3 = contrastive
+#   max_images_per_prompt  images one request may carry; must not exceed the
+#                          server's limit (entry <= server): vLLM's
+#                          --limit-mm-per-prompt, whose default when the flag
+#                          is unset is 999 images, not one. 3 = contrastive
 #                          references (PASS + FAIL example + candidate), 2 =
 #                          one example per call, 1 = no references. 0 (and
 #                          only 0) for a text-only model
@@ -141,6 +143,78 @@
 #                          agreement); points are non-decreasing, x in [0, 1],
 #                          y in [0, 100]. Re-fit after a model, prompt or
 #                          reasoning change
+#   fast                   OPTIONAL — this entry can answer an llm criterion
+#                          with options.mode "fast": reasoning OFF, ONE
+#                          generated token (a digit 0-9 for the 1-10 rating,
+#                          score = digit + 1), the answer read from that
+#                          token's probabilities (common.logprobs
+#                          .option_distribution) instead of from what it
+#                          wrote — prefill plus one token, no reason written.
+#                          No block = mode "fast" on this entry is a 400 that
+#                          names the entries that have one. Only for a model
+#                          whose reasoning can be turned OFF (Muse Glimmer's
+#                          lowest level is `low`, so it has none). The
+#                          response is read at confidence.logprobs
+#                          .entries_path / top_key (where this provider keeps
+#                          the entries). Fields:
+#     chat_template_kwargs merged LAST into a fast body's chat_template_kwargs,
+#                          after the entry's own extra_body ones with the
+#                          entry's `reasoning` key DROPPED: the switch that
+#                          turns reasoning off. The qwen family:
+#                          {enable_thinking: false} — NOT reasoning_effort:
+#                          none, with which vLLM's qwen3 parser files the
+#                          answer under reasoning_content and content comes
+#                          back null (measured 2026-11-12)
+#     extra_body           merged into a fast body after the entry's
+#                          extra_body. Default {temperature: 0}: greedy, so a
+#                          written answer is the most probable path (the
+#                          logprobs read are the raw ones, before
+#                          temperature). May not set model, messages, the
+#                          token field, response_format, chat_template_kwargs
+#                          (the field above), stream, n, logprobs or
+#                          top_logprobs. A fast body never carries
+#                          response_format, the sampling n or the confidence
+#                          request keys, and its token field is 1
+#     top_logprobs         alternatives asked for at the answer position
+#                          (default 20, at least 11 so all ten digits fit).
+#                          NEVER above the server's own ceiling: vLLM's
+#                          --max-logprobs (default 20; -1 = no cap) answers a
+#                          request over it with a 400, which the classifier
+#                          reports as "the server refused top_logprobs K".
+#                          To raise it: raise the server's --max-logprobs
+#                          first (ai/vllm/docker-compose.vllm.yml, then `make
+#                          up vllm <service>`), then this value, then `docker
+#                          restart classifier`. More alternatives make the
+#                          probability cap (below) fire less
+#     min_coverage         the share of the answer position's probability
+#                          that must fall on the labels (default 0.5); below
+#                          it the readout is incomplete and the unit fails
+#                          naming mode "reasoned"
+#     max_unseen_mass      the probability cap (default 0.02; above 0, at most
+#                          1): what labels missing from the top_logprobs list
+#                          hold is ESTIMATED as (labels missing) x (the
+#                          smallest listed probability), at most 1 - coverage
+#                          — one spelling per label, so a heuristic, not a
+#                          guarantee (a label also matches as " 3", "[3", …);
+#                          at or above this the readout is refused, naming
+#                          top_logprobs and --max-logprobs. A confident answer
+#                          whose other labels simply fell off the list stays
+#                          far below it
+#     strip_markers        strings removed from the caller text a fast prompt
+#                          carries (the criterion name, the text layer):
+#                          chat-template markers that would turn reasoning
+#                          back on (ai/jinja/qwen_fixed_chat_template.jinja
+#                          reads <|think_on|>, <|think_low|>, … in any user
+#                          or system text). Default []
+#     calibration          {} (default: the raw readout is reported) | per
+#                          answer type ({rating: ...} today): {temperature,
+#                          bias, n, fitted_on, ground_truth} — p ∝
+#                          exp(logprob / temperature) before the verdict
+#                          band is chosen (bias: a Platt offset for two-way
+#                          answers, unused by rating). The fitting tool,
+#                          bin/confidence_calibration.py --mode fast, is
+#                          ZT-603 phase 2 (not built yet): until it is, leave
+#                          {}. Re-fit after a model, prompt or template change
 
 default: muse-glimmer
 
@@ -189,6 +263,8 @@ models:
     # from the start of `10` and is reported unresolved (a lower bound); pinned,
     # it is score 1 exactly.
     confidence: {method: logprobs, logprobs: {number_tokens: single}}
+    # No `fast` block: its template's lowest reasoning level is `low` — the
+    # reasoning cannot be turned off, so options.mode "fast" is a 400 here.
 
   qwen2.5-vl:
     description: >-
@@ -200,8 +276,9 @@ models:
     served_name: Qwen/Qwen2.5-VL-7B-Instruct
     api_key_env: null
     vision: true
-    # vLLM's default of one image per prompt (the service sets no
-    # --limit-mm-per-prompt).
+    # One image per prompt by choice: the 8192-token context has no room for a
+    # second page. The service sets no --limit-mm-per-prompt, so vLLM's own
+    # limit is its default of 999 — the rule is entry <= server.
     max_images_per_prompt: 1
     reasoning: {style: none}
     extra_body: {}
@@ -255,20 +332,35 @@ models:
     # classifier_llm_call_seconds{kind="score",model="qwen3.5-4b"} p50 grows
     # by more than ~10% with it on, set it back to {method: stated}.
     confidence: {method: logprobs}
+    # Probed 2026-11-12 (llama.cpp): with thinking off and one token the
+    # readout answers in ~0.2 s after a ~2 s first call; digits and letters are
+    # single tokens; a yes / no split A 0.86 + [A 0.12 (the matcher sums the
+    # bracket variant). top_logprobs 20 = what was probed (llama.cpp's
+    # n_probs); thinking is already off in extra_body, said again here so the
+    # fast body never depends on it.
+    fast:
+      chat_template_kwargs: {enable_thinking: false}
+      top_logprobs: 20
 
   qwen3.8-solo:
     description: >-
       Qwen3.8-27B (AWQ INT4) on vLLM, one GPU (the qwen3.8-solo service in
-      ai/vllm) — order 1 of LiteLLM's local-general / -code / -private
-      chains and order 2 of local-reasoning. Text only, low reasoning. A
-      benchmark candidate for route-policy's llm_classifier, not a document
-      model: every call takes one of the 3 sequences chat runs on.
+      ai/vllm) — a vision document model AND a chat model: order 1 of
+      LiteLLM's local-general / -code / -private chains and order 2 of
+      local-reasoning, so chat shares its 3 sequences. Vision, 3 images per
+      prompt (boxes, references, contrastive references), low reasoning.
+      Fast-capable: options.mode "fast" turns reasoning off and reads a
+      one-token answer (~0.2-0.6 s per criterion).
     url: http://qwen3.8-solo:8000/v1/chat/completions
     served_name: qwen3.8-solo
     api_key_env: null
-    # LiteLLM declares no vision for it; the classifier sends it text only.
-    vision: false
-    max_images_per_prompt: 0
+    # Probed 2026-11-12: Qwen3_5ForConditionalGeneration with an unquantised
+    # vision tower; an image (and three in one request) is accepted. LiteLLM
+    # still declares no vision for its chat chains — that is LiteLLM's.
+    vision: true
+    # Three accepted (0a). The service sets no --limit-mm-per-prompt, so
+    # vLLM's limit is its default of 999 — the rule is entry <= server.
+    max_images_per_prompt: 3
     # The shared fixed template (ai/jinja/qwen_fixed_chat_template.jinja)
     # reads reasoning_effort: none | minimal | low | medium | high | xhigh …
     # (unset = medium, what the chains send; local-code sends high). `low`
@@ -283,14 +375,40 @@ models:
     # Reasoning counts against score first, as on muse-glimmer at `low`.
     max_tokens: {score: 8192, box: 1024, select: 2048, describe: 1024}
     timeout_s: 240
-    # --max-num-seqs 3, and all three are chat's (order 1 of three chains).
-    # One here: a classifier call that queues makes vllm:num_requests_waiting
-    # positive, and the LiteLLM overflow hook then spills chat off this
-    # model — to muse-glimmer, and on to Claude.
-    max_concurrent: 1
+    # = --max-num-seqs 3: the classifier may take all three (decision
+    # 2026-11-12 — overflow is not a concern here). Chat shares them: while
+    # the classifier holds all three, a chat turn queues
+    # (vllm:num_requests_waiting > 0) and the LiteLLM overflow hook spills it
+    # to the chain's next order. A fast readout holds its slot for ~0.2-0.6 s.
+    max_concurrent: 3
     # ~15k tokens + the 8192 answer, far inside --max-model-len 131072.
     text_char_budget: 60000
     # Probed 2026-10-22: logprobs come back, digits split (`1`,`0`), and the
     # stream includes the reasoning tokens — the score is read from the
     # answer part only.
     confidence: {method: logprobs}
+    # Probed 2026-11-12 (phase 0a): with enable_thinking false and one token
+    # the answer lands in `content` (0.16 s on a synthetic page; ~0.3-0.6 s
+    # expected on a ~2k-token page), every digit and capital letter is one
+    # token, and `[B`-style variants carry 0.5-12% (summed by the matcher).
+    fast:
+      # Not reasoning_effort: none — vLLM's qwen3 parser then files the one
+      # token under reasoning_content and content is null. The entry's
+      # reasoning_effort (above) is dropped from a fast body.
+      chat_template_kwargs: {enable_thinking: false}
+      # = qwen3.8-solo's --max-logprobs 64 (ai/vllm/docker-compose.vllm.yml);
+      # never above it. Raise both together (the server first).
+      top_logprobs: 64
+      # The shared template (ai/jinja/qwen_fixed_chat_template.jinja) turns
+      # thinking back ON when a user or system text contains any of these,
+      # whatever enable_thinking says; <|think_off|> only turns it off.
+      strip_markers:
+        - "<|think_on|>"
+        - "<|think_minimal|>"
+        - "<|think_low|>"
+        - "<|think_medium|>"
+        - "<|think_high|>"
+        - "<|think_xhigh|>"
+        - "<|think_max|>"
+        - "<|think_extreme|>"
+        - "<|think_ultracode|>"

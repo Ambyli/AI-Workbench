@@ -20,10 +20,12 @@ bind-mounted read-only over the same path in the container), validated here:
                       fails startup with its reason), log the entries, and
                       WARN once about any removed env var still set.
     Registry          the entries by id, the default, ``resolve(id)``,
-                      ``check_selectable(id)`` (the 400 messages) and
+                      ``check_selectable(id)`` (the 400 messages),
+                      ``fast_ids()`` (where ``mode: "fast"`` may run) and
                       ``public()`` (the GET /models payload — never a key).
     ModelSpec         one loaded entry: everything a prompt builder and the
-                      transport need, plus its own ``ConcurrencyLimit``.
+                      transport need (``body()``; ``fast_body()`` for a
+                      readout), plus its own ``ConcurrencyLimit``.
 
 **Keys never live in the YAML.** An entry names an environment variable
 (``api_key_env``); its value is read once, at load, into the spec's request
@@ -45,6 +47,21 @@ writes numbers, how many samples) is a knob with a default. Load refuses a
 cannot produce, a reserved body key in ``logprobs.request`` /
 ``sampling.extra_body``, and ``sampling`` via ``n_param`` with ``n`` above
 ``max_concurrent`` (one such call holds n slots). See ``llm.confidence``.
+
+**Fast is configuration too.** An entry's optional ``fast:`` block
+(``FastConfig``) says it can answer with reasoning OFF and ONE generated
+token whose probabilities are the answer (``options.mode: "fast"``):
+the ``chat_template_kwargs`` that turn reasoning off, the body extras
+(default ``{temperature: 0}``), ``top_logprobs`` (≥ 11, never above the
+server's ``--max-logprobs``), ``min_coverage`` / ``max_unseen_mass`` (when a
+readout is believed — ``llm.client.call_readout``), ``strip_markers`` (caller
+text that would turn thinking back on) and a per-answer-type
+``calibration``. ``ModelSpec.fast_body`` builds the request. No block = fast
+is a 400 on that entry; nothing branches on a model name. Load refuses a
+reserved key in ``fast.extra_body`` (as in ``confidence.logprobs.request``,
+plus ``logprobs`` / ``top_logprobs``), ``top_logprobs`` under 11, a
+``max_unseen_mass`` of 0 (it would cap every readout) and an unknown
+calibration answer type.
 
 **Replaced settings.** The registry replaced ``VISION_LLM_API``,
 ``VISION_LLM_MODEL``, ``VISION_LLM_REASONING_STRENGTH`` /
@@ -318,6 +335,124 @@ class ConfidenceConfig(_Strict):
         return 1
 
 
+# ── fast: the one-token readout (options.mode "fast") ────────────────────
+#
+# An entry with a `fast:` block can answer a criterion with reasoning OFF and
+# ONE generated token, read from that token's probabilities
+# (common.logprobs.option_distribution) instead of from what it wrote. No
+# block = fast is a 400 on this entry (a model that cannot turn reasoning
+# off — Muse Glimmer's lowest level is `low` — simply has none). How the body
+# is built is `ModelSpec.fast_body`; what the readout must look like before
+# it is believed is `min_coverage` / `max_unseen_mass` (llm.client.call_readout).
+
+# The answer types a fast calibration may be fitted for. Phase 1 reads the
+# 1-10 rating only (digits 0-9); typed answers (yes / no, choice, levels)
+# join when they exist.
+FAST_ANSWER_TYPES: tuple[str, ...] = ("rating",)
+
+# The fewest alternatives a readout may ask for: all ten digits must fit in
+# the list with room for one more token.
+FAST_MIN_TOP_LOGPROBS = 11
+
+# Body keys fast.extra_body may not set: the confidence block's reserved keys
+# (model / messages / the token field / response_format / chat_template_kwargs
+# — its own field below — stream / n) plus the two a readout owns.
+_FAST_RESERVED = _CONFIDENCE_RESERVED | {"logprobs", "top_logprobs"}
+
+
+class FastCalibration(_Strict):
+    """``fast.calibration.<answer type>`` — a fitted temperature (and, for a
+    two-way answer, a Platt bias) applied to the readout before it is
+    reported (``bin/confidence_calibration.py --mode fast`` will print it —
+    ZT-603 phase 2, not built yet)."""
+
+    temperature: float = Field(gt=0.0, description="p ∝ exp(logprob / temperature)")
+    bias: float = Field(
+        default=0.0, description="Platt offset — two-way (yes / no) answers only; unused "
+                                 "for rating",
+    )
+    n: Optional[int] = Field(default=None, ge=0)
+    fitted_on: Optional[str] = None
+    ground_truth: Optional[str] = None
+
+
+class FastConfig(_Strict):
+    """An entry's ``fast:`` block — how a one-token readout is asked for and
+    when it is believed. Every knob but the reasoning switch has a default."""
+
+    chat_template_kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Merged LAST into a fast body's chat_template_kwargs (after the "
+                    "entry's own, with its reasoning key dropped) — the switch that turns "
+                    "reasoning off, e.g. {enable_thinking: false}.",
+    )
+    extra_body: dict[str, Any] = Field(
+        default_factory=lambda: {"temperature": 0},
+        description="Merged into a fast body after the entry's extra_body. Default "
+                    "{temperature: 0}: greedy, so a written answer is the most probable "
+                    "path (the logprobs read are raw, before temperature).",
+    )
+    top_logprobs: int = Field(
+        default=20, ge=FAST_MIN_TOP_LOGPROBS,
+        description="Alternatives asked for at the answer position. Never above the "
+                    "server's --max-logprobs (vLLM's default is 20; a request over it is "
+                    "a 400).",
+    )
+    min_coverage: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="The share of the answer position's probability that must fall on "
+                    "the labels; below it the readout is incomplete.",
+    )
+    max_unseen_mass: float = Field(
+        default=0.02, gt=0.0, le=1.0,
+        description="The probability cap: what labels missing from the top_logprobs list "
+                    "hold is estimated as n_unseen × the smallest listed probability "
+                    "(capped by 1 − coverage; one spelling per label, so a heuristic, not "
+                    "a guarantee); at or above this the readout is refused "
+                    "(ReadoutCapped). Above 0: at 0 even a readout listing every label "
+                    "(estimate 0.0) would be refused.",
+    )
+    strip_markers: list[str] = Field(
+        default_factory=list,
+        description="Strings removed from the caller text a fast prompt carries (the "
+                    "criterion name and the text layer): chat-template markers that would "
+                    "turn reasoning back on.",
+    )
+    calibration: dict[Literal["rating"], FastCalibration] = Field(
+        default_factory=dict,
+        description="Per answer type: {temperature, bias, n, fitted_on, ground_truth}. "
+                    "{} = uncalibrated (the raw readout is reported).",
+    )
+
+    @field_validator("strip_markers")
+    @classmethod
+    def _markers(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(m, str) or not m for m in value):
+            raise ValueError("fast.strip_markers are non-empty strings")
+        return value
+
+    @model_validator(mode="after")
+    def _body(self) -> "FastConfig":
+        reserved = sorted(_FAST_RESERVED & set(self.extra_body))
+        if reserved:
+            raise ValueError(
+                f"fast.extra_body may not set {reserved} — the readout builder owns model / "
+                "messages / the token field (1) / logprobs / top_logprobs, the client reads "
+                "one non-streamed body, response_format and n are dropped, and "
+                "chat_template_kwargs is fast.chat_template_kwargs"
+            )
+        return self
+
+    def public(self) -> dict[str, Any]:
+        """The GET /models ``fast`` block — never the body extras."""
+        return {
+            "top_logprobs": self.top_logprobs,
+            "min_coverage": self.min_coverage,
+            "max_unseen_mass": self.max_unseen_mass,
+            "calibrated": [t for t in FAST_ANSWER_TYPES if t in self.calibration],
+        }
+
+
 class ModelEntry(_Strict):
     """One ``models:`` entry, as written in the file."""
 
@@ -337,6 +472,7 @@ class ModelEntry(_Strict):
     max_concurrent: int = Field(ge=1)
     text_char_budget: int = Field(ge=0)
     confidence: ConfidenceConfig = Field(default_factory=ConfidenceConfig)
+    fast: Optional[FastConfig] = None
 
     @field_validator("url")
     @classmethod
@@ -458,6 +594,11 @@ class ModelSpec:
     # body() for score calls, by llm.client (what to extract) and by
     # llm.confidence (the signals, the headline).
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    # The parsed `fast:` block, or None (fast is then a 400 on this entry).
+    # Read by fast_body(), llm.client.call_readout (top_logprobs, min_coverage,
+    # max_unseen_mass), llm.prompts (strip_markers) and analysis.llm_eval
+    # (calibration).
+    fast: Optional[FastConfig] = None
     _headers: dict[str, str] = field(default_factory=dict, repr=False)
     limit: ConcurrencyLimit = field(init=False, repr=False)
 
@@ -512,6 +653,51 @@ class ModelSpec:
             out["chat_template_kwargs"] = kwargs
         return out
 
+    def fast_body(self, messages: list[dict]) -> dict[str, Any]:
+        """A one-token READOUT request body (``options.mode: "fast"``).
+
+        Beside :meth:`body`, from the entry's ``fast:`` block:
+
+          * the token field is set to 1 directly (``MaxTokens`` refuses
+            budgets under 16 — this is not a budget, it is the answer);
+          * no ``response_format`` (the answer is one bare token, not JSON),
+            no sampling ``n`` (an ``n`` in ``extra_body`` is dropped) and none
+            of the ``confidence`` request keys;
+          * the entry's ``extra_body`` (minus ``chat_template_kwargs`` and
+            ``n``), then ``logprobs: true, top_logprobs: fast.top_logprobs``,
+            then ``fast.extra_body`` (default ``{temperature: 0}``);
+          * ``chat_template_kwargs`` = the entry's own, WITHOUT its reasoning
+            key (``reasoning.key`` — a reasoning depth would turn thinking back
+            on), then ``fast.chat_template_kwargs`` merged LAST (the switch
+            that turns reasoning off, e.g. ``enable_thinking: false``).
+
+        Key order is model, messages, the token field, the extras, logprobs,
+        top_logprobs, the fast extras, chat_template_kwargs.
+
+        Raises:
+            ValueError: The entry has no ``fast:`` block.
+        """
+        if self.fast is None:
+            raise ValueError(f"model {self.id!r} has no fast block in models.yaml")
+        out: dict[str, Any] = {
+            "model": self.served_name,
+            "messages": messages,
+            self.token_param: 1,
+        }
+        out.update({
+            k: v for k, v in self.extra_body.items() if k not in ("chat_template_kwargs", "n")
+        })
+        out["logprobs"] = True
+        out["top_logprobs"] = int(self.fast.top_logprobs)
+        out.update(self.fast.extra_body)
+        kwargs = dict(self.extra_body.get("chat_template_kwargs") or {})
+        if self.reasoning.get("style") == "chat_template_kwargs":
+            kwargs.pop(self.reasoning["key"], None)
+        kwargs.update(self.fast.chat_template_kwargs)
+        if kwargs:
+            out["chat_template_kwargs"] = kwargs
+        return out
+
     # ── What it supports ──────────────────────────────────────────────────
     @property
     def supports_boxes(self) -> bool:
@@ -525,8 +711,17 @@ class ModelSpec:
     def supports_contrastive(self) -> bool:
         return self.vision and self.max_images_per_prompt >= 3
 
+    @property
+    def supports_fast(self) -> bool:
+        """Whether ``options.mode: "fast"`` may run here (a ``fast:`` block)."""
+        return self.fast is not None
+
     def public(self) -> dict[str, Any]:
-        """The GET /models entry. Never a key value — only whether there is one."""
+        """The GET /models entry. Never a key value — only whether there is one.
+
+        ``fast`` is null without a ``fast:`` block, else ``{top_logprobs,
+        min_coverage, max_unseen_mass, calibrated: [answer types]}`` — never
+        the body extras."""
         parts = urlsplit(self.url)
         return {
             "id": self.id,
@@ -543,6 +738,7 @@ class ModelSpec:
                 "references": self.supports_references,
                 "contrastive_references": self.supports_contrastive,
                 "text_only_scoring": not self.vision,
+                "fast": self.supports_fast,
             },
             "reasoning": dict(self.reasoning),
             "text_char_budget": self.text_char_budget,
@@ -557,6 +753,8 @@ class ModelSpec:
                 "headline": self.confidence.headline,
                 "calibrated": self.confidence.calibration is not None,
             },
+            # The one-token readout (options.mode "fast"): null = not here.
+            "fast": self.fast.public() if self.fast is not None else None,
         }
 
 
@@ -607,6 +805,11 @@ class Registry:
         if not spec.available:
             raise ValueError(f"model {model_id!r} is unavailable: {spec.unavailable_reason}")
         return spec
+
+    def fast_ids(self) -> list[str]:
+        """The ids ``options.mode: "fast"`` may run on: entries with a
+        ``fast:`` block that are available, in file order."""
+        return [mid for mid, spec in self.models.items() if spec.supports_fast and spec.available]
 
     def total_concurrency(self) -> int:
         """Σ max_concurrent — every request slot the registry can hold at once."""
@@ -698,6 +901,7 @@ def _build(model_id: str, entry: ModelEntry, env: Mapping[str, str]) -> ModelSpe
         available=available,
         unavailable_reason=reason,
         confidence=entry.confidence,
+        fast=entry.fast,
         _headers=headers,
     )
 
@@ -778,11 +982,12 @@ def startup_check() -> Registry:
     for spec in registry.models.values():
         logger.info(
             "models: %s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs "
-            "confidence=%s/%s%s",
+            "confidence=%s/%s fast=%s%s",
             spec.id, " [default]" if spec.id == registry.default_id else "",
             urlsplit(spec.url).hostname, spec.served_name, spec.vision,
             spec.max_images_per_prompt, spec.max_concurrent, spec.timeout_s,
             spec.confidence.method, spec.confidence.headline,
+            f"top{spec.fast.top_logprobs}" if spec.fast is not None else "no",
             "" if spec.available else f" UNAVAILABLE: {spec.unavailable_reason}",
         )
     return registry

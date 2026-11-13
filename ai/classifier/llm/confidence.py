@@ -23,14 +23,18 @@ branches on a model's name):
 Every result carries the block :func:`assess` builds as
 ``detail.confidence``::
 
-    method             what the entry is configured to measure
+    method             what the entry is configured to measure (``readout``
+                       for a fast criterion)
     source             what actually produced the signals: logprobs |
                        sampling | stated (the fallback — the response had no
                        logprobs, coverage was under ``min_coverage``, …;
-                       ``note`` says why)
+                       ``note`` says why) | readout (a fast criterion: the
+                       one-token readout IS the answer, :func:`rate_readout`)
     headline           which number is the top-level ``confidence``:
-                       stated | calibrated
-    stated             the model's own 0-100 number (clamped)
+                       stated | calibrated (a fast criterion: readout |
+                       calibrated)
+    stated             the model's own 0-100 number (clamped); null for a
+                       readout, where the model states nothing
     stated_defaulted   true when the model omitted or garbled it (it is 50)
     calibrated         the calibration curve at its signal, 0-100, or null
                        (no calibration, or its signal is unavailable here)
@@ -50,6 +54,19 @@ Every result carries the block :func:`assess` builds as
     samples            sampling only: {asked, answered, agreement,
                        stated_mean}; else null
     note               why the source or the headline fell back, else null
+    unseen_bound       a fast readout's block only: an estimate of the
+                       probability the digits missing from the top-k
+                       alternatives hold (one spelling each under the
+                       smallest listed one; not a guarantee —
+                       ``common.logprobs.OptionReadout.unseen_bound``)
+
+**A fast readout** (``options.mode: "fast"``) is its own measurement: the
+digit 0-9 the model would write, read from one token's probabilities
+(``llm.client.call_readout``), becomes the score distribution (score = digit
++ 1) and :func:`rate_readout` decides from it — the band with the most mass
+is the verdict, its mass the headline confidence (after the entry's
+``fast.calibration.rating`` temperature, when one is fitted: headline
+``calibrated``).
 
 **Shadow first.** ``headline`` stays ``stated`` — the top-level number does
 not change — until an entry is given ``headline: calibrated`` AND a
@@ -77,7 +94,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Iterable, Optional, Sequence
 
-from common.logprobs import Distribution, Unresolved
+from common.logprobs import Distribution, OptionReadout, Unresolved, softmax_temperature
 
 from config import DETAIL_FLOAT_DECIMALS
 from llm.models import ConfidenceConfig
@@ -104,6 +121,19 @@ BLOCK_KEYS: tuple[str, ...] = (
     "certainty", "coverage", "unresolved", "samples", "note",
 )
 SAMPLES_KEYS: tuple[str, ...] = ("asked", "answered", "agreement", "stated_mean")
+
+# A fast readout's block: the same keys, plus the probability the labels
+# missing from the top-k could hold (``rate_readout``). Only a fast result
+# carries it, so a reasoned result's block is exactly BLOCK_KEYS.
+READOUT_BLOCK_KEYS: tuple[str, ...] = BLOCK_KEYS + ("unseen_bound",)
+
+# The fast readout's labels for the 1-10 rating — score = digit + 1 — and
+# the reason a readout reports (it writes none: decision 2, 2026-11-12). The
+# band probabilities ARE the judgement, so a `score: false` criterion (whose
+# judgement is not reported) gets the line without them.
+FAST_DIGITS: tuple[str, ...] = tuple("0123456789")
+FAST_REASON = "Fast readout (no reasoning): PASS {PASS:.2f}, MARGINAL {MARGINAL:.2f}, FAIL {FAIL:.2f}."
+FAST_REASON_UNJUDGED = "Fast readout (no reasoning)."
 
 
 def _r(value: Optional[float]) -> Optional[float]:
@@ -180,7 +210,7 @@ def _samples_block(samples: Optional[dict]) -> Optional[dict]:
 def signals(
     dist: Optional[Distribution],
     verdict: str,
-    stated: int,
+    stated: Optional[int],
     stated_defaulted: bool,
     *,
     method: str = "stated",
@@ -190,13 +220,15 @@ def signals(
 ) -> dict[str, Any]:
     """The ``detail.confidence`` block for one answer, before the headline is
     resolved (``calibrated`` null, ``headline`` "stated") — :func:`assess`
-    fills those. With no ``dist`` every distribution key is null."""
+    (or :func:`rate_readout`) fills those. With no ``dist`` every
+    distribution key is null. ``stated`` None — a readout, where the model
+    states nothing — stays null."""
     block: dict[str, Any] = {key: None for key in BLOCK_KEYS}
     block.update(
         method=method,
         source=source,
         headline="stated",
-        stated=int(stated),
+        stated=None if stated is None else int(stated),
         stated_defaulted=bool(stated_defaulted),
         samples=_samples_block(samples),
         note=note,
@@ -309,6 +341,69 @@ def combined_answer(answer: dict[str, Any], members: Iterable[dict[str, Any]]) -
         if notes:
             out[NOTE_KEY] = notes[0]
     return out
+
+
+# ---------------------------------------------------------------------------
+# The fast readout (options.mode "fast"): a rating from one token
+# ---------------------------------------------------------------------------
+
+
+def rate_readout(readout: OptionReadout, calibration: Optional[Any] = None) -> dict[str, Any]:
+    """A 1-10 rating from a digit readout (``FAST_DIGITS``; score = digit + 1).
+
+    ``calibration`` is the entry's ``fast.calibration["rating"]`` (a
+    ``llm.models.FastCalibration``) or None. When given, the digits' raw
+    logprobs are temperature-scaled (``common.logprobs.softmax_temperature``)
+    before anything is decided; a digit the readout never saw stays 0.
+
+      * ``verdict`` — the band (FAIL 1-3, MARGINAL 4-6, PASS 7-10) with the
+        most probability; a tie goes to the lower band;
+      * ``score`` — the most probable score inside that band (a tie to the
+        lower score);
+      * ``confidence`` — ``round(100 × that band's probability)``;
+      * ``reason`` — ``FAST_REASON``: the three bands' probabilities (a
+        readout writes no reason of its own);
+      * ``block`` — ``detail.confidence`` in its usual shape (``signals``
+        over the score distribution) with ``method`` / ``source``
+        ``readout``, ``stated`` null, ``headline`` ``readout`` (or
+        ``calibrated``, with ``calibrated`` = the headline), the readout's
+        raw ``coverage``, plus ``unseen_bound`` (``READOUT_BLOCK_KEYS``).
+    """
+    if calibration is not None:
+        scaled = softmax_temperature(readout.logprobs, float(calibration.temperature))
+        probs = {d: scaled.get(d, 0.0) for d in FAST_DIGITS}
+    else:
+        probs = {d: float(readout.probs.get(d, 0.0)) for d in FAST_DIGITS}
+    by_score = {int(d) + 1: p for d, p in probs.items()}
+    bands = {band: 0.0 for band in BANDS}
+    for value, p in by_score.items():
+        bands[verdict_from_score(value)] += p
+    verdict = max(("FAIL", "MARGINAL", "PASS"), key=lambda band: bands[band])
+    inside = [v for v in sorted(by_score) if verdict_from_score(v) == verdict]
+    score = max(inside, key=lambda v: by_score[v])
+    # The probabilities sum to 1 (the readout and softmax_temperature both
+    # renormalise); the clamp keeps the declared 0-100 whatever arrives.
+    confidence = max(0, min(100, int(round(100 * bands[verdict]))))
+    dist = Distribution(
+        probs={v: by_score[v] for v in sorted(by_score)},
+        unresolved=(),
+        coverage=float(readout.coverage),
+        sampled=score,
+        lo=SCORE_LO,
+        hi=SCORE_HI,
+    )
+    block = signals(dist, verdict, None, False, method="readout", source="readout")
+    calibrated = calibration is not None
+    block["headline"] = "calibrated" if calibrated else "readout"
+    block["calibrated"] = confidence if calibrated else None
+    block["unseen_bound"] = _r(readout.unseen_bound)
+    return {
+        "score": score,
+        "verdict": verdict,
+        "confidence": confidence,
+        "reason": FAST_REASON.format(**{b: bands[b] for b in BANDS}),
+        "block": block,
+    }
 
 
 # ---------------------------------------------------------------------------

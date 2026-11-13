@@ -93,13 +93,16 @@ def list_models():
     ``authenticated`` (never the key itself), whether it is ``available``
     (an entry whose API key variable is unset is not, and says why),
     ``vision`` and ``max_images_per_prompt``, what it ``supports`` (boxes,
-    references, contrastive references, text-only scoring), its reasoning
-    setting, token budgets per call kind, ``text_char_budget``,
-    ``timeout_s``, ``max_concurrent``, the requests ``in_flight`` now, and
+    references, contrastive references, text-only scoring, ``fast`` — the
+    one-token readout of ``options.mode: "fast"``), its reasoning setting,
+    token budgets per call kind, ``text_char_budget``, ``timeout_s``,
+    ``max_concurrent``, the requests ``in_flight`` now,
     ``confidence: {method, headline, calibrated}`` — how its llm results'
     ``detail.confidence`` is measured (logprobs | sampling | stated), which
     number is the headline, and whether a calibration is fitted (never the
-    points or the request keys).
+    points or the request keys) — and ``fast``: null without a models.yaml
+    ``fast`` block, else ``{top_logprobs, min_coverage, max_unseen_mass,
+    calibrated: [answer types]}`` (never the body extras).
     """
     return JSONResponse(content=llm_models.get_registry().public())
 
@@ -114,7 +117,10 @@ def list_criterion_types():
     whether DETECTOR_URL is set; an `llm` criterion's box-loop settings and
     ``reference.boxes`` / ``.text`` show the service defaults, also listed
     in the ``box_loop`` block); ``caps`` are the server limits a request
-    may not exceed.
+    may not exceed. The ``mode`` block names ``options.mode``'s values, its
+    default (``reasoned``), that it is per criterion only
+    (``request_level: false``), and ``fast_models`` — the ids ``fast`` may
+    run on in THIS container.
 
     Each type also carries ``result``: the shape of the ``detail`` it returns
     (``analysis.result_specs``) — its headline ``metric``, every field with

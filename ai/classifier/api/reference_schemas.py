@@ -24,6 +24,8 @@ runs) and criterion keys unique within the reference
 (``check_unique_keys``, which /assess does not run: there keys may repeat);
 a breakdown verdict that disagrees with its score
 (``utils.verdict_from_score``); a breakdown for a ``score: false`` criterion;
+a request-level ``mode`` and a criterion with ``options.mode: "fast"`` (a
+reference records reasoned 1-10 answers);
 breakdown / regions keys that name no criterion; a malformed box or polygon;
 grid coordinates outside 0–1000; a blank ``criteria_keys`` value. What needs
 the bytes (the page exists, a pixel region lies inside it) or the store
@@ -40,7 +42,7 @@ from typing import Annotated, Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from api.criterion_options import NAME_MAX_CHARS, check_model_id
+from api.criterion_options import MODE_NOT_REQUEST_LEVEL, NAME_MAX_CHARS, check_model_id
 from api.schemas import (
     CriterionInput,
     DocumentInput,
@@ -227,6 +229,14 @@ class ReferenceRequest(_Meta):
                     "the registry default. A criterion's options.model still wins for it.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _no_request_mode(cls, data: Any) -> Any:
+        """A request-level ``mode`` is a named 400, as on /assess."""
+        if isinstance(data, dict) and "mode" in data:
+            raise ValueError(MODE_NOT_REQUEST_LEVEL)
+        return data
+
     @field_validator("model")
     @classmethod
     def _known_model(cls, value: Optional[str]) -> Optional[str]:
@@ -254,6 +264,13 @@ class ReferenceRequest(_Meta):
                 raise ValueError(
                     f"options.reference on {guided}: a reference's own criteria are "
                     "not guided by other references; drop it"
+                )
+            fast = [c.name for c in self.criteria if c.is_fast()]
+            if fast:
+                raise ValueError(
+                    f"options.mode 'fast' on {fast}: a reference records reasoned 1-10 "
+                    "answers (its expected answer becomes a later prompt's caption); drop "
+                    "options.mode or use 'reasoned'"
                 )
             self.check_keys([c.name for c in self.criteria], {c.name: c for c in self.criteria})
         # Every model the creation job uses must see images: the job model,

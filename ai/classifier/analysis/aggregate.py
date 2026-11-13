@@ -41,6 +41,12 @@ The rules around the rules:
     already carries its own ``page = item``), whatever the rule picked, and
     whether or not the criterion is scored: a ``score: false`` criterion
     aggregates geometry and never a judgement.
+  * **Rebuilt keys are rebuilt, whatever the rule.** A ``detail`` key
+    declared with ``rebuild=`` (``result_specs.FieldSpec`` — today an
+    adaptive llm criterion's ``escalations`` tally) is rebuilt from every
+    counted member by ``result_specs.aggregated_detail`` at both levels,
+    never copied from the chosen or first member; the excluded (skipped /
+    errored) members are not counted, as in ``values``.
   * **The LLM loop's record merges.** One member: its ``localization`` as-is.
     Several: every attempt, tagged with its ``item``, the total ``calls``,
     and ``accepted`` listing ``{"item", "attempt"}`` per accepted box

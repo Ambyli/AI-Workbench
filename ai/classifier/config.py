@@ -944,6 +944,17 @@ ESCALATION_UNPARSED_UNJUDGED: str = (
 ADAPTIVE_BOTH_FAILED: str = (
     "{readout} — and the escalation to model {model!r} failed: {error}"
 )
+# detail.escalations.summary — the adaptive tally over the pages a result
+# covers, rewritten at every aggregate level (analysis/llm_eval.py
+# combine_escalations): "escalated on 2 of 5 pages", and — only when an
+# escalation failed (the readout's answer stood there) — the tail, "escalated
+# on 2 of 5 pages and 1 escalation failed". {escalated}, {units} and
+# {failed} filled in; each noun is (singular, plural), the singular for a
+# count of exactly 1. An llm unit is always one page (no document scope).
+ESCALATIONS_SUMMARY: str = "escalated on {escalated} of {units} {unit_noun}"
+ESCALATIONS_SUMMARY_FAILED: str = " and {failed} {failed_noun} failed"
+ESCALATIONS_UNIT_NOUNS: tuple[str, str] = ("page", "pages")
+ESCALATIONS_FAILED_NOUNS: tuple[str, str] = ("escalation", "escalations")
 # GET /criterion-types `mode` block (api/criterion_options.py
 # criterion_types): where options.mode applies, what each mode does, where
 # the escalation model is described, how the threshold resolves, identity.

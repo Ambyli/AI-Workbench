@@ -1568,7 +1568,7 @@ every type, so the headline number reads the same whatever ran:
 
 | Type | `metric` | `value` is | Other `detail` keys |
 |---|---|---|---|
-| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `model`, `image_sent`, `text_sent`, `confidence` (below; **null** for `score: false`) — under `adaptive`, of the call that answered; `mode` (`reasoned` \| `fast` — under `adaptive`, `fast` when the readout stood, `reasoned` when it escalated) only when `options.mode` was sent; `escalation` only under `options.mode: "adaptive"` ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)); `reference` when the request listed references (below) |
+| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `model`, `image_sent`, `text_sent`, `confidence` (below; **null** for `score: false`) — under `adaptive`, of the call that answered; `mode` (`reasoned` \| `fast` — under `adaptive`, `fast` when the readout stood, `reasoned` when it escalated) only when `options.mode` was sent; `escalation` (the page's) and `escalations` (the tally over every page the result covers — "escalated on 2 of 5 pages") only under `options.mode: "adaptive"` ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)); `reference` when the request listed references (below) |
 | `text` | `count` | `detail.count`, the hits | the match record above; `scope`, `separator`, `items_with_hits` with `scope: "document"` |
 | `detector` | `best_score` | `detail.best_score` | `detector_matches`, `min_score` |
 | `cv` | per detector | `detail.measurements[metric]` | `detector`, `measurements`, `thresholds`, `parameters`, `state`, `image` — keys per detector in `GET /cv-detectors` |
@@ -1662,9 +1662,17 @@ document, its `detail` is still its type's shape, plus one block:
 
 | Rule | `detail` |
 |---|---|
-| `any` / `worst` / `all` | The chosen member's detail, whole; `from` names it |
-| `mean` | Only the type's **stable** keys — those that mean the same on every member (a `text` pattern, a `cv` detector's thresholds and parameters, an `llm` hint and `mode`) — plus `metric` and `value` = the mean of the members' values. For `cv` that is the mean measurement (e.g. mean `mean_intensity`), not the mean score. Per-member keys (`measurements`, `snippets`, `text_sent`, an adaptive unit's `escalation`) are in `items[]`. The stable keys are copied from the FIRST member: under `adaptive`, where one page may escalate and another not, `model`, `mode` and `image_sent` there are that member's — read each unit's in `items[]` |
+| `any` / `worst` / `all` | The chosen member's detail, whole — its rebuilt keys excepted (below); `from` names it |
+| `mean` | Only the type's **stable** keys — those that mean the same on every member (a `text` pattern, a `cv` detector's thresholds and parameters, an `llm` hint and `mode`) — plus `metric` and `value` = the mean of the members' values, and the rebuilt keys. For `cv` that is the mean measurement (e.g. mean `mean_intensity`), not the mean score. Per-member keys (`measurements`, `snippets`, `text_sent`, an adaptive unit's `escalation`) are in `items[]`. The stable keys are copied from the FIRST member: under `adaptive`, where one page may escalate and another not, `model`, `mode` and `image_sent` there are that member's — read each unit's in `items[]`, and the count in `escalations` |
 | `sum` (`text`) | The full match record with the counts added; `values` holds each member's count |
+
+A **rebuilt** key (`rebuilt: true` in [`GET /criterion-types`](#get-criterion-types);
+today only an adaptive `llm` criterion's `escalations`) is rebuilt from EVERY
+counted member at every level, under every rule — never copied from the
+chosen or the first member — so a criterion over five pages reads
+"escalated on 2 of 5 pages" whichever page `any` / `worst` picked
+([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)). Skipped and
+errored members are not counted, as in `values`.
 
 `values` is always each member's `value`, by label (`item n` at the pages
 level, `document n` at the documents level). A single member passes through
@@ -2740,6 +2748,11 @@ The escalated result (a quality criterion on `qwen3.8-solo`, escalating to
       "escalated": true, "model": "muse-glimmer", "threshold": 85, "signal": 62,
       "why": "confidence 62 < 85", "error": null,
       "fast": {"model": "qwen3.8-solo", "score": 8, "verdict": "PASS", "confidence": 62, "coverage": 0.98}
+    },
+    "escalations": {
+      "units": 1, "escalated": 1, "escalation_failed": 0, "readout_failed": 0,
+      "why": {"confidence": 1, "incomplete": 0, "cap": 0}, "models": ["muse-glimmer"],
+      "summary": "escalated on 1 of 1 page"
     }
   },
   "options_used": {"hint": "quality", "…": "…", "model": "qwen3.8-solo", "mode": "adaptive",
@@ -2749,12 +2762,16 @@ The escalated result (a quality criterion on `qwen3.8-solo`, escalating to
 ```
 
 A readout that stood carries `"mode": "fast"`, the readout's `model`,
-`confidence` block and reason, and `"escalation": {"escalated": false,
+`confidence` block and reason, `"escalation": {"escalated": false,
 "model": "muse-glimmer", "threshold": 80, "signal": 93, "why": null,
-"error": null, "fast": null}`. Under a `mean` aggregate `escalation` is
+"error": null, "fast": null}`, and its page's `escalations` with
+`"escalated": 0`, `"models": []` and `"summary": "escalated on 0 of 1
+page"`. Under a `mean` aggregate `escalation` is
 per item (in `items[]` only), and the stable keys `model` / `mode` /
 `image_sent` are the first member's — one page may have escalated and
-another not ([§ Result details](#result-details--the-same-shape-on-every-type)).
+another not ([§ Result details](#result-details--the-same-shape-on-every-type));
+under `any` / `worst` / `all` they and `escalation` are the chosen page's.
+`detail.escalations` (below) counts every page.
 Under `score: false` the judgement is withheld as for any criterion, and
 `escalation.signal` and `escalation.fast`'s score / verdict / confidence are
 nulled with it (a readout that stood gets the reason `Fast readout (no
@@ -2764,6 +2781,47 @@ whose answer could not be parsed is not quoted there either: its `error` is
 `score: false` criterion reports no judgement)`` — the call's own message
 quotes the answer's start, verdict and confidence included (the service log
 keeps it).
+
+**`detail.escalations`** — what adaptive did across every page the result
+covers, so a criterion over several pages or documents says it in one key
+(`analysis/llm_eval.py` `combine_escalations`):
+
+| Key | Meaning |
+|---|---|
+| `units` | The pages counted. A page counts itself (`1`); every aggregate adds its members' — the documents level adds each document's pages, so `units` is pages, never documents. An errored or skipped page is not counted, as it is left out of the aggregate's score and `values` (the criterion's `complete: false` and `reason` say so); an unreadable readout whose escalation also failed errors its page, so it is not counted either |
+| `escalated` | Pages the escalation model answered |
+| `escalation_failed` | Pages whose escalation failed — the readout's answer stood there (`escalation.error`) |
+| `readout_failed` | Pages whose readout could not be read (incomplete / capped); each of them escalated |
+| `why` | `{confidence, incomplete, cap}` — every page that escalated or tried to, by reason (the `why` of `classifier_escalations_total`); they add up to `escalated + escalation_failed` |
+| `models` | The escalation model ids that answered, each once, in page order (`[]` when none did) |
+| `summary` | `escalated on 2 of 5 pages`, plus ` and 1 escalation failed` when one did (`config.ESCALATIONS_SUMMARY*`; `1 page`, `2 escalations`) |
+
+It is on every adaptive result — a single page's too (`units: 1`, so a
+single-page criterion reads the same key), each `items[]` entry's (its own
+page), and every aggregate's, where it is **rebuilt** from all the members
+under every rule: never the chosen page's under `any` / `worst` / `all`, nor
+the first page's under `mean` (`rebuilt: true` in `GET /criterion-types`).
+Under `score: false` the counts stay — they are not a judgement (each page's
+`escalation.signal` is still nulled). Five pages, page 1 escalated on
+confidence and page 3 on an incomplete readout, `aggregate: "mean"`:
+
+```json
+"detail": {
+  "metric": "score", "hint": "quality", "model": "qwen3.8-solo", "image_sent": true,
+  "mode": "fast", "value": 6.8,
+  "escalations": {
+    "units": 5, "escalated": 2, "escalation_failed": 0, "readout_failed": 1,
+    "why": {"confidence": 1, "incomplete": 1, "cap": 0}, "models": ["muse-glimmer"],
+    "summary": "escalated on 2 of 5 pages"
+  },
+  "aggregate": {"rule": "mean", "level": "pages", "from": null,
+                "values": {"item 0": 10, "item 1": 2, "item 2": 10, "item 3": 2, "item 4": 10}}
+}
+```
+
+(`model` / `mode` are page 0's, whose readout stood; `items[1]` and
+`items[3]` carry `"mode": "reasoned"`, `"model": "muse-glimmer"` and their
+own `escalations` with `units: 1, escalated: 1`.)
 
 **When something fails** — a failed escalation never costs a complete
 readout's answer:
@@ -4405,7 +4463,9 @@ Each type also carries **`result`**, the shape of the `detail` it returns:
 `metric_from` says where the headline number lives: `detail` (the `metric`
 names a detail key), `measurements` (a `cv` measurement; its keys per detector
 in `GET /cv-detectors`) or `score` (the `llm` score). A field without `when`
-is always present; `stable` marks what survives a `mean` aggregate;
+is always present; `stable` marks what survives a `mean` aggregate (the first
+member's value); `rebuilt` marks a key every aggregate rebuilds from all its
+members, under every rule, and keeps under `mean` (the llm `escalations`);
 `nullable` marks a value that may be `null` (the llm `value` and `confidence`
 under `score: false`, the text `fuzzy_threshold` outside `fuzzy` mode).
 `kind` is one of `number`, `integer`, `string`, `boolean`, `array`, `object`

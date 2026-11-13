@@ -123,14 +123,16 @@ def generated_schemas() -> Dict[tuple, Any]:
         source = f"analysis.result_specs.specs()[{type_!r}]"
         out[("$defs", f"detail_{type_}")] = generate.from_result_spec(spec, source=source)
         # What a `mean` aggregate keeps: the stable keys, metric, value and the
-        # aggregate block (then always there) -- analysis.result_specs.aggregated_detail.
+        # aggregate block (then always there), and the rebuilt keys (rebuilt from
+        # every member under every rule) -- analysis.result_specs.aggregated_detail.
         kept = {key: (replace(f, when=None) if f is AGGREGATE_FIELD else f)
                 for key, f in spec.fields.items()
-                if f.stable or key in ("metric", "value", "aggregate")}
+                if f.stable or f.rebuild is not None or key in ("metric", "value", "aggregate")}
         mean = generate.from_result_spec(types.SimpleNamespace(type=spec.type, fields=kept),
                                          source=f"{source}, the stable keys a `mean` keeps")
+        rebuilt = ", the rebuilt keys (from every member)" if spec.rebuilt() else ""
         mean["description"] = (f"`detail` of a `{type_}` criterion aggregated by `mean`: only the stable "
-                               "keys, `metric`, `value` (the members' mean) and `aggregate`")
+                               f"keys{rebuilt}, `metric`, `value` (the members' mean) and `aggregate`")
         out[("$defs", f"detail_{type_}_mean")] = mean
     functions = {fn.__name__: fn for fn in REGISTRY.values()}
     cases = {}
@@ -528,6 +530,7 @@ def test_an_adaptive_readout(schema_file, monkeypatch):
     # Mixed members: one page's readout stands, the other's escalates. The
     # mean keeps the FIRST member's stable keys (as declared); each unit's
     # model / mode / escalation is in items[].
+    confident = top
     readouts = iter([top, {"9": 0.6, "1": 0.4}])
 
     async def mixed_send(prompt):
@@ -548,6 +551,27 @@ def test_an_adaptive_readout(schema_file, monkeypatch):
     assert (entry["detail"]["model"], entry["detail"]["mode"]) == (units[0]["model"],
                                                                    units[0]["mode"])
     assert "escalation" not in entry["detail"]
+    # ... and the rebuilt tally counts both (detail_llm_mean declares it).
+    tally = entry["detail"]["escalations"]
+    assert (tally["units"], tally["escalated"], tally["summary"]) == (
+        2, 1, "escalated on 1 of 2 pages")
+    assert sorted(u["escalations"]["escalated"] for u in units) == [0, 1]
+
+    # The other rules over the same two documents: the chosen member's detail
+    # (detail_llm), with the tally rebuilt; and score: false.
+    for rule in ("any", "worst", "all"):
+        readouts = iter([confident, {"9": 0.6, "1": 0.4}])
+        result = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [
+            C(name="q", type="llm", options={"model": fast_model, "mode": "adaptive",
+                                              "escalate_below": 80, "aggregate": rule})]))
+        detail = _entries(result)["q"]["detail"]
+        assert detail["aggregate"]["rule"] == rule and "escalation" in detail
+        assert detail["escalations"]["units"] == 2 and detail["escalations"]["escalated"] == 1
+    readouts = iter([confident, {"9": 0.6, "1": 0.4}])
+    unjudged = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [
+        C(name="q", type="llm", score=False,
+          options={"model": fast_model, "mode": "adaptive", "escalate_below": 80})]))
+    assert _entries(unjudged)["q"]["detail"]["escalations"]["escalated"] == 1
 
 
 # -- (b) the artifact routes ---------------------------------------------------------------------

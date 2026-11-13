@@ -38,7 +38,11 @@ readout's (``detail.mode`` ``fast``); ``detail.escalation`` records whether,
 why, the threshold and signal, a failure and — when it escalated — the
 readout it replaced. A failed escalation keeps a complete readout's answer;
 only an unreadable readout whose escalation failed errors the unit. The box
-loop stays on the criterion's own model, reasoned.
+loop stays on the criterion's own model, reasoned. ``detail.escalations`` is
+the page's tally (units 1: escalated, failed, why — ``_unit_escalations``);
+its declaration's ``rebuild`` (``combine_escalations``) sums the members'
+at every aggregate level, so a criterion over five pages reads "escalated on
+2 of 5 pages".
 
 A TEXT-ONLY model (``vision: false``) is sent the text layer and no image;
 an item with no text at all fails the unit ("no text available for a
@@ -158,6 +162,10 @@ from config import (
     ESCALATION_UNPARSED_UNJUDGED,
     ESCALATION_WHY_CONFIDENCE,
     ESCALATION_WHY_CONFIDENCE_UNJUDGED,
+    ESCALATIONS_FAILED_NOUNS,
+    ESCALATIONS_SUMMARY,
+    ESCALATIONS_SUMMARY_FAILED,
+    ESCALATIONS_UNIT_NOUNS,
     FAST_DIGITS,
     FAST_REASON_UNJUDGED,
     FAST_UNIT_ERROR_FIX,
@@ -191,6 +199,90 @@ def model_for(opts: dict, ctx: DocumentContext) -> ModelSpec:
     model, else the registry default."""
     return llm_models.get_registry().resolve(
         opts.get("model") or getattr(ctx, "default_model", None)
+    )
+
+
+# The keys of detail.escalations — the adaptive tally LLM_RESULT's
+# `escalations` field describes — and of its `why`: the reasons a unit
+# escalated or tried to, the `why` label values of
+# classifier_escalations_total (metrics.py). For the tests and for callers.
+ESCALATIONS_KEYS: tuple[str, ...] = (
+    "units", "escalated", "escalation_failed", "readout_failed", "why", "models", "summary",
+)
+ESCALATIONS_WHY_KEYS: tuple[str, ...] = ("confidence", "incomplete", "cap")
+
+
+def _plural(nouns: tuple[str, str], count: int) -> str:
+    return nouns[0] if count == 1 else nouns[1]
+
+
+def _escalations(
+    *, units: int, escalated: int, failed: int, readout_failed: int,
+    why: dict[str, int], models: list[str],
+) -> dict:
+    """``detail.escalations`` from its counts, the summary written from them
+    (``config.ESCALATIONS_SUMMARY``, its failed tail only when one failed)."""
+    summary = ESCALATIONS_SUMMARY.format(
+        escalated=escalated, units=units, unit_noun=_plural(ESCALATIONS_UNIT_NOUNS, units),
+    )
+    if failed:
+        summary += ESCALATIONS_SUMMARY_FAILED.format(
+            failed=failed, failed_noun=_plural(ESCALATIONS_FAILED_NOUNS, failed),
+        )
+    return {
+        "units": units,
+        "escalated": escalated,
+        "escalation_failed": failed,
+        "readout_failed": readout_failed,
+        "why": {key: int(why.get(key, 0)) for key in ESCALATIONS_WHY_KEYS},
+        "models": models,
+        "summary": summary,
+    }
+
+
+def _unit_escalations(
+    *, why: Optional[str] = None, answered_by: Optional[str] = None,
+    readout_failed: bool = False,
+) -> dict:
+    """One adaptive unit's ``detail.escalations`` — itself, counted once
+    (units 1). ``why`` is the reason it tried to escalate (an
+    ``ESCALATIONS_WHY_KEYS`` key), None when the readout stood;
+    ``answered_by`` the escalation model's id when its answer is the unit's,
+    None when the escalation failed; ``readout_failed`` an incomplete /
+    capped readout (which only reaches here escalated: with a failed
+    escalation the unit errors)."""
+    tried = why is not None
+    escalated = answered_by is not None
+    return _escalations(
+        units=1,
+        escalated=int(escalated),
+        failed=int(tried and not escalated),
+        readout_failed=int(readout_failed),
+        why={why: 1} if tried else {},
+        models=[answered_by] if escalated else [],
+    )
+
+
+def combine_escalations(tallies: list[dict]) -> dict:
+    """``detail.escalations`` of an aggregate — the ``rebuild`` of its
+    declaration below (``result_specs.aggregated_detail`` calls it under
+    every rule): the counted members' tallies summed. A member is a unit
+    (units 1) or a document's aggregate (its pages already summed), so
+    ``units`` counts the LEAF units — the pages — never the documents.
+    ``models`` keeps each escalation id once, in member order; the summary
+    is rewritten from the sums."""
+    models: list[str] = []
+    for tally in tallies:
+        for model_id in tally["models"]:
+            if model_id not in models:
+                models.append(model_id)
+    return _escalations(
+        units=sum(t["units"] for t in tallies),
+        escalated=sum(t["escalated"] for t in tallies),
+        failed=sum(t["escalation_failed"] for t in tallies),
+        readout_failed=sum(t["readout_failed"] for t in tallies),
+        why={key: sum(t["why"][key] for t in tallies) for key in ESCALATIONS_WHY_KEYS},
+        models=models,
     )
 
 
@@ -247,7 +339,8 @@ LLM_RESULT = ResultSpec(
             "How the model answered: `reasoned` | `fast` — the criterion's options.mode "
             "as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when "
             "it escalated; under a `mean` aggregate, the first member's (adaptive members "
-            "may differ — each unit's is in items[])", "string", stable=True,
+            "may differ — each unit's is in items[], and detail.escalations counts them)",
+            "string", stable=True,
             when="options.mode was sent",
         ),
         "escalation": FieldSpec(
@@ -264,6 +357,23 @@ LLM_RESULT = ResultSpec(
             "`{model, score, verdict, confidence, coverage}` (score / verdict / confidence "
             "null when the readout was incomplete, and under `score: false`)",
             "object", when="options.mode was 'adaptive'",
+        ),
+        "escalations": FieldSpec(
+            "What the adaptive mode did across the pages this result covers: `{units, "
+            "escalated, escalation_failed, readout_failed, why: {confidence, incomplete, cap}, "
+            "models, summary}` — `units` the pages counted (a unit counts itself, units 1; an "
+            "aggregate sums its members', so a criterion's are its documents' pages added; an "
+            "errored or skipped unit is excluded, as from the aggregate's `values`), "
+            "`escalated` those the escalation model answered, `escalation_failed` those whose "
+            "escalation failed (the readout's answer stood), `readout_failed` those whose "
+            "readout could not be read (incomplete / capped — each escalated), `why` each "
+            "page that escalated or tried to, by reason (they add up to escalated + "
+            "escalation_failed), `models` the escalation model ids that answered, `summary` "
+            "e.g. 'escalated on 2 of 5 pages' (+ ' and 1 escalation failed'). Rebuilt at "
+            "every aggregate level from all its members, under every rule (never one "
+            "member's), and kept under `mean` and under `score: false` (counts, not a "
+            "judgement)",
+            "object", when="options.mode was 'adaptive'", rebuild=combine_escalations,
         ),
         "reference": REFERENCE_FIELD,
         "aggregate": AGGREGATE_FIELD,
@@ -284,7 +394,9 @@ LLM_RESULT = ResultSpec(
         "scoring call answers (detail.model, detail.confidence and every top-level field "
         "are its), never guided by references. A failed escalation keeps a complete "
         "readout's answer (detail.escalation.error); the unit errors only when the "
-        "readout was incomplete too.",
+        "readout was incomplete too. detail.escalations counts what happened over every "
+        "page the result covers ('escalated on 2 of 5 pages'); each page's "
+        "detail.escalation is in items[].",
         "Box-loop results are in `localization`, not `detail`.",
         "A cv criterion answered by the llm fallback has this shape, `reference` included.",
     ),
@@ -372,6 +484,7 @@ async def evaluate_with(
     answered = _Sent(spec, image_b64 is not None, _text_sent(text, truncated, spec, layer))
     detail_mode = mode
     escalation_detail: Optional[dict] = None
+    escalations_detail: Optional[dict] = None
     if mode == "fast":
         # The one-token readout: never guided (a fast criterion's guide is
         # an empty one whose note says so), posted once, no retry.
@@ -394,6 +507,7 @@ async def evaluate_with(
         )
         answer, confidence_block, headline = result.answer, result.block, result.headline
         escalation_detail = result.escalation
+        escalations_detail = result.escalations
         detail_mode = result.mode
         if result.sent is not None:
             answered = result.sent
@@ -442,6 +556,10 @@ async def evaluate_with(
                 # without it is exactly what it always was.
                 **({"mode": detail_mode} if detail_mode is not None else {}),
                 **({"escalation": escalation_detail} if escalation_detail is not None else {}),
+                # The page's own tally (units 1); every aggregate level
+                # rebuilds it from its members (combine_escalations).
+                **({"escalations": escalations_detail} if escalations_detail is not None
+                   else {}),
                 **({"reference": reference_detail} if reference_detail is not None else {}),
             },
             "llm", answer["score"],
@@ -642,6 +760,7 @@ class _Adaptive:
     headline: int               # the top-level confidence
     mode: str                   # detail.mode: "fast" (the readout stood) | "reasoned"
     escalation: dict            # detail.escalation (ESCALATION_KEYS)
+    escalations: dict           # detail.escalations: this unit's tally (ESCALATIONS_KEYS)
     sent: Optional[_Sent]       # the escalation call, when it answered; None = the readout's
 
 
@@ -687,7 +806,8 @@ async def _adaptive(
     ``reasoned``, ``detail.model`` the escalation id, its own
     ``detail.confidence``), with ``escalation.fast`` the readout it
     replaced. Counted in ``classifier_escalations_total{model, why,
-    outcome}``.
+    outcome}``, and in the unit's ``detail.escalations`` (``_unit_escalations``:
+    the same ``why``; escalated or failed).
 
     **A failed escalation** (an HTTP error, a timeout, an unparseable
     answer, the entry unavailable at run time, a text-only escalation model
@@ -736,7 +856,8 @@ async def _adaptive(
             "llm_eval: '%s' adaptive: the readout stands (confidence %d >= %d)",
             name, rated["confidence"], threshold,
         )
-        return _Adaptive(_answer(rated), rated["block"], rated["confidence"], "fast", detail, None)
+        return _Adaptive(_answer(rated), rated["block"], rated["confidence"], "fast", detail,
+                         _unit_escalations(), None)
 
     if refused is not None:
         detail["why"] = refused.summary
@@ -765,7 +886,8 @@ async def _adaptive(
                 readout=refused.summary, model=escalation.id, error=error,
             )) from exc
         detail["error"] = error
-        return _Adaptive(_answer(rated), rated["block"], rated["confidence"], "fast", detail, None)
+        return _Adaptive(_answer(rated), rated["block"], rated["confidence"], "fast", detail,
+                         _unit_escalations(why=metric_why), None)
 
     escalations_total.labels(model=escalation.id, why=metric_why, outcome="ok").inc()
     detail["escalated"] = True
@@ -785,7 +907,10 @@ async def _adaptive(
         "llm_eval: '%s' adaptive: escalated to %s (%s) → %s (%s)",
         name, escalation.id, detail["why"], answer["score"], answer["verdict"],
     )
-    return _Adaptive(answer, block, headline, "reasoned", detail, sent)
+    tally = _unit_escalations(
+        why=metric_why, answered_by=escalation.id, readout_failed=refused is not None,
+    )
+    return _Adaptive(answer, block, headline, "reasoned", detail, tally, sent)
 
 
 async def _escalate(

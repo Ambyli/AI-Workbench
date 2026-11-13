@@ -308,6 +308,10 @@ Response `200` (`application/json`):
                       "description": {"type": "string"},
                       "when": {"type": "string", "description": "Present only in this case"},
                       "stable": {"const": true},
+                      "rebuilt": {
+                        "const": true,
+                        "description": "Rebuilt by every aggregate from all its members, under every rule (never one member's), and kept under `mean`"
+                      },
                       "nullable": {"const": true}
                     }
                   }
@@ -361,6 +365,10 @@ Response `200` (`application/json`):
                       "description": {"type": "string"},
                       "when": {"type": "string", "description": "Present only in this case"},
                       "stable": {"const": true},
+                      "rebuilt": {
+                        "const": true,
+                        "description": "Rebuilt by every aggregate from all its members, under every rule (never one member's), and kept under `mean`"
+                      },
                       "nullable": {"const": true}
                     }
                   }
@@ -414,6 +422,10 @@ Response `200` (`application/json`):
                       "description": {"type": "string"},
                       "when": {"type": "string", "description": "Present only in this case"},
                       "stable": {"const": true},
+                      "rebuilt": {
+                        "const": true,
+                        "description": "Rebuilt by every aggregate from all its members, under every rule (never one member's), and kept under `mean`"
+                      },
                       "nullable": {"const": true}
                     }
                   }
@@ -467,6 +479,10 @@ Response `200` (`application/json`):
                       "description": {"type": "string"},
                       "when": {"type": "string", "description": "Present only in this case"},
                       "stable": {"const": true},
+                      "rebuilt": {
+                        "const": true,
+                        "description": "Rebuilt by every aggregate from all its members, under every rule (never one member's), and kept under `mean`"
+                      },
                       "nullable": {"const": true}
                     }
                   }
@@ -3836,11 +3852,16 @@ The definitions (`#/$defs/<name>`) that the schemas above too large to show inli
     },
     "mode": {
       "type": "string",
-      "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when it escalated; under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[]) (present only when options.mode was sent)"
+      "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when it escalated; under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[], and detail.escalations counts them) (present only when options.mode was sent)"
     },
     "escalation": {
       "type": "object",
       "description": "What the adaptive mode did: `{escalated, model, threshold, signal, why, error, fast}` — `model` the escalation model's id (CLASSIFIER_ESCALATION_MODEL), `threshold` the 0-100 confidence it escalates under (options.escalate_below, else the model's fast.escalate_below.rating), `signal` the readout's confidence (null when the readout was incomplete / capped, and under `score: false`), `why` null | 'confidence 62 < 80' | the readout's 'readout incomplete: …' / 'probability cap reached: …', `error` null or why the escalation failed (the readout's answer then stands, escalated false; under `score: false` an unparseable answer is not quoted), `fast` null or — only when it escalated — the readout it replaced: `{model, score, verdict, confidence, coverage}` (score / verdict / confidence null when the readout was incomplete, and under `score: false`) (present only when options.mode was 'adaptive')",
+      "additionalProperties": true
+    },
+    "escalations": {
+      "type": "object",
+      "description": "What the adaptive mode did across the pages this result covers: `{units, escalated, escalation_failed, readout_failed, why: {confidence, incomplete, cap}, models, summary}` — `units` the pages counted (a unit counts itself, units 1; an aggregate sums its members', so a criterion's are its documents' pages added; an errored or skipped unit is excluded, as from the aggregate's `values`), `escalated` those the escalation model answered, `escalation_failed` those whose escalation failed (the readout's answer stood), `readout_failed` those whose readout could not be read (incomplete / capped — each escalated), `why` each page that escalated or tried to, by reason (they add up to escalated + escalation_failed), `models` the escalation model ids that answered, `summary` e.g. 'escalated on 2 of 5 pages' (+ ' and 1 escalation failed'). Rebuilt at every aggregate level from all its members, under every rule (never one member's), and kept under `mean` and under `score: false` (counts, not a judgement) (present only when options.mode was 'adaptive')",
       "additionalProperties": true
     },
     "reference": {
@@ -3863,7 +3884,7 @@ The definitions (`#/$defs/<name>`) that the schemas above too large to show inli
 {
   "$comment": "generated from analysis.result_specs.specs()['llm'], the stable keys a `mean` keeps — do not edit",
   "type": "object",
-  "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, `metric`, `value` (the members' mean) and `aggregate`",
+  "description": "`detail` of a `llm` criterion aggregated by `mean`: only the stable keys, the rebuilt keys (from every member), `metric`, `value` (the members' mean) and `aggregate`",
   "additionalProperties": false,
   "required": ["metric", "value", "hint", "model", "image_sent", "aggregate"],
   "properties": {
@@ -3883,7 +3904,12 @@ The definitions (`#/$defs/<name>`) that the schemas above too large to show inli
     },
     "mode": {
       "type": "string",
-      "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when it escalated; under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[]) (present only when options.mode was sent)"
+      "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when it escalated; under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[], and detail.escalations counts them) (present only when options.mode was sent)"
+    },
+    "escalations": {
+      "type": "object",
+      "description": "What the adaptive mode did across the pages this result covers: `{units, escalated, escalation_failed, readout_failed, why: {confidence, incomplete, cap}, models, summary}` — `units` the pages counted (a unit counts itself, units 1; an aggregate sums its members', so a criterion's are its documents' pages added; an errored or skipped unit is excluded, as from the aggregate's `values`), `escalated` those the escalation model answered, `escalation_failed` those whose escalation failed (the readout's answer stood), `readout_failed` those whose readout could not be read (incomplete / capped — each escalated), `why` each page that escalated or tried to, by reason (they add up to escalated + escalation_failed), `models` the escalation model ids that answered, `summary` e.g. 'escalated on 2 of 5 pages' (+ ' and 1 escalation failed'). Rebuilt at every aggregate level from all its members, under every rule (never one member's), and kept under `mean` and under `score: false` (counts, not a judgement) (present only when options.mode was 'adaptive')",
+      "additionalProperties": true
     },
     "aggregate": {
       "type": "object",

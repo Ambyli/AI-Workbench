@@ -49,12 +49,13 @@ import socket
 import textwrap
 
 import httpx
+import numpy as np
 import pytest
 import yaml
 
 import analysis
 import config
-from analysis import llm_eval
+from analysis import llm_eval, pipeline
 from api.schemas import AssessRequest, CriterionInput
 from llm import client as llm_client
 from llm import confidence as llm_confidence
@@ -627,6 +628,10 @@ def test_an_unreadable_readout_escalates(registry, monkeypatch, model_id, top, w
     assert fast["coverage"] == pytest.approx(0.2 if why == "incomplete" else 0.6, abs=1e-4)
     assert _escalations("reasoner", why, "ok") == before + 1
     assert len(model.readouts()) == 1                   # never retried
+    # The page's tally names the same reason as the metric's label.
+    tally = _detail(entry)["escalations"]
+    assert (tally["units"], tally["escalated"], tally["readout_failed"]) == (1, 1, 1)
+    assert tally["why"] == {"confidence": 0, "incomplete": 0, "cap": 0, why: 1}
 
 
 def test_a_readout_without_logprobs_escalates_with_no_coverage(registry, monkeypatch):
@@ -838,10 +843,21 @@ def test_the_adaptive_detail_matches_its_declaration(registry, monkeypatch):
         assert tuple(detail["escalation"]) == llm_eval.ESCALATION_KEYS
         if detail["escalation"]["fast"] is not None:
             assert tuple(detail["escalation"]["fast"]) == llm_eval.ESCALATION_FAST_KEYS
+        assert tuple(detail["escalations"]) == llm_eval.ESCALATIONS_KEYS
+        assert tuple(detail["escalations"]["why"]) == llm_eval.ESCALATIONS_WHY_KEYS
     field = spec.fields["escalation"]
     assert field.kind == "object" and field.when and not field.stable
     for key in llm_eval.ESCALATION_KEYS + llm_eval.ESCALATION_FAST_KEYS:
         assert key in field.description, key
+    # The tally: present on the same condition, REBUILT (never stable), by
+    # the combiner declared beside it; served as `rebuilt: true`.
+    tally = spec.fields["escalations"]
+    assert tally.kind == "object" and tally.when == field.when and not tally.stable
+    assert tally.rebuild is llm_eval.combine_escalations
+    assert spec.rebuilt() == {"escalations"}
+    assert spec.as_dict()["fields"]["escalations"]["rebuilt"] is True
+    for key in llm_eval.ESCALATIONS_KEYS + llm_eval.ESCALATIONS_WHY_KEYS:
+        assert key in tally.description, key
 
 
 def test_a_criterion_without_adaptive_carries_no_new_key(registry, monkeypatch):
@@ -855,6 +871,7 @@ def test_a_criterion_without_adaptive_carries_no_new_key(registry, monkeypatch):
     for name in ("plain", "fast"):
         entry = _entries(result)[name]
         assert "escalation" not in entry["detail"] and "escalate_below" not in entry["options_used"]
+        assert "escalations" not in entry["detail"]
     plain = _entries(result)["plain"]
     assert "mode" not in plain["detail"] and "mode" not in plain["options_used"]
     assert list(plain["detail"]) == ["metric", "value", "hint", "model", "image_sent",
@@ -868,6 +885,233 @@ def test_the_escalation_env_var_changes_no_body(key, digest):
     reg = parse_registry(data, env={ENV: "qwen3.8-solo"})
     model_id, kind = key
     assert _hash(reg.get(model_id).body([{"role": "user", "content": "x"}], kind)) == digest
+
+
+# ---------------------------------------------------------------------------
+# Across pages and documents: detail.escalations
+# ---------------------------------------------------------------------------
+
+
+def _marked_doc(first: int, count: int, filename: str = "scan.pdf"):
+    """A ``count``-page PDF-kind document whose page k's native text starts
+    with ``page-<first + k>-marker`` — what :class:`PerPage` reads a page
+    off (20+ characters, so ``ocr: auto`` keeps the native text, no OCR; the
+    marker survives the escalation model's 20-character budget)."""
+    from common.documents import Document, Page
+
+    pages = [
+        Page(index=k, image_bgr=np.full((300, 400, 3), 170, dtype=np.uint8), width=400,
+             height=300, text=f"page-{first + k}-marker: the account number is printed here.",
+             text_source="native")
+        for k in range(count)
+    ]
+    return Document(kind="pdf", filename=filename, pages=pages)
+
+
+class PerPage:
+    """A scripted ``_send`` keyed by the PAGE (units run concurrently, so not
+    by call order): a readout gets ``tops[page]`` (else CONFIDENT_9, which
+    stands); a reasoned call — the escalation, or a reasoned criterion's
+    scoring call — ``answer``, or a connection error on a page in
+    ``fail``."""
+
+    def __init__(self, tops: dict, *, fail=(), answer=(2, "FAIL", 70, "escalated: no")):
+        self.tops, self.fail, self.answer = tops, set(fail), answer
+
+    async def __call__(self, prompt):
+        page = int(re.search(r"page-(\d+)-marker", _user_text(prompt)).group(1))
+        if is_readout(prompt):
+            return readout_response(self.tops.get(page, CONFIDENT_9))
+        if page in self.fail:
+            raise httpx.ConnectError("connection refused")
+        body = dict(zip(("score", "verdict", "confidence", "reason"), self.answer))
+        return {"choices": [{"message": {"content": json.dumps(body)}, "finish_reason": "stop"}]}
+
+
+def _run(docs, criteria) -> dict:
+    return asyncio.run(analysis.analyze_document(docs, criteria))
+
+
+# Five pages, two escalated: page 1 on confidence (60 < 80), page 3 on an
+# incomplete readout; the rest stand.
+FIVE_PAGES = {1: UNSURE, 3: LOW_COVERAGE}
+TWO_OF_FIVE = {
+    "units": 5, "escalated": 2, "escalation_failed": 0, "readout_failed": 1,
+    "why": {"confidence": 1, "incomplete": 1, "cap": 0}, "models": ["reasoner"],
+    "summary": "escalated on 2 of 5 pages",
+}
+
+
+@pytest.mark.parametrize("rule", ["mean", "any", "worst", "all"])
+def test_a_criterion_over_five_pages_counts_its_escalations(registry, monkeypatch, rule):
+    """The criterion's detail.escalations is rebuilt from ALL five pages
+    under every rule — never the chosen page's (any / worst / all keep that
+    page's detail whole otherwise) nor the first's (mean keeps its stable
+    keys)."""
+    monkeypatch.setattr(llm_client, "_send", PerPage(FIVE_PAGES))
+    entry = _entries(_run(_marked_doc(0, 5), [_ac(aggregate=rule)]))["has a house"]
+    assert entry["status"] == "ok" and entry["complete"] is True
+    detail = _detail(entry)
+    assert (detail["aggregate"]["rule"], detail["aggregate"]["level"]) == (rule, "pages")
+    assert detail["escalations"] == TWO_OF_FIVE
+    assert tuple(detail["escalations"]) == llm_eval.ESCALATIONS_KEYS
+    # Each page keeps its own tally (units 1) beside its escalation block.
+    pages = [unit["detail"]["escalations"] for unit in entry["items"]]
+    assert [(t["units"], t["escalated"]) for t in pages] == [(1, 0), (1, 1), (1, 0), (1, 1), (1, 0)]
+    assert pages[1]["why"]["confidence"] == 1 and pages[3]["why"]["incomplete"] == 1
+    assert pages[3]["readout_failed"] == 1 and pages[1]["readout_failed"] == 0
+    assert pages[0]["summary"] == "escalated on 0 of 1 page"
+    assert [unit["detail"]["escalation"]["escalated"] for unit in entry["items"]] == [
+        False, True, False, True, False]
+    if rule == "mean":
+        assert "escalation" not in detail                      # per page: items[] only
+        assert detail["model"] == "quick" and detail["mode"] == "fast"     # the first page's
+    else:
+        chosen = "item 0" if rule == "any" else "item 1"       # the first on a tie
+        assert detail["aggregate"]["from"] == chosen
+        own = entry["items"][int(chosen.split()[1])]["detail"]
+        assert detail["escalation"] == own["escalation"]       # the chosen page's, whole …
+        assert own["escalations"]["units"] == 1                # … but not its tally
+
+
+@pytest.mark.parametrize("rules", [
+    "mean", "worst",
+    {"pages": "mean", "documents": "any"},
+    {"pages": "any", "documents": "mean"},
+])
+def test_two_documents_add_their_pages_never_count_documents(registry, monkeypatch, rules):
+    """Document a (pages 0-2) escalates page 0, document b (pages 3-4) page
+    4: each document's tally counts its pages, and the criterion's adds
+    them — 5 units, the pages, not 2 documents."""
+    captured = []
+    real = pipeline.aggregate_criterion
+
+    def capture(c, units, groups):
+        captured.append(real(c, units, groups))
+        return captured[-1]
+
+    monkeypatch.setattr(pipeline, "aggregate_criterion", capture)
+    monkeypatch.setattr(llm_client, "_send", PerPage({0: UNSURE, 4: LOW_COVERAGE}))
+    docs = [_marked_doc(0, 3, "a.pdf"), _marked_doc(3, 2, "b.pdf")]
+    entry = _entries(_run(docs, [_ac(aggregate=rules)]))["has a house"]
+    detail = _detail(entry)
+    assert detail["aggregate"]["level"] == "documents"
+    assert detail["escalations"] == TWO_OF_FIVE
+    (aggregated,) = captured
+    per_document = [o.detail["escalations"] for o in aggregated.per_document]
+    assert [(t["units"], t["escalated"], t["why"]) for t in per_document] == [
+        (3, 1, {"confidence": 1, "incomplete": 0, "cap": 0}),
+        (2, 1, {"confidence": 0, "incomplete": 1, "cap": 0}),
+    ]
+    assert [t["summary"] for t in per_document] == [
+        "escalated on 1 of 3 pages", "escalated on 1 of 2 pages"]
+    assert aggregated.final.detail["escalations"] == TWO_OF_FIVE
+
+
+def test_a_single_page_criterion_reads_the_same_key(registry, monkeypatch):
+    """One page passes straight through: the criterion's detail IS the
+    page's, tally included (units 1, the singular noun)."""
+    monkeypatch.setattr(llm_client, "_send", PerPage({0: UNSURE}))
+    entry = _entries(_run(_marked_doc(0, 1), [_ac()]))["has a house"]
+    detail = _detail(entry)
+    assert "aggregate" not in detail and detail == entry["items"][0]["detail"]
+    assert detail["escalations"] == {
+        "units": 1, "escalated": 1, "escalation_failed": 0, "readout_failed": 0,
+        "why": {"confidence": 1, "incomplete": 0, "cap": 0}, "models": ["reasoner"],
+        "summary": "escalated on 1 of 1 page",
+    }
+    monkeypatch.setattr(llm_client, "_send", PerPage({}))
+    stood = _detail(_entries(_run(_marked_doc(0, 1), [_ac()]))["has a house"])
+    assert stood["escalations"] == {
+        "units": 1, "escalated": 0, "escalation_failed": 0, "readout_failed": 0,
+        "why": {"confidence": 0, "incomplete": 0, "cap": 0}, "models": [],
+        "summary": "escalated on 0 of 1 page",
+    }
+
+
+def test_score_false_keeps_the_counts(registry, monkeypatch):
+    """Under ``score: false`` the judgement goes (value, each page's signal
+    and readout) and the counts stay — they are not a judgement."""
+    monkeypatch.setattr(llm_client, "_send", PerPage(FIVE_PAGES))
+    c = CriterionInput.model_validate({"name": "has a house", "score": False, "options": {
+        "hint": "presence", "model": "quick", "mode": "adaptive"}})
+    entry = _entries(_run(_marked_doc(0, 5), [c]))["has a house"]
+    assert entry["status"] == "ok" and entry["score"] is None
+    detail = _detail(entry)
+    assert detail["value"] is None and detail["escalations"] == TWO_OF_FIVE
+    for unit in entry["items"]:
+        assert unit["detail"]["escalation"]["signal"] is None
+    assert entry["items"][1]["detail"]["escalation"]["why"] == "confidence < 80"
+
+
+def test_a_failed_escalation_is_counted_and_an_errored_page_is_not(registry, monkeypatch):
+    """Page 0 stands; page 1 is unsure and its escalation fails (its readout
+    stands: counted as escalation_failed); page 2 is incomplete and
+    escalates; page 3 is incomplete AND its escalation fails — the page
+    errors and, as from the aggregate's score and `values`, is excluded."""
+    monkeypatch.setattr(llm_client, "_send", PerPage(
+        {1: UNSURE, 2: LOW_COVERAGE, 3: LOW_COVERAGE}, fail={1, 3}))
+    entry = _entries(_run(_marked_doc(0, 4), [_ac(aggregate="mean")]))["has a house"]
+    assert entry["status"] == "ok" and entry["complete"] is False
+    assert [unit["status"] for unit in entry["items"]] == ["ok", "ok", "ok", "error"]
+    assert "(1 item(s) errored and are excluded)" in entry["reason"]
+    assert _detail(entry)["escalations"] == {
+        "units": 3, "escalated": 1, "escalation_failed": 1, "readout_failed": 1,
+        "why": {"confidence": 1, "incomplete": 1, "cap": 0}, "models": ["reasoner"],
+        "summary": "escalated on 1 of 3 pages and 1 escalation failed",
+    }
+    assert list(_detail(entry)["aggregate"]["values"]) == ["item 0", "item 1", "item 2"]
+
+
+def test_the_summary_is_configs_wording_and_the_levels_nest():
+    stood = llm_eval._unit_escalations()
+    failed = llm_eval._unit_escalations(why="confidence")
+    capped = llm_eval._unit_escalations(why="cap", answered_by="reasoner", readout_failed=True)
+    assert failed["summary"] == "escalated on 0 of 1 page and 1 escalation failed"
+    three = llm_eval.combine_escalations([failed, failed, stood])
+    assert three["summary"] == (
+        config.ESCALATIONS_SUMMARY.format(
+            escalated=0, units=3, unit_noun=config.ESCALATIONS_UNIT_NOUNS[1])
+        + config.ESCALATIONS_SUMMARY_FAILED.format(
+            failed=2, failed_noun=config.ESCALATIONS_FAILED_NOUNS[1])
+    ) == "escalated on 0 of 3 pages and 2 escalations failed"
+    # A document's tally combines like its pages: (a + b) + c == a + b + c.
+    assert llm_eval.combine_escalations([three, capped]) == llm_eval.combine_escalations(
+        [failed, failed, stood, capped])
+    four = llm_eval.combine_escalations([three, capped])
+    assert four["why"] == {"confidence": 2, "incomplete": 0, "cap": 1}
+    assert four["models"] == ["reasoner"]
+    assert four["summary"] == "escalated on 1 of 4 pages and 2 escalations failed"
+
+
+# The detail a reasoned criterion over two documents of 3 and 2 pages
+# (pages mean, documents any; every page answering 9) had before
+# detail.escalations existed — no rebuilt key may appear or move a byte.
+REASONED_TWO_DOCUMENTS = {
+    "metric": "score", "hint": "auto", "model": "quick", "image_sent": True, "value": 9.0,
+    "aggregate": {"rule": "any", "level": "documents", "from": "document 0",
+                  "values": {"document 0": 9.0, "document 1": 9.0}},
+}
+
+
+@pytest.mark.parametrize("mode", [None, "reasoned", "fast"])
+def test_a_criterion_without_adaptive_has_no_tally_across_pages(registry, monkeypatch, mode):
+    monkeypatch.setattr(llm_client, "_send", PerPage({1: UNSURE},
+                                                     answer=(9, "PASS", 80, "reasoned")))
+    options = {"model": "quick", "aggregate": {"pages": "mean", "documents": "any"}}
+    if mode is not None:
+        options["mode"] = mode
+    c = CriterionInput.model_validate({"name": "has a house", "options": options})
+    docs = [_marked_doc(0, 3, "a.pdf"), _marked_doc(3, 2, "b.pdf")]
+    entry = _entries(_run(docs, [c]))["has a house"]
+    for detail in [entry["detail"]] + [unit["detail"] for unit in entry["items"]]:
+        assert "escalations" not in detail and "escalation" not in detail
+    if mode is None:
+        assert json.dumps(entry["detail"]) == json.dumps(REASONED_TWO_DOCUMENTS)
+    else:
+        assert list(entry["detail"]) == ["metric", "hint", "model", "image_sent", "mode", "value",
+                                         "aggregate"]
+        assert entry["detail"]["mode"] == mode
 
 
 # ---------------------------------------------------------------------------

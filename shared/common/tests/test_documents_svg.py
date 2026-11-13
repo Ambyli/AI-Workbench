@@ -27,6 +27,7 @@ import pytest
 
 from common.documents import (
     DEFAULT_MAX_RENDER_PIXELS,
+    DEFAULT_MAX_WARNING_URL_CHARS,
     ExternalRef,
     UnsupportedDocumentError,
     find_external_refs,
@@ -147,6 +148,21 @@ def test_external_references_become_warnings() -> None:
     ]
     # ...and the data: image, which needs no fetch, IS drawn.
     assert _red_pixels(doc.pages[0].image_bgr) > 0
+
+
+def test_a_warning_cuts_its_url_to_max_warning_url_chars() -> None:
+    long_url = "https://cdn.example/" + "x" * 300 + ".png"
+    raw = make_svg(f'<image width="1" height="1" href="{long_url}"/>')
+    prefix = "external image not rendered: "
+    # The default bound...
+    (line,) = load_document(raw).warnings
+    assert line == prefix + long_url[:DEFAULT_MAX_WARNING_URL_CHARS] + "…"
+    # ...and the caller's: a service passes its own, so its warnings cut alike.
+    (line,) = load_document(raw, max_warning_url_chars=12).warnings
+    assert line == prefix + long_url[:12] + "…"
+    # A URL within the bound is reported whole.
+    (line,) = load_document(raw, max_warning_url_chars=len(long_url)).warnings
+    assert line == prefix + long_url
 
 
 def test_warnings_are_capped() -> None:

@@ -1189,7 +1189,15 @@ a remote failure is a status, never an exception:
    containers, so a stopped `qwen3.5-4b` shows up as `not_local` too. The
    host's verdict is cached per host for 60 s -- an unresolved one for 2 s
    only, so a restarted model is classified again within seconds. An
-   unknown or unavailable model is `refused`.
+   unknown or unavailable model is `refused`. The guard checks only the
+   model it submits to, which is enough because route-policy sends no
+   `options.mode` (its criteria are `{hint: presence, ocr: never}`, so the
+   classifier answers them reasoned on that model alone). If it ever sends
+   `options.mode: "adaptive"`, an unsure page escalates to the classifier's
+   ESCALATION model (`CLASSIFIER_ESCALATION_MODEL`, which may be external,
+   e.g. Claude): the guard must then also require `GET /models`
+   `escalation` to be `authenticated: false`, `available: true` and
+   private, or a conversation could leave the box.
 2. **`POST /assess`** (JSON): `documents: [{type: text, data: <transcript>}]`,
    one `{name: <question>, type: llm, options: {hint: presence, ocr: never}}`
    per criterion in tie order, `model`. N criteria cost N model calls, run

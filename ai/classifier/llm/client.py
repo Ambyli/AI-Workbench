@@ -18,8 +18,11 @@ the prompt with; ``None`` means the registry's default.
                                model there — and written as one ``llm_calls``
                                row linked to its job (``llm.usage``), with the
                                registry id and the URL actually posted to.
-    call_kind()              — label -> score | ask | refine | verify |
-                               select | describe | other (the metric label).
+    call_kind()              — label -> fast | escalate | score | ask |
+                               refine | verify | select | describe | other
+                               (the metric label; ``escalate`` is an adaptive
+                               criterion's scoring call on the escalation
+                               model, measured like ``score``).
     usage_counts()           — a response's prompt / cached / completion /
                                reasoning token counts, None where absent.
     call_model()              — the SCORING call. Retries a parse failure up to
@@ -34,9 +37,25 @@ the prompt with; ``None`` means the registry's default.
                                raising, because a localisation that could not
                                be obtained must leave the score it was
                                annotating untouched.
+    call_readout()            — the ONE-TOKEN readout (``options.mode:
+                               "fast"``, a ``ModelSpec.fast_body`` prompt):
+                               posted ONCE (never the parse-retry loop — the
+                               same prompt gets the same logits), its answer
+                               read from the first generated position's
+                               probabilities (``common.logprobs
+                               .option_distribution``). Raises
+                               ``ReadoutIncomplete`` (coverage under
+                               ``fast.min_coverage``; not a ``ValueError``)
+                               or its subclass ``ReadoutCapped`` (labels
+                               missing from the top-k could hold
+                               ``fast.max_unseen_mass``), counted in
+                               ``classifier_readout_incomplete_total{model,
+                               kind, reason}``; a server's 4xx about
+                               logprobs becomes the named ``LLMCallError``
+                               "the server refused top_logprobs K".
 
-The difference in failure mode between the two is the whole reason they are
-separate functions.
+The difference in failure mode between the first two is the whole reason
+they are separate functions.
 
 **Measured confidence** (``models.yaml`` ``confidence.method``, score calls
 only). ``logprobs``: the score call's body asked for token probabilities
@@ -55,8 +74,8 @@ replaces ``call_model`` returns plain answers and gets the fallback.
 because both calls produce them and nothing else reads them — and so do the
 per-request ``classifier_llm_call_seconds`` histogram and the four
 ``classifier_llm_*_tokens_total`` counters ``_post`` records from each
-response's ``usage``. Those are labelled by call KIND — score, ask, refine,
-verify, select, describe, other — derived from the ``label`` every caller
+response's ``usage``. Those are labelled by call KIND — fast, escalate, score,
+ask, refine, verify, select, describe, other — derived from the ``label`` every caller
 already passes (:func:`call_kind`), and by ``model`` — the REGISTRY id, a
 fixed set from ``models.yaml`` — so they say where time goes without a
 criterion name or a free-form string ever becoming a label value.
@@ -81,7 +100,8 @@ duration of the request, and ``_send`` reads the URL, the headers and the
 timeout from it.
 
 Process flow position: ``call_model`` is the ``llm`` evaluator's scoring call
-(``analysis.llm_eval``); ``call_model_json`` is every round of ``llm.boxes``.
+(``analysis.llm_eval``), ``call_readout`` its fast one; ``call_model_json`` is
+every round of ``llm.boxes``.
 """
 
 import asyncio
@@ -96,9 +116,15 @@ from typing import Optional
 import httpx
 from prometheus_client import Counter, Histogram
 
-from common.logprobs import from_samples, int_field_distribution, resolve_path
+from common.logprobs import (
+    OptionReadout,
+    from_samples,
+    int_field_distribution,
+    option_distribution,
+    resolve_path,
+)
 
-from config import HTTP_CONNECT_TIMEOUT, MAX_LLM_RETRIES
+from config import HTTP_CONNECT_TIMEOUT, MAX_LLM_RETRIES, SCORE_HI, SCORE_LO
 from llm import confidence as llm_confidence
 from llm import usage as llm_usage
 from llm.models import ModelSpec, get_registry
@@ -192,13 +218,29 @@ llm_reasoning_tokens = Counter(
     "by call kind and model",
     ["kind", "model"],
 )
+# A one-token readout (call_readout) that answered but could not be believed:
+# reason `coverage` — under fast.min_coverage of the answer position's
+# probability fell on the labels (or the response carried no logprobs);
+# `cap` — labels missing from the top_logprobs list could hold
+# fast.max_unseen_mass or more (ReadoutCapped). Each one fails its unit.
+readout_incomplete = Counter(
+    "classifier_readout_incomplete_total",
+    "One-token readouts refused after the model answered, by model, call kind and "
+    "reason (coverage | cap)",
+    ["model", "kind", "reason"],
+)
 
 # label prefix -> call kind. The callers' labels are "score/<name>",
-# "score/<name>/ref<k>", "bbox/<name>#<n>", "refine/<name>#<n>",
-# "verify/<name>#<n>", "reference/select#<item>" and "reference/describe";
-# a label that matches none of them is "other". A new call site picks one of
-# these prefixes (or adds a row here) so its tokens are attributed.
+# "score/<name>/ref<k>", "fast/<name>" (a one-token readout, call_readout),
+# "escalate/<name>" (an adaptive criterion's reasoned scoring call on the
+# escalation model), "bbox/<name>#<n>", "refine/<name>#<n>",
+# "verify/<name>#<n>", "reference/select#<item>" and "reference/describe"; a
+# label that matches none of them is "other". A new call site picks one of
+# these prefixes (or adds a row here, AHEAD of any more generic prefix it
+# shares) so its tokens are attributed.
 _KIND_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("fast/", "fast"),
+    ("escalate/", "escalate"),
     ("score/", "score"),
     ("bbox/", "ask"),
     ("refine/", "refine"),
@@ -207,6 +249,10 @@ _KIND_PREFIXES: tuple[tuple[str, str], ...] = (
     ("reference/describe", "describe"),
 )
 CALL_KINDS: tuple[str, ...] = tuple(kind for _, kind in _KIND_PREFIXES) + ("other",)
+# The kinds that are SCORING calls (a ModelSpec.body(..., "score") body), so
+# call_model measures their confidence per the entry's confidence.method: the
+# plain / guided scoring call and an adaptive criterion's escalation.
+_SCORING_KINDS: frozenset[str] = frozenset({"score", "escalate"})
 
 
 def call_kind(label: str) -> str:
@@ -271,6 +317,44 @@ class LLMCallError(RuntimeError):
     response shape, or ``MAX_LLM_RETRIES`` unparseable answers. The message
     is caller-facing: it lands in the criterion's ``error`` field.
     """
+
+
+class AnswerUnparsed(LLMCallError):
+    """The ``MAX_LLM_RETRIES`` unparseable answers case of
+    :class:`LLMCallError`. Its message quotes the start of the model's last
+    answer — which can carry a verdict and a confidence — so a caller that
+    must not report a judgement (an adaptive ``score: false`` unit's
+    ``detail.escalation.error``) tells it apart by type."""
+
+
+class ReadoutIncomplete(RuntimeError):
+    """A one-token readout answered, but too little of its answer position's
+    probability fell on the labels (``fast.min_coverage``) — or the response
+    carried no token probabilities to read.
+
+    NOT a ``ValueError`` on purpose: nothing may mistake it for a parse
+    failure and retry (a retry gets the same logits). ``reason`` is
+    ``coverage`` here, ``cap`` on :class:`ReadoutCapped`; ``readout`` is the
+    ``common.logprobs.OptionReadout`` (None when there was nothing to read).
+    ``summary`` is the message without its remedy, for a caller that words
+    its own.
+    """
+
+    reason = "coverage"
+
+    def __init__(self, message: str, *, summary: Optional[str] = None, readout=None):
+        super().__init__(message)
+        self.summary = summary or message
+        self.readout = readout
+
+
+class ReadoutCapped(ReadoutIncomplete):
+    """The probability cap: labels missing from the returned top-k could hold
+    ``fast.max_unseen_mass`` or more of the probability (the readout's
+    ``unseen_bound`` estimate), so its answer is not known well enough to
+    report."""
+
+    reason = "cap"
 
 
 def encode_image_to_base64(image) -> str:
@@ -446,7 +530,8 @@ async def call_model(
         prompt: The dict produced by ``llm.prompts.build_llm_prompt``.
         label:     What this call is for: the log lines, and — through
                    :func:`call_kind` — the kind its metrics are labelled by.
-                   Start it with ``score/`` or ``reference/...`` (see
+                   Start it with ``score/``, ``escalate/`` (an adaptive
+                   criterion's escalation) or ``reference/...`` (see
                    ``_KIND_PREFIXES``).
         validator: Optional ``parsed -> answer`` function. A ``ValueError``
                    from it counts as a parse failure and retries, so "valid
@@ -457,8 +542,9 @@ async def call_model(
 
     Returns:
         The model's JSON object, or ``validator``'s result for it. For a
-        ``score/`` call to an entry whose ``confidence.method`` measures
-        something, a dict result also carries the private keys
+        ``score/`` or ``escalate/`` call to an entry whose
+        ``confidence.method`` measures something, a dict result also carries
+        the private keys
         ``llm.confidence`` reads (``_score_dist``, ``_samples``,
         ``_confidence_note``) — see :func:`_measure`.
 
@@ -467,10 +553,12 @@ async def call_model(
     """
     spec = _spec(model)
     conf = spec.confidence
-    # Only the SCORE call kind is measured — the same rule ModelSpec.body
-    # uses to add the confidence request keys; box / select / describe calls
-    # are sent and read exactly as before.
-    measure = conf.method if conf.method != "stated" and call_kind(label) == "score" else None
+    # Only a SCORING call is measured (kind score, or escalate — the same
+    # score body, ModelSpec.body's rule for the confidence request keys); box
+    # / select / describe calls are sent and read exactly as before.
+    measure = (
+        conf.method if conf.method != "stated" and call_kind(label) in _SCORING_KINDS else None
+    )
     repeat = measure == "sampling" and conf.sampling.via == "repeat"
     slots = conf.slots if measure == "sampling" else 1
     logger.debug(
@@ -509,7 +597,7 @@ async def call_model(
 
     llm_calls_total.labels(status="failed", model=spec.id).inc()
     logger.error("call_model(%s): all %d attempts failed", label, MAX_LLM_RETRIES)
-    raise LLMCallError(
+    raise AnswerUnparsed(
         f"model {spec.id!r}'s answer could not be parsed after {MAX_LLM_RETRIES} "
         f"attempts: {last_exc}"
     )
@@ -561,7 +649,7 @@ def _logprob_distribution(data: dict, spec: ModelSpec):
         if isinstance(message, dict) and isinstance(message.get("content"), str):
             content = message["content"]
         dist = int_field_distribution(
-            entries, llm_confidence.SCORE_KEY, llm_confidence.SCORE_LO, llm_confidence.SCORE_HI,
+            entries, llm_confidence.SCORE_KEY, SCORE_LO, SCORE_HI,
             content=content, top_key=cfg.top_key, number_tokens=cfg.number_tokens,
         )
     except Exception as exc:  # noqa: BLE001 — a measurement never fails the call
@@ -629,12 +717,158 @@ def _measure(responses: list[dict], validator, measure: Optional[str], spec: Mod
         "verdicts": [a.get("verdict") for a in scored],
         "stated": [a.get("confidence") for a in scored],
     }
-    dist = from_samples(
-        [a["score"] for a in scored], llm_confidence.SCORE_LO, llm_confidence.SCORE_HI,
-    ) if scored else None
+    dist = from_samples([a["score"] for a in scored], SCORE_LO, SCORE_HI) if scored else None
     note = None if dist is not None else "sampling: no sample carried a score"
     return {**reported, llm_confidence.DIST_KEY: dist, llm_confidence.SAMPLES_KEY: samples,
             llm_confidence.NOTE_KEY: note}
+
+
+# ---------------------------------------------------------------------------
+# The one-token readout (options.mode "fast")
+# ---------------------------------------------------------------------------
+
+
+def _beside(value: float, threshold: float, *, below: bool) -> str:
+    """``value`` printed with the fewest decimals (2 to 6) that keep it on
+    the side of ``threshold`` the check found it on — strictly under it
+    (``below``), else over it or equal to it — so a refusal message never
+    reads "coverage 0.50 < 0.5" or "0.02 (fast.max_unseen_mass 0.02)" for a
+    value a hair across the line."""
+    for digits in range(2, 7):
+        text = f"{value:.{digits}f}"
+        shown = float(text)
+        if (shown < threshold) if below else (shown > threshold or value == threshold):
+            return text
+    return repr(value)
+
+
+def _refused_top_logprobs(exc: httpx.HTTPError) -> bool:
+    """Whether an HTTP error is the server refusing the logprobs request: a
+    4xx whose body mentions ``logprobs`` (vLLM's 400 for a ``top_logprobs``
+    over its ``--max-logprobs``)."""
+    response = getattr(exc, "response", None)
+    if response is None or not 400 <= response.status_code < 500:
+        return False
+    try:
+        text = response.text
+    except Exception:  # noqa: BLE001 — an unreadable body is not this case
+        return False
+    return "logprobs" in (text or "").lower()
+
+
+async def call_readout(
+    prompt: dict, *, labels: tuple[str, ...], label: str = "", model: Optional[ModelSpec] = None,
+) -> OptionReadout:
+    """A ONE-TOKEN readout: post ``prompt`` (built by ``ModelSpec.fast_body``)
+    ONCE and read the answer position's distribution over ``labels``.
+
+    Posted exactly once: it never enters :func:`call_model`'s parse-retry
+    loop — the same prompt gets the same logits, so a retry could only cost
+    a slot. It goes through ``_post`` like every call, so it holds a slot of
+    the model's ``max_concurrent``, is timed and token-counted, and is
+    written as one ``llm_calls`` row; start ``label`` with ``fast/`` (call
+    kind ``fast``). The logprob payload is dropped once read.
+
+    The response is read at the entry's ``confidence.logprobs.entries_path``
+    / ``top_key`` (where this provider keeps the entries) with
+    ``common.logprobs.option_distribution``, then believed only when:
+
+      * ``coverage`` (the probability on the labels) is at least
+        ``fast.min_coverage`` — else :class:`ReadoutIncomplete`;
+      * ``unseen_bound`` (an estimate of what labels missing from the top-k
+        hold — one spelling each under the smallest listed probability, a
+        heuristic rather than a guarantee: ``common.logprobs.options``) is
+        under ``fast.max_unseen_mass`` — else :class:`ReadoutCapped`.
+
+    Either refusal is counted in ``classifier_readout_incomplete_total{model,
+    kind, reason}``; its message prints the measured value with enough
+    decimals to show it on the threshold's far side (:func:`_beside`).
+
+    Raises:
+        ReadoutIncomplete / ReadoutCapped: As above.
+        LLMCallError: An HTTP failure — a 4xx about logprobs is named ("the
+            server refused top_logprobs K — its --max-logprobs is lower") —
+            or a response that is not a chat completion (a body that is not
+            JSON, no choices); or ``model`` has no ``fast:`` block. Each is
+            counted ``llm_calls_total{status="failed"}``, and none is
+            retried.
+    """
+    spec = _spec(model)
+    if spec.fast is None:
+        raise LLMCallError(f"model {spec.id!r} has no fast block in models.yaml")
+    fast = spec.fast
+    kind = call_kind(label)
+    cfg = spec.confidence.logprobs
+    try:
+        data = await _post(prompt, label=label, attempt=1, model=spec)
+    except httpx.HTTPError as exc:
+        llm_calls_total.labels(status="failed", model=spec.id).inc()
+        logger.error("call_readout(%s): HTTP error: %s", label, exc)
+        if _refused_top_logprobs(exc):
+            raise LLMCallError(
+                f"the server refused top_logprobs {fast.top_logprobs} — its --max-logprobs is "
+                "lower: raise it (ai/vllm) or lower models.yaml fast.top_logprobs "
+                f"(model {spec.id!r})"
+            ) from exc
+        raise LLMCallError(f"model {spec.id!r} call failed: {exc}") from exc
+    except (ValueError, KeyError) as exc:
+        # A 2xx whose body is not JSON (a proxy's HTML page, a truncated
+        # body: `_send`'s response.json() raises JSONDecodeError, a
+        # ValueError). Named here rather than left a bare parse error, and
+        # still not retried. ReadoutIncomplete is not a ValueError, and
+        # `_post` never raises it.
+        llm_calls_total.labels(status="failed", model=spec.id).inc()
+        logger.error("call_readout(%s): unreadable response: %s", label, exc)
+        what = "not JSON" if isinstance(exc, json.JSONDecodeError) else "unreadable"
+        raise LLMCallError(f"unexpected response from model {spec.id!r}: {what} ({exc})") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
+        llm_calls_total.labels(status="failed", model=spec.id).inc()
+        raise LLMCallError(f"unexpected response from model {spec.id!r}: no choices")
+    try:
+        entries = resolve_path(data, cfg.entries_path)
+        readout = option_distribution(entries, labels, top_key=cfg.top_key)
+    except Exception as exc:  # noqa: BLE001 — a garbled stream is an incomplete readout
+        logger.warning("call_readout(%s): could not read the entries: %s", label, exc)
+        readout = None
+    finally:
+        _drop_logprobs(data)
+    llm_calls_total.labels(status="success", model=spec.id).inc()
+
+    if readout is None:
+        readout_incomplete.labels(model=spec.id, kind=kind, reason="coverage").inc()
+        summary = (
+            f"readout incomplete: the response carried no token probabilities at "
+            f"{cfg.entries_path} (models.yaml confidence.logprobs.entries_path)"
+        )
+        raise ReadoutIncomplete(summary, summary=summary)
+    if readout.coverage < fast.min_coverage:
+        readout_incomplete.labels(model=spec.id, kind=kind, reason="coverage").inc()
+        summary = (
+            f"readout incomplete: coverage {_beside(readout.coverage, fast.min_coverage, below=True)}"
+            f" < {fast.min_coverage} "
+            f"(models.yaml fast.min_coverage; the model wrote {readout.first_token!r})"
+        )
+        raise ReadoutIncomplete(summary, summary=summary, readout=readout)
+    if readout.unseen_bound >= fast.max_unseen_mass:
+        readout_incomplete.labels(model=spec.id, kind=kind, reason="cap").inc()
+        bound = _beside(readout.unseen_bound, fast.max_unseen_mass, below=False)
+        summary = (
+            f"probability cap reached: {readout.n_unseen} of {len(readout.labels)} labels were "
+            f"not among the top {fast.top_logprobs} alternatives and could hold up to "
+            f"{bound} (fast.max_unseen_mass {fast.max_unseen_mass})"
+        )
+        knobs = (
+            "raise models.yaml fast.top_logprobs together with the server's --max-logprobs"
+        )
+        raise ReadoutCapped(
+            f"{summary} — {knobs}, or use mode 'reasoned'",
+            summary=f"{summary}; {knobs}", readout=readout,
+        )
+    logger.debug(
+        "call_readout(%s): %s coverage=%.3f unseen_bound=%.4f", label, readout.best(),
+        readout.coverage, readout.unseen_bound,
+    )
+    return readout
 
 
 async def call_model_json(

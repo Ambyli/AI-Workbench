@@ -2,12 +2,17 @@
 
 All tuneable values live here — environment-driven settings AND the
 module-level constants the pipeline used to keep next to the code that used
-them (content-type allowlist, working image size, fuzzy-credit floor, the LLM
-hint rubrics and prompt headings, the reference examples' prompt wording, the
-SSRF blocklist). Anything a deployment
-or a prompt engineer might want to change without reading the pipeline is in
-this file; the other modules import from here and hold no constants of their
-own beyond function registries.
+them (the 1-10 score scale and its verdict bands, content-type allowlist,
+working image size, fuzzy-credit floor, the LLM hint rubrics, prompt headings
+and the scoring prompt's system sentences, the reference examples' prompt
+wording, the fast readout's scale, defaults and wording, a models.yaml
+`confidence:` block's defaults, the fetch User-Agent, the SSRF blocklist,
+the database pool's close timeout). Anything a deployment or a prompt
+engineer might want to change without reading the pipeline is in this file;
+the other modules import from here and hold no constants of their own beyond
+the exceptions ai/classifier/CLAUDE.md § Rules lists under "Constants live in
+config.py" (function registries, result-shape declarations, metric
+definitions, the answer contracts the parsers read, ...).
 
 This file is deliberately NOT split along the package boundaries below it. A
 constant read by three packages has one home, and the section comments name
@@ -47,6 +52,37 @@ def _env_flag(name: str, default: str) -> bool:
 # CLASSIFIER_HTTP_TIMEOUT_S, CLASSIFIER_LLM_BBOX_MAX_TOKENS,
 # CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS, CLASSIFIER_TEXT_CHAR_BUDGET) were
 # removed with no fallback; startup warns about any still set.
+
+# ---------------------------------------------------------------------------
+# The score scale and the verdict bands (utils.py verdict_from_score; the
+# clamps in llm/validate.py, llm/boxes.py, llm/confidence.py, llm/client.py,
+# analysis/aggregate.py, analysis/weighting.py, analysis/references.py,
+# analysis/text_eval.py, analysis/detector_eval.py, api/reference_schemas.py,
+# cv/quality.py, cv/features.py; and the constants below that derive from it)
+# ---------------------------------------------------------------------------
+# Every criterion of every type is scored on ONE integer scale, SCORE_LO to
+# SCORE_HI, and its verdict is read off the score by utils.verdict_from_score:
+# PASS from SCORE_PASS_MIN up, MARGINAL from SCORE_MARGINAL_MIN up, FAIL below
+# — 7-10, 4-6, 1-3. A DEFINITION, not a knob: the same scale is written out as
+# text the model and the caller read — HINT_RUBRICS, the scoring and verify
+# prompts in llm/prompts.py (pinned by hash), FAST_RUBRICS / FAST_INSTRUCTION
+# (the readout's digits are this scale moved down by one), the BreakdownInput
+# descriptions (api/reference_schemas.py), classifier.schemas.json's score
+# bounds and API.md — and each CV detector's curve places its scores in these
+# bands (cv/features.py, cv/quality.py: the curve is the detector's own, only
+# its clamp to the scale reads these). Change all of them together. A clamp
+# to the scale reads SCORE_LO / SCORE_HI; a line that IS the PASS line reads
+# SCORE_PASS_MIN (LLM_BBOX_PRESENCE_MIN, LLM_BBOX_VERIFY_PASS's default, a
+# detector hit under DETECTOR_STRONG_SCORE, a fuzzy near miss's ceiling).
+#
+# The lowest score: absent, unreadable, nothing found.
+SCORE_LO: int = 1
+# The highest score: clearly present, a full hit.
+SCORE_HI: int = 10
+# The lowest PASS score; the PASS band is SCORE_PASS_MIN..SCORE_HI.
+SCORE_PASS_MIN: int = 7
+# The lowest MARGINAL score; below it is FAIL, from SCORE_LO.
+SCORE_MARGINAL_MIN: int = 4
 
 # ---------------------------------------------------------------------------
 # OpenCV pre-check thresholds
@@ -159,7 +195,11 @@ OCR_MIN_NATIVE_CHARS: int = max(
 #   * the body must be a PNG or JPEG by its bytes (no nested SVG, no HTML
 #     error page, no HEIC/AVIF — MuPDF draws only JPEG and PNG data: images);
 #   * any failure blanks that href and becomes a documents[].warnings line
-#     naming the reason — it never fails the request.
+#     naming the reason and the URL, cut to SVG_WARNING_URL_MAX_CHARS — it
+#     never fails the request. The loader's own "not rendered" lines cut
+#     their URLs to the same bound: analysis/loading.py passes it as
+#     common.documents.load_document's max_warning_url_chars (the library's
+#     own default, DEFAULT_MAX_WARNING_URL_CHARS, is also 200).
 #
 # OFF by default because every fetch is a beacon: it tells whoever wrote the
 # SVG when, and from where, the document was processed. On customer
@@ -170,6 +210,9 @@ SVG_FETCH_MAX_BYTES: int = max(1, int(os.environ.get("CLASSIFIER_SVG_FETCH_MAX_B
 SVG_FETCH_TIMEOUT_S: float = max(
     0.1, float(os.environ.get("CLASSIFIER_SVG_FETCH_TIMEOUT_S", "10"))
 )
+# The characters of a URL a "not fetched" warning quotes (analysis/loading.py
+# resolve_svg_images); a longer one is cut and ends in "…".
+SVG_WARNING_URL_MAX_CHARS: int = 200
 
 # ---------------------------------------------------------------------------
 # Document analysis constants (analysis/loading.py, analysis/text_eval.py)
@@ -206,7 +249,9 @@ MAX_WORKING_DIMENSION: int = 1000
 # Similarity below which a fuzzy text criterion earns no partial credit at
 # all. difflib scores two unrelated phrases around 0.3-0.5, so a "near miss"
 # only means something above this line. Between the floor and the criterion's
-# fuzzy_threshold the score scales 1-6; at or above the threshold it is 10.
+# fuzzy_threshold the score scales from SCORE_LO to SCORE_PASS_MIN - 1 (1-6:
+# a near miss never PASSes); at or above the threshold it is SCORE_HI
+# (analysis/text_eval.py score_text).
 FUZZY_CREDIT_FLOOR: float = 0.5
 
 # ---------------------------------------------------------------------------
@@ -263,6 +308,61 @@ HINT_RUBRICS: dict[str, dict[str, str]] = {
 # "provided above".
 DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
 
+# The scoring system prompt (build_llm_prompt) is SCORING_ROLE_SENTENCE, then
+# ONE source sentence saying what the model is given (_source_sentence), then
+# SCORING_CONFIDENCE_SENTENCE and JSON_ONLY_SENTENCE — and, on a
+# reference-guided call, REFERENCE_SYSTEM_SENTENCE (§ Prompt wording below).
+# The fast readout's (_fast_prompt) shares the role sentence and the image /
+# image-and-text / no-image source sentences, swaps the text-only one for
+# FAST_TEXT_ONLY_SENTENCE and ends in FAST_SYSTEM_LINE instead of the
+# confidence and JSON sentences, so the two prompts cannot drift. Each
+# sentence carries its own trailing space except JSON_ONLY_SENTENCE (which ends
+# the BASE prompt) and REFERENCE_SYSTEM_SENTENCE (appended after it with a
+# leading space). All of it is pinned by hash (unit-tests/classifier/
+# test_reference_prompts.py GOLDEN, test_fast_mode.py REASONED_PROMPT_PINS /
+# FAST_GOLDEN): change it only on purpose. What stays inline in
+# llm/prompts.py is the user turn built around per-call values — the context
+# line, the truncation note, the "Score this one criterion…" instruction —
+# and SCORING_SCAFFOLD, the answer contract llm/validate.py parses.
+SCORING_ROLE_SENTENCE: str = "You are a document assessment expert. "
+# A text-only model (vision: false) on a page that has an image: it reads the
+# page's text only. Twin of FAST_TEXT_ONLY_SENTENCE, which differs only in
+# "answer 4 (uncertain)" for "say so and score it 5 (uncertain)".
+SCORING_TEXT_ONLY_SENTENCE: str = (
+    "You are given one page of a document as extracted text only — you cannot see the "
+    "page. Judge the criterion from that text; a criterion about how the page LOOKS cannot "
+    "be judged from it, so say so and score it 5 (uncertain). The text may be OCR output "
+    "and can contain recognition errors — judge meaning, not exact spelling. "
+)
+# The page image AND its text layer.
+SCORING_IMAGE_AND_TEXT_SENTENCE: str = (
+    "You are given a document as an image and as extracted text. Use BOTH: the image for "
+    "anything visual (legibility, lighting, framing, stamps, signatures) and the text for "
+    "anything about content (wording, amounts, dates, clauses). The text may be OCR output "
+    "and can contain recognition errors — judge meaning, not exact spelling. "
+)
+# Text with no page image at all (a .txt / .docx).
+SCORING_NO_IMAGE_SENTENCE: str = (
+    "You are given a document as extracted text only — it has no page image. Judge the "
+    "criterion from that text. It may be OCR output and can contain recognition errors — "
+    "judge meaning, not exact spelling. "
+)
+# The image with no text — and the fallback when there is neither.
+SCORING_IMAGE_ONLY_SENTENCE: str = (
+    "Analyze the provided image and score it against the criterion. "
+)
+# The scale of the answer's `confidence` (reasoned only; a readout states none).
+SCORING_CONFIDENCE_SENTENCE: str = (
+    "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
+)
+# The last sentence of every BASE system prompt that asks for JSON (a guided
+# call's REFERENCE_ / BOX_ / VERIFY_SYSTEM_SENTENCE and a system_line model's
+# reasoning line are appended after it): the scoring
+# call's, the box loop's ask and verify (build_bbox_prompt,
+# build_verify_prompt), MARKS_SYSTEM_PROMPT below, the describe and the
+# selection call's (build_describe_prompt, build_reference_selection_prompt).
+JSON_ONLY_SENTENCE: str = "Return ONLY a valid JSON object."
+
 # ---------------------------------------------------------------------------
 # Prompt wording — the reference examples (llm/prompts.py)
 # ---------------------------------------------------------------------------
@@ -277,9 +377,8 @@ DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
 # "cut off" field — each sent only behind its own setting.
 #
 # Not here on purpose: llm/prompts.py SCORING_SCAFFOLD (the answer contract
-# llm/validate.py parses, not wording), ReferenceExample.caption() (built from
-# the example's score and reason) and the scoring call's own system-prompt
-# sentence for examples (inline in build_llm_prompt).
+# llm/validate.py parses, not wording) and ReferenceExample.caption() (built
+# from the example's score and reason).
 #
 # ── The scoring call's examples (ReferenceExample; build_llm_prompt) ───────
 # The text block that separates the examples from what is being scored.
@@ -290,6 +389,14 @@ REFERENCE_GUARD: str = (
     "The image(s) above are reference examples with known answers, shown so you know "
     "what this criterion means here. Do not reward resemblance the criterion does not "
     "ask about, and do not score the examples."
+)
+
+# Appended to a guided scoring call's system prompt, after one space (the
+# box loop's BOX_SYSTEM_SENTENCE / VERIFY_SYSTEM_SENTENCE below are its
+# siblings).
+REFERENCE_SYSTEM_SENTENCE: str = (
+    "Reference examples with known answers come first; score ONLY the image marked "
+    "CANDIDATE."
 )
 
 # ── The box loop's examples (BoxExample; build_bbox_prompt / build_verify_prompt)
@@ -341,9 +448,9 @@ BOX_CANDIDATE_HEADING: str = "CANDIDATE — locate the feature only in this imag
 VERIFY_CANDIDATE_HEADING: str = "CANDIDATE — judge only this crop"
 
 # One sentence appended to each guided call's system prompt, as the scoring
-# call's is. The verify's says the examples are from OTHER documents, and
-# says "examples", not "crops" — the experiment can show it composites
-# (bin/grounding_experiment.py --verify-images composite).
+# call's REFERENCE_SYSTEM_SENTENCE is. The verify's says the examples are from
+# OTHER documents, and says "examples", not "crops" — the experiment can show
+# it composites (bin/grounding_experiment.py --verify-images composite).
 BOX_SYSTEM_SENTENCE: str = (
     "Reference examples come first; locate the feature ONLY in the image marked CANDIDATE."
 )
@@ -398,7 +505,7 @@ BOX_CAPTION_TEXT: dict[bool, str] = {
 # rejections block (MARKS_FEEDBACK_HEADING, or ""), {scaffold} the answer.
 MARKS_SYSTEM_PROMPT: str = (
     "You pick numbered marks in images. You answer with mark numbers and nothing else. "
-    "Return ONLY a valid JSON object."
+    f"{JSON_ONLY_SENTENCE}"
 )
 MARKS_PROMPT: str = (
     "Find this feature in {attached}: {name}\n\n"
@@ -458,8 +565,87 @@ VERIFY_PARTIAL_REJECT: str = (
     "label and every digit"
 )
 
+# ── The fast readout (an llm criterion's options.mode "fast";
+#    build_llm_prompt(style="fast")) ─────────────────────────────────────
+# Reasoning off, ONE generated token: a digit 0-9 whose probabilities are the
+# answer (llm.client.call_readout; score = digit + FAST_SCORE_OFFSET, so the
+# bands are the 1-10 rubric's moved down by one — 0-2 FAIL, 3-5 MARGINAL, 6-9
+# PASS). Only a fast criterion is sent any of this; the reasoned prompt is
+# untouched (pinned by hash). The prefix stays the reasoned prompt's layout — system
+# prompt, page image, context line, DOCUMENT TEXT block, all per item — so
+# every fast criterion on one page shares a cached prefix; only the rubric,
+# the CRITERION line and FAST_INSTRUCTION differ per criterion. There is no
+# JSON, no confidence and no reason in the answer.
+#
+# The system prompt is SCORING_ROLE_SENTENCE + the reasoned prompt's source
+# sentence (SCORING_IMAGE_AND_TEXT_SENTENCE / SCORING_NO_IMAGE_SENTENCE /
+# SCORING_IMAGE_ONLY_SENTENCE, § LLM prompt text) + FAST_SYSTEM_LINE, which
+# replaces SCORING_CONFIDENCE_SENTENCE + JSON_ONLY_SENTENCE; a text-only page
+# uses FAST_TEXT_ONLY_SENTENCE instead of SCORING_TEXT_ONLY_SENTENCE (which
+# says "say so and score it 5", which a one-digit answer cannot do).
+FAST_SYSTEM_LINE: str = "Answer with one character, nothing else."
+# Twin of SCORING_TEXT_ONLY_SENTENCE; only "answer 4 (uncertain)" differs.
+FAST_TEXT_ONLY_SENTENCE: str = (
+    "You are given one page of a document as extracted text only — you cannot see the "
+    "page. Judge the criterion from that text; a criterion about how the page LOOKS cannot "
+    "be judged from it, so answer 4 (uncertain). The text may be OCR output and can contain "
+    "recognition errors — judge meaning, not exact spelling. "
+)
+# The rubric per hint, on the digit scale — the same shape as HINT_RUBRICS
+# (heading, rubric, extra). GET /hints serves HINT_RUBRICS only.
+FAST_RUBRICS: dict[str, dict[str, str]] = {
+    "quality": {
+        "heading": "QUALITY criterion — rate image quality on a 0-9 scale",
+        "rubric":  "0-2 = FAIL (poor quality)  |  3-5 = MARGINAL  |  6-9 = PASS (good quality)",
+        "extra":   "",
+    },
+    "presence": {
+        "heading": "PRESENCE criterion — detect whether the feature is present in the document",
+        "rubric":  (
+            "9 = clearly present (PASS)  |  "
+            "4 = uncertain or partially present (MARGINAL)  |  "
+            "0 = clearly absent (FAIL)"
+        ),
+        "extra":   (
+            "When DOCUMENT TEXT is provided above, a phrase in that text counts as "
+            "evidence just as a visual observation does."
+        ),
+    },
+    "auto": {
+        "heading": "INFERRED criterion — determine the appropriate rubric from the criterion name",
+        "rubric":  (
+            "Quality/clarity criteria (e.g. 'image sharpness'): rate quality 0-9.\n"
+            "  Presence/absence criteria (e.g. 'has X'): "
+            "9=present, 4=uncertain, 0=absent."
+        ),
+        "extra":   (
+            "A criterion about content ('mentions X', 'includes a total') can be judged "
+            "from the DOCUMENT TEXT block when one is provided; a criterion about the "
+            "image itself (sharpness, lighting, framing) must be judged from the image."
+        ),
+    },
+}
+# After the CRITERION line: the scale once more, and the one-token answer.
+FAST_INSTRUCTION: str = (
+    "Rate this one criterion on the 0-9 scale above: 0-2 is FAIL, 3-5 is MARGINAL, "
+    "6-9 is PASS. Answer with one digit."
+)
+# The scale that wording spells out: the labels read from the answer token
+# (llm.client.call_readout) and what llm.confidence.rate_readout adds to a
+# digit to make the 1-10 score. A DEFINITION, not a knob: it is tied to the
+# score scale (SCORE_LO / SCORE_HI — ten digits for ten scores, digit 0 is
+# SCORE_LO) and the verdict bands (SCORE_PASS_MIN / SCORE_MARGINAL_MIN, § The
+# score scale and the verdict bands), and "score = digit + 1" is also written
+# out in FAST_RUBRICS, FAST_INSTRUCTION, FAST_TEXT_ONLY_SENTENCE's "answer 4",
+# the LLMOptions.mode description and criterion_types()'s mode block
+# (api/criterion_options.py), LLM_RESULT's confidence FieldSpec
+# (analysis/llm_eval.py) and API.md § Fast mode — change all of them together.
+FAST_DIGITS: tuple[str, ...] = tuple("0123456789")
+FAST_SCORE_OFFSET: int = SCORE_LO
+
 # ---------------------------------------------------------------------------
-# LLM call behaviour
+# LLM call behaviour (llm/client.py, llm/usage.py; the document fetch,
+# analysis/loading.py)
 # ---------------------------------------------------------------------------
 # MAX_LLM_RETRIES: how many times to retry if the LLM returns unparseable JSON.
 # The seconds ONE model request may take are per model (models.yaml
@@ -473,9 +659,330 @@ VERIFY_PARTIAL_REJECT: str = (
 #   (analysis/loading.py). Separate from the model timeouts on purpose — a
 #   slow remote file server is not a reason to hold a submit request for four
 #   minutes.
+# FETCH_USER_AGENT: the User-Agent sent with every document-URL and SVG
+#   <image> fetch (analysis/loading.py) — some servers 403 httpx's default.
+# LLM_CALL_ERROR_MAX_CHARS: the llm_calls row's `error` (llm/usage.py
+#   build_row) is the exception's class and message, never a traceback, cut
+#   to this many characters.
 MAX_LLM_RETRIES: int = 3
 HTTP_CONNECT_TIMEOUT: float = 10.0
 FETCH_TIMEOUT: float = 120.0
+FETCH_USER_AGENT: str = "Classifier/1.0"
+LLM_CALL_ERROR_MAX_CHARS: int = 500
+
+# ---------------------------------------------------------------------------
+# Measured confidence — a models.yaml `confidence:` block's defaults and
+# bounds (llm/models.py ConfidenceConfig / LogprobsConfig / SamplingConfig;
+# read through the parsed block by llm/client.py and llm/confidence.py)
+# ---------------------------------------------------------------------------
+# How a scoring call's confidence is measured is per model (API.md
+# § Confidence; models.yaml's header documents each knob). An entry's own
+# value wins over each default here, and an entry with no block is all of
+# them — method `stated`, which asks the server for nothing extra and is safe
+# on any provider. Constants, not env vars. The fast readout's own logprob
+# knobs are § Fast mode (FAST_DEFAULT_TOP_LOGPROBS, FAST_DEFAULT_MIN_COVERAGE):
+# the same values today, kept apart so raising one never changes the other's
+# body. The Literal types of method / headline / fallback / number_tokens /
+# via stay written out in llm/models.py.
+#
+# confidence.method: what is measured — logprobs | sampling | stated.
+CONFIDENCE_DEFAULT_METHOD: str = "stated"
+# confidence.headline: which number is the top-level `confidence` — stated |
+# calibrated (calibrated needs a fitted confidence.calibration).
+CONFIDENCE_DEFAULT_HEADLINE: str = "stated"
+# confidence.fallback: what is reported when the measurement is missing.
+CONFIDENCE_FALLBACK: str = "stated"
+# ── confidence.logprobs (LogprobsConfig: the score token's distribution) ──
+# Merged into a SCORE body; copied per entry, never shared. top_logprobs must
+# stay at or under the server's --max-logprobs (vLLM's default is 20).
+CONFIDENCE_LOGPROBS_DEFAULT_REQUEST: dict = {"logprobs": True, "top_logprobs": 20}
+# Where the response keeps the [{token, logprob, <top_key>}] list
+# (llm/client.py; the fast readout reads it at the same path).
+CONFIDENCE_LOGPROBS_DEFAULT_ENTRIES_PATH: str = "choices.0.logprobs.content"
+# The alternatives' key inside each entry.
+CONFIDENCE_LOGPROBS_DEFAULT_TOP_KEY: str = "top_logprobs"
+# How the tokenizer writes a number — auto | single | digits
+# (common.logprobs.NUMBER_TOKEN_MODES).
+CONFIDENCE_LOGPROBS_DEFAULT_NUMBER_TOKENS: str = "auto"
+# Below this numeric share of the score position the fallback is reported
+# (llm/confidence.py assess).
+CONFIDENCE_LOGPROBS_DEFAULT_MIN_COVERAGE: float = 0.5
+# ── confidence.sampling (SamplingConfig: the distribution of n answers) ───
+# Answers per score call, and the bounds an entry's `n` must stay inside (via
+# n_param one call holds n slots of the entry's max_concurrent).
+CONFIDENCE_SAMPLING_DEFAULT_N: int = 5
+CONFIDENCE_SAMPLING_MIN_N: int = 2
+CONFIDENCE_SAMPLING_MAX_N: int = 32
+# How the n answers are asked for — n_param (one request, `n` in the body) |
+# repeat (n requests, one slot each).
+CONFIDENCE_SAMPLING_DEFAULT_VIA: str = "n_param"
+
+# ---------------------------------------------------------------------------
+# Fast mode — an llm criterion's options.mode (api/, llm/models.py,
+# llm/prompts.py, llm/confidence.py, analysis/llm_eval.py,
+# analysis/references.py, bin/confidence_calibration.py)
+# ---------------------------------------------------------------------------
+# The readout's prompt and scale are § Prompt wording, "The fast readout".
+# Here: the mode's values, a models.yaml `fast:` block's defaults, the
+# adaptive mode's escalation (below), and the wording a CALLER reads (400s, a
+# note, the result's reason, an escalation's `why` — tests pin it verbatim).
+# Constants, not env vars: a per-model value goes in the entry's `fast:`
+# block, which wins over these defaults (the one env var, the escalation
+# model, is read by llm/models.py from the name below).
+#
+# ── The values (api/criterion_options.py LLMOptions.mode, whose Literal a
+#    test pins to MODES) ────────────────────────────────────────────────────
+# reasoned  the scoring call, as every criterion always ran (null = this);
+# fast      the one-token readout alone;
+# adaptive  the readout, then — when it is unsure (its confidence under the
+#           threshold) or could not be read (incomplete / capped) — the
+#           reasoned scoring call on the ESCALATION model.
+MODES: tuple[str, ...] = ("reasoned", "fast", "adaptive")
+DEFAULT_MODE: str = "reasoned"  # what options.mode null means
+# The modes that start with the readout: they need a `fast:` block on the
+# criterion's model and are never guided by references
+# (api/criterion_options.py reads_out, guided_by_references).
+READOUT_MODES: tuple[str, ...] = ("fast", "adaptive")
+# The prompts build_llm_prompt writes (llm/prompts.py `style`; llm/ never
+# imports api/). Adaptive has none of its own: its readout is the fast prompt
+# and its escalation the reasoned one.
+PROMPT_STYLES: tuple[str, ...] = ("reasoned", "fast")
+
+# ── A `fast:` block's defaults and bounds (llm/models.py FastConfig) ──────
+# The answer types fast.calibration may be fitted for and fast.escalate_below
+# set per (the 1-10 rating only).
+FAST_ANSWER_TYPES: tuple[str, ...] = ("rating",)
+# The answer type of every criterion today — the 1-10 rating (typed answers
+# are ZT-603 phase 3): whose calibration and threshold a readout reads
+# (analysis/llm_eval.py, bin/confidence_calibration.py).
+DEFAULT_ANSWER_TYPE: str = "rating"
+# The load-time floor on fast.top_logprobs: every digit, plus one more token.
+FAST_MIN_TOP_LOGPROBS: int = len(FAST_DIGITS) + 1
+# Alternatives asked for — vLLM's --max-logprobs default; never above the server's.
+FAST_DEFAULT_TOP_LOGPROBS: int = 20
+# Below this share of the answer position on the labels, the readout is incomplete.
+FAST_DEFAULT_MIN_COVERAGE: float = 0.5
+# The probability cap: an unseen_bound at or above it refuses the readout.
+FAST_DEFAULT_MAX_UNSEEN_MASS: float = 0.02
+# Merged into a fast body (greedy); copied per entry, never shared.
+FAST_DEFAULT_EXTRA_BODY: dict = {"temperature": 0}
+
+# ── Adaptive: the escalation model and the threshold (llm/models.py
+#    parse_registry / FastConfig.escalate_below, api/criterion_options.py
+#    LLMOptions.escalate_below, analysis/llm_eval.py _adaptive) ───────────
+# The env var naming the ONE models.yaml entry an adaptive criterion
+# escalates to — read by llm/models.py parse_registry from the env mapping it
+# is given (never at config import). Unset or empty = the registry `default`.
+# An id that is not in models.yaml stops startup (decided on static facts —
+# no DNS at load); an unavailable entry (its key unset) logs a startup WARN
+# and makes adaptive a 400 at submit. It may be external (an https entry
+# with a key): the operator designates it, and GET /models `escalation`
+# reports where adaptive may send pages.
+ESCALATION_MODEL_ENV: str = "CLASSIFIER_ESCALATION_MODEL"
+# The bounds of a threshold — options.escalate_below and an entry's
+# fast.escalate_below.<answer type>: the readout's 0-100 confidence under it
+# escalates (0 = never on confidence, only an incomplete / capped readout;
+# 100 = always, unless the readout says 100).
+ESCALATE_BELOW_MIN: int = 0
+ESCALATE_BELOW_MAX: int = 100
+# fast.escalate_below for an answer type the entry does not set. A guess
+# until bin/confidence_calibration.py --mode fast's escalation curve sets it
+# per model.
+FAST_DEFAULT_ESCALATE_BELOW: int = 80
+
+# ── The wording a caller reads ──────────────────────────────────────────
+# 400: a request-level `mode` (api/schemas.py, api/reference_schemas.py,
+# api/assess.py and api/references.py's multipart forms).
+MODE_NOT_REQUEST_LEVEL: str = (
+    "mode is per criterion: set options.mode on each llm criterion. A request has a "
+    "`model` default because job-wide calls (the references \"auto\" selection) need one; "
+    "nothing job-wide has a mode"
+)
+# 400: `mode` at a criterion's top level (api/schemas.py CriterionInput).
+MODE_IN_OPTIONS: str = (
+    "mode belongs in options: options.mode on an llm criterion (reasoned | fast | adaptive)"
+)
+# 400: options.mode on a type that has none, by type (api/schemas.py).
+MODE_REFUSED_BY_TYPE: dict[str, str] = {
+    "text": "only an llm criterion has a mode (reasoned | fast | adaptive); a text criterion "
+            "is a deterministic search of the text layer — no model answers it",
+    "detector": "only an llm criterion has a mode (reasoned | fast | adaptive); a detector "
+                "criterion is answered by the open-vocabulary detector — no model reasons "
+                "about it",
+    "cv": "only an llm criterion has a mode (reasoned | fast | adaptive); a cv criterion is "
+          "answered by an OpenCV detector, the detector service or its llm fallback, which "
+          "always runs reasoned — use an llm criterion for a fast readout",
+}
+# 400: options.escalate_below set (a value, not null) on an llm criterion
+# whose mode is not 'adaptive' (api/criterion_options.py LLMOptions), and the
+# key on another type, which has no such option (api/schemas.py
+# CriterionInput).
+ESCALATE_BELOW_NEEDS_ADAPTIVE: str = (
+    "escalate_below is the adaptive mode's threshold (a readout whose confidence is under "
+    "it escalates to the reasoned call); set options.mode 'adaptive' or drop escalate_below"
+)
+ESCALATE_BELOW_NOT_LLM: str = (
+    "only an llm criterion with options.mode 'adaptive' has an escalation threshold; drop "
+    "escalate_below"
+)
+# 400: options.reference on a fast / adaptive criterion (api/schemas.py
+# CriterionInput).
+FAST_NOT_GUIDED: str = (
+    "references guide the reasoned scoring call, and options.mode 'fast' is a one-token "
+    "readout with no reasoning for an example to steer; drop options.reference or use "
+    "mode 'reasoned'"
+)
+ADAPTIVE_NOT_GUIDED: str = (
+    "references guide the reasoned scoring call, and options.mode 'adaptive' starts with a "
+    "one-token readout (its escalation is never guided either); drop options.reference or "
+    "use mode 'reasoned'"
+)
+# detail.reference.note on a fast / adaptive criterion in a request with
+# references (analysis/references.py JobReferences.guide): answered, never
+# guided.
+FAST_NOT_GUIDED_NOTE: str = (
+    "options.mode 'fast' is not guided by references: a one-token readout has no "
+    "reasoning for an example to steer — use mode 'reasoned' for a guided criterion"
+)
+ADAPTIVE_NOT_GUIDED_NOTE: str = (
+    "options.mode 'adaptive' is not guided by references: it starts with a one-token "
+    "readout, and its escalation is never guided either — use mode 'reasoned' for a "
+    "guided criterion"
+)
+# 400: options.mode 'fast' / 'adaptive' (both start with the readout) on an
+# effective model with no `fast:` block (api/schemas.py check_model_rules).
+# {name}, {mode}, {model}, {source} (READOUT_MODEL_SOURCE: where the model
+# came from), {starts} (READOUT_ADAPTIVE_STARTS for adaptive, else empty) and
+# {capable} (Registry.fast_ids(), else READOUT_NONE_CAPABLE) filled in.
+READOUT_NO_FAST_BLOCK: str = (
+    "criterion {name!r} has options.mode {mode!r}, and its model {model!r} ({source}) has no "
+    "`fast` block in models.yaml — its reasoning cannot be turned off{starts}; fast-capable "
+    "models: {capable} (GET /models supports.fast) — set options.model to one, or use mode "
+    "'reasoned'"
+)
+READOUT_MODEL_SOURCE: dict[str, str] = {
+    "option": "its options.model",
+    "request": "the request's `model`",
+    "default": "the registry default",
+}
+READOUT_ADAPTIVE_STARTS: str = " (adaptive starts with the fast readout)"
+READOUT_NONE_CAPABLE: str = "none on this container"
+# The role each model plays in api/assess.py's 400 for a text-only model on a
+# photo with no OCR: the criterion's own model, and an adaptive criterion's
+# escalation model, which must answer its items too ("'q' (escalation model
+# 'x')").
+TEXT_ONLY_MODEL_ROLES: dict[str, str] = {"model": "model", "escalation": "escalation model"}
+# 400: an adaptive criterion while the escalation model is unavailable (its
+# API key variable unset) — api/schemas.py check_model_rules.
+ADAPTIVE_ESCALATION_UNAVAILABLE: str = (
+    "criterion {name!r} has options.mode 'adaptive', and the escalation model {model!r} ("
+    + ESCALATION_MODEL_ENV + "; GET /models escalation) is unavailable: {reason} — make it "
+    "available, point " + ESCALATION_MODEL_ENV + " at an available entry, or use mode "
+    "'fast' or 'reasoned'"
+)
+# 400: POST /references with an explicit fast / adaptive criterion
+# (api/reference_schemas.py ReferenceRequest); {mode} and {names} filled in.
+REFERENCE_REFUSES_READOUT_MODE: str = (
+    "options.mode {mode!r} on {names}: a reference records reasoned 1-10 answers (its "
+    "expected answer becomes a later prompt's caption); drop options.mode or use 'reasoned'"
+)
+# A reference's warning when from_job does not copy a unit's answer and
+# observation (api/references.py _resolve_from_job): the job ran the
+# criterion fast, or adaptive and its readout stood (it did not escalate — or
+# the unit errored). {name}, {job_id}, {ran} (FROM_JOB_RAN_AS by mode) and
+# {then} (FROM_JOB_THEN_BREAKDOWN / FROM_JOB_THEN_RESCORED) filled in.
+FROM_JOB_READOUT_NOT_COPIED: str = (
+    "{name!r}: job {job_id!r} {ran}, which is never copied as an expected answer or an "
+    "observation — {then}"
+)
+FROM_JOB_RAN_AS: dict[str, str] = {
+    "fast": "ran it as a fast readout (options.mode 'fast')",
+    "adaptive": "ran it adaptive (options.mode 'adaptive') and has no reasoned answer for it "
+                "— the fast readout stood (it did not escalate) or the unit errored",
+}
+FROM_JOB_THEN_BREAKDOWN: str = "your breakdown is the answer"
+FROM_JOB_THEN_RESCORED: str = (
+    "the creation job scores it reasoned; send breakdown[{name!r}] to set it yourself"
+)
+# A fast result's `reason` (llm/confidence.py rate_readout): a readout writes
+# none, so the service writes the band probabilities — and, for a `score:
+# false` criterion whose judgement they are, only FAST_REASON_UNJUDGED
+# (analysis/llm_eval.py). Never copied into a reference's caption.
+FAST_REASON: str = (
+    "Fast readout (no reasoning): PASS {PASS:.2f}, MARGINAL {MARGINAL:.2f}, FAIL {FAIL:.2f}."
+)
+FAST_REASON_UNJUDGED: str = "Fast readout (no reasoning)."
+# A readout that failed its unit names the fix (analysis/llm_eval.py — an
+# incomplete / capped readout in mode 'fast', a model that lost its fast
+# block): appended after the message.
+FAST_UNIT_ERROR_FIX: str = " — use mode 'reasoned' for this criterion"
+# detail.escalation.why (analysis/llm_eval.py _adaptive) when the readout's
+# confidence was under the threshold; under `score: false` (whose judgement
+# the number is — detail.escalation.signal is null there) the line without
+# it. An incomplete / capped readout's why is the readout's own summary
+# ("readout incomplete: …" / "probability cap reached: …").
+ESCALATION_WHY_CONFIDENCE: str = "confidence {signal} < {threshold}"
+ESCALATION_WHY_CONFIDENCE_UNJUDGED: str = "confidence < {threshold}"
+# detail.escalation.error when the escalation could not run at all
+# (analysis/llm_eval.py _escalate): the entry lost its key after submit, or a
+# text-only escalation model met a page with no text. A failed call's error
+# is the call's own message — except an unparseable answer under `score:
+# false`: that message quotes the start of the model's answer, which can
+# carry the verdict and confidence the criterion does not report, so the
+# unit says only this (the service log keeps the full message).
+ESCALATION_UNAVAILABLE_AT_RUN: str = "escalation model {model!r} is unavailable: {reason}"
+ESCALATION_NO_TEXT: str = (
+    "escalation model {model!r} is text-only and this page has no text layer (source "
+    "{source!r})"
+)
+ESCALATION_UNPARSED_UNJUDGED: str = (
+    "model {model!r}'s answer could not be parsed after {attempts} attempts (not quoted: a "
+    "`score: false` criterion reports no judgement)"
+)
+# The unit's error when the readout could not be read AND the escalation
+# failed — the only adaptive case with no answer (analysis/llm_eval.py).
+ADAPTIVE_BOTH_FAILED: str = (
+    "{readout} — and the escalation to model {model!r} failed: {error}"
+)
+# detail.escalations.summary — the adaptive tally over the pages a result
+# covers, rewritten at every aggregate level (analysis/llm_eval.py
+# combine_escalations): "escalated on 2 of 5 pages", and — only when an
+# escalation failed (the readout's answer stood there) — the tail, "escalated
+# on 2 of 5 pages and 1 escalation failed". {escalated}, {units} and
+# {failed} filled in; each noun is (singular, plural), the singular for a
+# count of exactly 1. An llm unit is always one page (no document scope).
+ESCALATIONS_SUMMARY: str = "escalated on {escalated} of {units} {unit_noun}"
+ESCALATIONS_SUMMARY_FAILED: str = " and {failed} {failed_noun} failed"
+ESCALATIONS_UNIT_NOUNS: tuple[str, str] = ("page", "pages")
+ESCALATIONS_FAILED_NOUNS: tuple[str, str] = ("escalation", "escalations")
+# GET /criterion-types `mode` block (api/criterion_options.py
+# criterion_types): where options.mode applies, what each mode does, where
+# the escalation model is described, how the threshold resolves, identity.
+MODE_APPLIES_TO: str = (
+    "llm criteria (a 400 on cv / text / detector, and at the top level of a request or a "
+    "criterion)"
+)
+ESCALATION_CATALOG: str = "GET /models escalation"
+MODE_FAST_SUMMARY: str = (
+    "reasoning off, one token: a digit 0-9 read from its probabilities (score = digit + 1); "
+    "no model-written reason; never guided by references; the box loop still runs reasoned"
+)
+MODE_ADAPTIVE_SUMMARY: str = (
+    "the fast readout first; when its confidence is under the threshold, or it could not be "
+    "read (incomplete / the probability cap), the reasoned scoring call on the escalation "
+    "model (" + ESCALATION_MODEL_ENV + ", GET /models escalation) answers instead — its "
+    "answer, detail.model and detail.confidence; detail.escalation says what happened. A "
+    "failed escalation keeps a complete readout's answer. Never guided by references; the "
+    "box loop runs on the criterion's own model, reasoned"
+)
+ESCALATE_BELOW_RESOLUTION: str = (
+    "options.escalate_below (adaptive only), else the criterion's model's models.yaml "
+    "fast.escalate_below.rating (GET /models fast.escalate_below), else the service default"
+)
+MODE_IDENTITY_NOTE: str = (
+    "options.mode and options.escalate_below are not part of a criterion's identity "
+    "('reasoned' equals unset)"
+)
 
 # ---------------------------------------------------------------------------
 # State: the classifier-db Postgres, and the files beside it on /data
@@ -659,6 +1166,12 @@ CANCEL_CHECK_INTERVAL_S: float = 1.0
 # connection), and the whole ceiling sits far under Postgres's default
 # max_connections of 100 — classifier-db's only client is this service.
 DB_POOL_HEADROOM: int = 8
+
+# Seconds the pool's close() (db.Database.close, main's lifespan on shutdown)
+# waits for borrowed connections to come back before it terminates the pool.
+# Shutdown cancels the workers first, so this only bites on a request that is
+# still mid-query when the container stops.
+DB_POOL_CLOSE_TIMEOUT_S: float = 10.0
 
 # ---------------------------------------------------------------------------
 # Region layers and the artifact directory (regions/, api/artifacts.py)
@@ -853,9 +1366,10 @@ DETECTOR_MAX_LABELS_PER_CALL: int = max(
 )
 
 # Detector score at or above which a detector-scored `cv` criterion earns a
-# full 10 rather than a 7. Between DETECTOR_MIN_SCORE and this the finding is
-# real but not confident, which is what a 7 means everywhere else in this
-# service (PASS, but do not build on it).
+# full SCORE_HI (10) rather than SCORE_PASS_MIN (7) (analysis/detector_eval.py).
+# Between DETECTOR_MIN_SCORE and this the finding is real but not confident,
+# which is what a 7 means everywhere else in this service (PASS, but do not
+# build on it).
 DETECTOR_STRONG_SCORE: float = 0.5
 
 # ── LLM bounding-box enforcement loop (llm/boxes.py) ───────────────────────
@@ -879,8 +1393,9 @@ DETECTOR_STRONG_SCORE: float = 0.5
 # verify call, so 3 attempts is at most 9 small calls per criterion on top of
 # that criterion's one scoring call.
 #
-# LLM_BBOX_VERIFY_PASS is the 1-10 score the crop has to earn. 7 is the same
-# line PASS means everywhere else in this service.
+# LLM_BBOX_VERIFY_PASS is the 1-10 score the crop has to earn. Its default is
+# SCORE_PASS_MIN (7), the same line PASS means everywhere else in this
+# service; the value is clamped to SCORE_LO..SCORE_HI.
 #
 # LLM_BBOX_MIN_AREA / _MAX_AREA are the box's area as a fraction of the page.
 # Under the floor it is a speck the crop cannot confirm; over the ceiling it
@@ -901,7 +1416,8 @@ LLM_BBOX_MAX_ATTEMPTS: int = max(
     1, int(os.environ.get("CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS", "3"))
 )
 LLM_BBOX_VERIFY_PASS: int = max(
-    1, min(10, int(os.environ.get("CLASSIFIER_LLM_BBOX_VERIFY_PASS", "7")))
+    SCORE_LO,
+    min(SCORE_HI, int(os.environ.get("CLASSIFIER_LLM_BBOX_VERIFY_PASS", str(SCORE_PASS_MIN)))),
 )
 LLM_BBOX_MIN_AREA: float = float(
     os.environ.get("CLASSIFIER_LLM_BBOX_MIN_AREA", "0.002")
@@ -1041,10 +1557,9 @@ REFERENCE_BOX_TEXT_PAD: float = 0.1
 REFERENCE_BOX_TEXT_MIN_SPAN: float = 0.05
 
 # Presence score at or above which a criterion is worth locating. Not an env
-# knob: it is the service-wide PASS line (utils.verdict_from_score), and a
-# deployment that moved it here alone would locate features the same result
-# calls FAIL.
-LLM_BBOX_PRESENCE_MIN: int = 7
+# knob: it is the service-wide PASS line, SCORE_PASS_MIN, and a deployment
+# that moved it here alone would locate features the same result calls FAIL.
+LLM_BBOX_PRESENCE_MIN: int = SCORE_PASS_MIN
 
 # The normalised square the model is asked to answer on. 0-1000 rather than
 # 0-1 because models emit integers far more reliably than decimals; shared
@@ -1123,7 +1638,7 @@ REFERENCE_POSITION_MAX_OFFSET: float = max(
     0.0, min(1.0, float(os.environ.get("CLASSIFIER_REFERENCE_POSITION_MAX_OFFSET", "0.15")))
 )
 REFERENCE_POSITION_CAP: int = max(
-    1, min(10, int(os.environ.get("CLASSIFIER_REFERENCE_POSITION_CAP", "5")))
+    SCORE_LO, min(SCORE_HI, int(os.environ.get("CLASSIFIER_REFERENCE_POSITION_CAP", "5")))
 )
 REFERENCE_DESCRIBE: bool = _env_flag("CLASSIFIER_REFERENCE_DESCRIBE", "true")
 REFERENCE_DESCRIPTION_MAX_CHARS: int = max(
@@ -1132,12 +1647,16 @@ REFERENCE_DESCRIPTION_MAX_CHARS: int = max(
 
 # Code constants for references (not env knobs). The describe call's
 # completion budget is per model (models.yaml `max_tokens.describe`). Title /
-# tag bounds keep a catalogue line short. REFERENCE_JPEG_QUALITY is for
-# page.jpg / working.jpg / the composites: a composite is what the model will
-# SEE as the example, so it is kept higher than a preview.
+# tag bounds keep a catalogue line short. REFERENCE_REASON_MAX_CHARS is the
+# longest breakdown `reason` a caller may store (api/reference_schemas.py
+# BreakdownInput): it is pasted into the example's caption, so it is kept to
+# a few sentences. REFERENCE_JPEG_QUALITY is for page.jpg / working.jpg / the
+# composites: a composite is what the model will SEE as the example, so it is
+# kept higher than a preview.
 REFERENCE_TITLE_MAX_CHARS: int = 120
 REFERENCE_MAX_TAGS: int = 20
 REFERENCE_TAG_MAX_CHARS: int = 40
+REFERENCE_REASON_MAX_CHARS: int = 1000
 REFERENCE_JPEG_QUALITY: int = 90
 
 # ── Text-hit regions (analysis/text_eval.py) ───────────────────────────────

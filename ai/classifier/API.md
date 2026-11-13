@@ -20,6 +20,16 @@ the system text itself, so the classifier sends no reasoning line; its
 thinking is stripped server-side by the `muse_glimmer` reasoning parser, so
 only the JSON answer reaches the classifier.
 
+An `llm` criterion may instead ask for a **fast** answer, `options.mode:
+"fast"`: reasoning off and ONE generated token — a digit read from its
+probabilities, no reason written — on a model whose registry entry has a
+`fast` block (`qwen3.8-solo`, `qwen3.5-4b`; not Muse Glimmer, whose reasoning
+cannot be turned off). See [§ Fast mode](#fast-mode--a-one-token-readout).
+Or an **adaptive** one, `options.mode: "adaptive"`: that readout, and — only
+when it is unsure or could not be read — the reasoned scoring call on the
+**escalation model** (`CLASSIFIER_ESCALATION_MODEL`, by default the registry
+default). See [§ Adaptive mode](#adaptive-mode--escalate-when-unsure).
+
 ---
 
 ## Models
@@ -44,9 +54,39 @@ compose `environment:` as `- VAR=${VAR:-}`.
 The `auto` selection call always uses the request's model (2, then 3): it
 serves every criterion on the item. `POST /references` takes the same
 top-level `model` for its creation job (scoring, box loop, description).
-Nothing ever picks an external model on its own; an external entry sends
-document pages and text to that provider, and `GET /models` reports each
-entry's host so a caller can see where the data goes.
+Nothing ever picks an external model on its own — except the
+operator-designated **escalation model**, for a criterion that asked for
+`options.mode: "adaptive"` (below); an external entry sends document pages
+and text to that provider, and `GET /models` reports each entry's host (and
+the escalation model's, as `escalation`) so a caller can see where the data
+goes.
+
+**The escalation model — `CLASSIFIER_ESCALATION_MODEL`.** The one model
+setting that is an environment variable, not a `models.yaml` field: it names
+the ONE entry an adaptive criterion escalates to — the reasoned scoring call
+that answers when the criterion's fast readout is unsure
+([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)). Unset or empty, it
+is the registry `default` (`muse-glimmer`).
+
+* **Checked at startup, on static facts only.** An id that names no entry
+  stops the container (`CLASSIFIER_ESCALATION_MODEL='x' names no entry in
+  /app/ai/classifier/models.yaml (models: […]) — set it to one of them, or
+  leave it empty for the default 'muse-glimmer'`). Loading the registry never resolves a host
+  or opens a connection — the image build and the offline test registries
+  load it too.
+* **An unavailable entry** (its `api_key_env` variable unset) loads: startup
+  logs a WARNING beside the `[escalation]` marker, `GET /models` →
+  `escalation.available` is false, and every adaptive criterion is a 400 at
+  submit until it is available or the variable names another entry.
+* **It may be external** — Claude, say, an `https://` entry with a key. The
+  operator designates it explicitly, and `GET /models` → `escalation: {id,
+  host, authenticated, available}` shows callers where adaptive may send
+  their pages.
+* **It is the entry itself**, so it shares that entry's `max_concurrent`
+  slots with every other call to it (the database pool does not grow).
+* **Changing it** is an env change: set it in the box's `.env`, then `make
+  up classifier` (a recreate) — `docker restart classifier` does not re-read
+  `.env`.
 
 **What an entry sets** (every field is validated; an unknown key, invalid
 YAML, an unknown `default`, an `api_key_env` on plain `http://` to a dotted
@@ -54,8 +94,11 @@ host, a reasoning key set twice, a `system_line` reasoning on Muse Glimmer,
 an unavailable default, or an invalid `confidence` block — a reserved body
 key in it, `headline: calibrated` without a calibration, a calibration signal
 the method cannot produce, non-monotone points, `sampling` via `n_param` with
-`n` above `max_concurrent` — stops the container at startup with the reason
-in its log):
+`n` above `max_concurrent` — or an invalid `fast` block — a reserved key in
+`fast.extra_body`, `top_logprobs` under 11, a calibration or an
+`escalate_below` for an answer type other than `rating`, an `escalate_below`
+outside 0-100 — or a `CLASSIFIER_ESCALATION_MODEL` that names no entry, stops
+the container at startup with the reason in its log):
 
 | Field | Meaning |
 |---|---|
@@ -64,7 +107,7 @@ in its log):
 | `served_name` | The request body's `model` |
 | `api_key_env` / `api_key_header` | The NAME of the env var holding the key (`null` = no auth); `Authorization` sends `Bearer <key>`, any other header the raw key. Unset or empty → the entry is `available: false` and selecting it is a 400 |
 | `vision` | `false` = text-only (below) |
-| `max_images_per_prompt` | Must match the server's `--limit-mm-per-prompt`: 3 = contrastive references, 2 = one example per call, 1 = no references; 0 for a text-only model |
+| `max_images_per_prompt` | Images one request may carry — never more than the server accepts (entry ≤ server): vLLM's `--limit-mm-per-prompt`, which defaults to 999 images when the flag is unset (not one). 3 = contrastive references, 2 = one example per call, 1 = no references; 0 for a text-only model |
 | `reasoning` | `{style: chat_template_kwargs, key, value}` → `chat_template_kwargs: {key: value}` in the body (Muse Glimmer: `reasoning_strength`; the qwen family: `reasoning_effort`); `{style: system_line, value}` → that line appended to every system prompt, for a model whose template has no variable (refused on Muse Glimmer, where a system line overrides the variable); `{style: none}` |
 | `extra_body` | Merged into every body (sampling, other `chat_template_kwargs`); may not set `model`, `messages`, the token field, `response_format` or the reasoning key |
 | `json_mode` / `token_param` | `response_format: json_object`; `max_tokens` or `max_completion_tokens` |
@@ -73,6 +116,7 @@ in its log):
 | `max_concurrent` | Requests to THIS model in flight across every job — its own limit, held around the HTTP request in `llm/client.py` |
 | `text_char_budget` | Characters of the text layer pasted into a scoring prompt |
 | `confidence` | Optional — how an llm result's confidence is MEASURED and which number is the headline: `{method: stated (default) \| logprobs \| sampling, logprobs: {request, entries_path, top_key, number_tokens, min_coverage}, sampling: {n, via: n_param \| repeat, extra_body}, fallback: stated, headline: stated (default) \| calibrated, calibration: null \| {signal, points, n, fitted_on, ground_truth}}`. No block = `stated`: nothing extra is requested. Only the SCORE call's body changes. See [§ Confidence](#confidence--measured-then-calibrated) |
+| `fast` | Optional — this entry can answer `options.mode: "fast"` (a one-token readout) and run the readout an `"adaptive"` criterion starts with: `{chat_template_kwargs, extra_body, top_logprobs, min_coverage, max_unseen_mass, strip_markers, calibration, escalate_below}`. No block = `mode: "fast"` / `"adaptive"` on this entry is a 400. Every field, and how to adjust it, is below ([§ Fast mode](#fast-mode--a-one-token-readout) is what a caller gets) |
 
 The checked-in entries: **`muse-glimmer`** (the default — 3 images,
 `reasoning_strength: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 6 in
@@ -86,12 +130,13 @@ text only, thinking off through `extra_body.chat_template_kwargs:
 `--n-predict`, 90 s, 2 in flight = its `--parallel 2`, 12 000 characters — the
 model route-policy's `llm_classifier` evaluator sends conversation transcripts
 to, one `text` document and one presence criterion per route; seconds per
-call, so not a document model) and **`qwen3.8-solo`** (the `qwen3.8-solo` vLLM
-service, order 1 of three LiteLLM chat chains: text only,
-`reasoning_effort: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 60 000
-characters, and **1** in flight of its 3 sequences, because a queued
-classifier call makes the overflow hook spill chat off it — a benchmark
-candidate for the same evaluator). `muse-glimmer`, `qwen3.5-4b` and
+call, so not a document model; fast-capable, `top_logprobs: 20`) and
+**`qwen3.8-solo`** (the `qwen3.8-solo` vLLM service, which is also order 1 of
+three LiteLLM chat chains: vision, 3 images per prompt (boxes, references,
+contrastive references), `reasoning_effort: low`, budgets 8192 / 1024 / 2048 /
+1024, 240 s, 60 000 characters, **3** in flight = all of its `--max-num-seqs
+3`, which chat shares; fast-capable, `top_logprobs: 64` = its
+`--max-logprobs 64`). `muse-glimmer`, `qwen3.5-4b` and
 `qwen3.8-solo` measure confidence with `confidence: {method: logprobs}` (probed
 on the box 2026-10-22); `qwen2.5-vl` is `stated`. Every headline is still the
 stated number (shadow, [§ Confidence](#confidence--measured-then-calibrated)).
@@ -124,9 +169,93 @@ More on the checked-in entries:
   `text_char_budget` (12 000). Its `max_concurrent: 2` and score budget 512
   change together with the llama.cpp service's `--parallel 2` /
   `--n-predict 512` / `-c 32768`.
-- **`qwen3.8-solo`** is a benchmark candidate for that classifier at
-  `max_concurrent: 1`, so it never takes more than one of the 3 sequences chat
-  runs on (a queued request there makes the overflow hook spill chat).
+- **`qwen3.8-solo`** is a vision document model AND a chat model.
+  Probed on the box (2026-11-12): `Qwen3_5ForConditionalGeneration` with an
+  unquantised vision tower; one image and three in one request are both
+  accepted (the service sets no `--limit-mm-per-prompt`, so vLLM's limit is
+  its default, 999). Its `max_concurrent: 3` is all of the service's
+  `--max-num-seqs 3` (a decision: overflow is not a concern there): while the
+  classifier holds all three, a chat turn queues
+  (`vllm:num_requests_waiting` > 0) and LiteLLM's overflow hook spills it to
+  the chain's next order. A fast readout holds its slot for well under a
+  second; a reasoned scoring call for seconds. LiteLLM still declares no
+  vision for its chat chains — that is LiteLLM's setting, not the model's.
+
+**The `fast` block — configuring the one-token readout.** An entry whose
+reasoning can be turned OFF may carry a `fast` block; `options.mode: "fast"`
+— and the readout `"adaptive"` starts with — runs only on such an entry
+(`GET /models` → `supports.fast`), and on any other it is a 400 naming the
+entries that can ([§ Fast mode](#fast-mode--a-one-token-readout) is what a
+caller gets). Muse Glimmer has none — its template's lowest reasoning level
+is `low` — and neither has `qwen2.5-vl`; either can still be the escalation
+model, which answers reasoned. The checked-in blocks (neither sets
+`calibration` or `escalate_below` yet: the raw readout, escalating under 80):
+
+```yaml
+  qwen3.5-4b:
+    fast:
+      chat_template_kwargs: {enable_thinking: false}
+      top_logprobs: 20                # what was probed on the box (llama.cpp)
+  qwen3.8-solo:
+    fast:
+      chat_template_kwargs: {enable_thinking: false}
+      top_logprobs: 64                # = qwen3.8-solo's --max-logprobs 64 (ai/vllm)
+      strip_markers: ["<|think_on|>", "<|think_minimal|>", "<|think_low|>", "<|think_medium|>",
+                      "<|think_high|>", "<|think_xhigh|>", "<|think_max|>", "<|think_extreme|>",
+                      "<|think_ultracode|>"]
+```
+
+| Field | Default | What it does |
+|---|---|---|
+| `chat_template_kwargs` | `{}` | Merged LAST into the readout body's `chat_template_kwargs`, after the entry's own with its `reasoning` key DROPPED — the switch that turns reasoning off. The qwen family: `{enable_thinking: false}`. **Not** `reasoning_effort: none`: vLLM's qwen3 reasoning parser then files the one-token answer under `reasoning_content`, and `content` comes back null (measured 2026-11-12) |
+| `extra_body` | `{temperature: 0}` | Merged into the readout body after the entry's `extra_body` (greedy; the logprobs read are the raw ones, before temperature). May not set `model`, `messages`, the token field, `response_format`, `chat_template_kwargs` (the field above), `stream`, `n`, `logprobs` or `top_logprobs` — a startup error |
+| `top_logprobs` | `20` (at least 11, so all ten digits fit) | Alternatives asked for at the answer position. **Never above the server's own ceiling**, vLLM's `--max-logprobs` (default 20; `-1` = no cap): a request over it is refused (the error below). More alternatives make the probability cap fire less |
+| `min_coverage` | `0.5` | The share of the answer position's probability that must fall on the labels (the ten digits, bracket variants included); below it the readout is **incomplete**: the unit errors in mode `fast`, and mode `adaptive` escalates ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)) |
+| `max_unseen_mass` | `0.02` (above 0, at most 1) | The **probability cap**. A token missing from the returned list is at most as probable as the smallest one listed, so what the missing labels hold is estimated as `unseen_bound = min(1 − coverage, (labels missing) × (smallest listed probability))`; at or above this value the readout is **capped**: the unit errors in mode `fast`, and mode `adaptive` escalates. A confident answer whose other labels simply fell off the list has a tiny estimate (about 6e-5 on a 19-way choice probed on the box) and stays far below it. It is a heuristic, not a guarantee: it counts one spelling per missing label, while the match accepts several (`3`, ` 3`, `[3`, `3.` …), each of which could sit just under the smallest listed probability; only `1 − coverage` is a hard ceiling. `0` is refused at load (every readout, even one listing all ten digits, would be capped) |
+| `strip_markers` | `[]` | Strings removed from the criterion name and the text layer — in a fast prompt only: chat-template markers that would turn thinking back on whatever `enable_thinking` says (`ai/jinja/qwen_fixed_chat_template.jinja` reads `<\|think_on\|>`, `<\|think_low\|>`, … in any user or system text; `<\|think_off\|>` only turns it off, so it is not listed). Removed repeatedly, so a marker split around another cannot reassemble |
+| `calibration` | `{}` | Per answer type — `rating` is the only one today: `{temperature, bias, n, fitted_on, ground_truth}`. The digits' raw log-probabilities are scaled `p ∝ exp(logprob / temperature)` before the band is chosen, and the result's headline says `calibrated`; `bias` (a Platt offset for a two-way answer) is unused by `rating`. `{}` reports the raw readout. Fitted and printed by `bin/confidence_calibration.py --mode fast` ([§ Confidence](#confidence--measured-then-calibrated)); re-fit after a model, prompt or template change |
+| `escalate_below` | `{}` (every type filled in at load with **80**) | Per answer type — `rating` is the only one today: the 0-100 readout confidence under which an `options.mode: "adaptive"` criterion on this entry escalates to the escalation model ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)); the confidence is the readout's headline, after `calibration`. A criterion's `options.escalate_below` wins. `GET /models` shows the value in force (`fast.escalate_below`). `0` escalates only an unreadable readout; `100` escalates every readout short of 100. Set it from the escalation curve `bin/confidence_calibration.py --mode fast` prints (it prints this beside the calibration — re-fit both together); a value outside 0-100 or a type other than `rating` stops the container |
+
+The readout is read where the entry's `confidence.logprobs.entries_path` /
+`top_key` say (defaults `choices.0.logprobs.content` / `top_logprobs`) — the
+same place a logprobs confidence is read, so there is no second knob. The
+body (`ModelSpec.fast_body`) is the scoring body's model, messages and
+`extra_body` (minus `n` and `chat_template_kwargs`), the token field set to
+**1** directly, `logprobs: true`, `top_logprobs`, `fast.extra_body`, then
+`chat_template_kwargs` — and never `response_format`, the sampling `n` or the
+`confidence` request keys. `qwen3.8-solo`'s:
+
+```json
+{"model": "qwen3.8-solo", "messages": ["…"], "max_tokens": 1, "logprobs": true, "top_logprobs": 64,
+ "temperature": 0, "chat_template_kwargs": {"enable_thinking": false}}
+```
+
+**Adjusting it.** An edit takes effect with `docker restart classifier`, as
+for any `models.yaml` change.
+
+* **`top_logprobs` and the server's `--max-logprobs` change together.**
+  Raising: the server FIRST (`ai/vllm/docker-compose.vllm.yml`, then `make up
+  vllm <service>` — a recreate; chat on that model pauses while it restarts),
+  then the entry, then `docker restart classifier`. Lowering: the entry
+  first. In the other order every readout in between is refused with "the
+  server refused top_logprobs K". `qwen3.8-solo` runs `--max-logprobs 64` for
+  its entry's 64 (root `CLAUDE.md` § Cross-folder rules, *Fast readout
+  logprobs*). The flag is only a ceiling: a request asking for fewer
+  alternatives, or none — a chat turn, a reasoned score call's 20 — is
+  unaffected by it.
+* **When the cap fires** ("probability cap reached"), raise `top_logprobs`
+  with `--max-logprobs` as above; raising `max_unseen_mass` instead accepts
+  readouts whose missing digits could have moved the verdict. With ten
+  digits and 64 alternatives the cap fires only on a readout spread thin over
+  many tokens that are not digits.
+* **When coverage is low** ("readout incomplete: coverage …"), the model
+  wanted to write something other than a digit: that criterion, worded that
+  way, does not suit a one-digit answer — send it `reasoned`. Lowering
+  `min_coverage` hides it, and the reported probabilities (renormalised over
+  the digits) then overstate how sure the model was.
+
+The full error list is in
+[§ Fast-mode errors and troubleshooting](#fast-mode-errors-and-troubleshooting).
 
 **Text-only models** (`vision: false`) score from the page's text layer
 alone: the scoring prompt carries no image and says so ("You are assessing
@@ -185,7 +314,8 @@ ai/classifier/
   logger.py            the one "classifier" logger every module imports
   middleware.py        correlation IDs: the ContextVar, the filter, the middleware
   metrics.py           the Prometheus objects produced in one module, read in none
-  utils.py             verdict_from_score — the PASS/MARGINAL/FAIL line
+  utils.py             verdict_from_score — the PASS/MARGINAL/FAIL line (its thresholds and the
+                       1-10 scale are config.py's SCORE_* constants)
   api/                 the HTTP layer
     schemas.py         AssessRequest (a documents list), DocumentInput, CriterionInput + the cross-criterion rules
     criterion_options.py  LLMOptions / TextOptions / CVOptions / DetectorOptions: defaults, caps,
@@ -212,7 +342,8 @@ ai/classifier/
     cv_eval.py         the `cv` evaluator (and its fallback)
     text_eval.py       the `text` evaluator (one page, or a document's pages joined)
     llm_eval.py        the `llm` evaluator: one scoring call (or its reference-guided calls,
-                       combined), then maybe the box loop
+                       combined, or one fast readout, or an adaptive readout and — when
+                       unsure — its escalation), then maybe the box loop
     references.py      a job's reference plan (JobReferences): which examples guide which
                        criterion, the `auto` selection call per item, the position check, the
                        result block — and the reference page's description call
@@ -239,13 +370,18 @@ ai/classifier/
     render.py          page.jpg / working.jpg / c.<slug>.jpg, and the `auto` catalogue
   llm/
     models.py          the registry: models.yaml validated into ModelSpecs (endpoint, key,
-                       budgets, reasoning, timeout, a concurrency limit each), get_registry
-    prompts.py         the single-criterion scoring prompt (with reference examples), the
-                       loop's two small ones, the reference describe and selection prompts
-    client.py          per-model routing + limit (_post), call_model, call_model_json, the encoder;
+                       budgets, reasoning, timeout, a concurrency limit each; the `fast`
+                       block and fast_body; the escalation model,
+                       CLASSIFIER_ESCALATION_MODEL), get_registry
+    prompts.py         the single-criterion scoring prompt (with reference examples; its
+                       style="fast" one-digit form), the loop's two small ones, the
+                       reference describe and selection prompts
+    client.py          per-model routing + limit (_post), call_model, call_readout (the
+                       one-token fast readout), call_model_json, the encoder;
                        reads a score call's logprobs / samples (models.yaml `confidence`)
     confidence.py      detail.confidence: band mass, signals, mixture, the headline;
-                       fit_isotonic / apply (the calibration curve)
+                       rate_readout (a fast readout's rating); fit_isotonic / apply (the
+                       calibration curve)
     usage.py           UsageStore (`llm_calls` in classifier-db): one row per model request,
                        attributed to its job / criterion / item through context vars
     validate.py        find the answer, clamp it, derive the verdict from the score,
@@ -268,7 +404,8 @@ ai/classifier/
     reference_box_assess.py   operator tool — the box loop measured end to end through
                               the API: stored references, /assess jobs, the job result
     confidence_calibration.py operator tool — measures the confidence signals, fits a
-                              calibration (§ Confidence)
+                              calibration; --mode fast: the readout's temperature and
+                              adaptive's escalation curve (§ Confidence)
 ```
 
 Import direction is strictly one way:
@@ -334,7 +471,8 @@ stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT` + every
 model's `max_concurrent` + `DB_POOL_HEADROOM` (8, a `config.py` constant)
 connections — `db.pool_max()`; adding registry entries grows it, e.g. the
 `qwen3.5-4b` and `qwen3.8-solo` entries took Σ `max_concurrent` from 8 to 11
-and the pool by 3). The database is the only store:
+and the pool by 3, and `qwen3.8-solo`'s rise from 1 to 3 took it to 13).
+The database is the only store:
 with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
 refuses to start and says why. `CLASSIFIER_DB_HOST` (`classifier-db`) and the
 port are fixed in the compose file, never in `.env`; the credentials are
@@ -373,7 +511,7 @@ in the one process) — and the model-call one is per MODEL:
 |---|---|---|
 | `CLASSIFIER_MAX_CONCURRENT` | jobs at once — worker tasks each atomically claiming the oldest `pending` row | 4 |
 | `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot. Matched to the default model's `max_concurrent` so a lone job can fill every slot of that model. A slot is held for a whole unit, so a slow model's units can occupy a job's slots while its other units wait | 6 |
-| `max_concurrent` (per model, [`models.yaml`](models.yaml)) | requests to THAT model in flight across ALL jobs, every call type — scoring, box ask, refine, verify, select, describe. Each model has its own limit, acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it and a slow model never takes another's slots; a retry takes a fresh slot. Size it to the model: `muse-glimmer` schedules 8 sequences (`--max-num-seqs 8`) and the classifier takes 6, leaving 2 for the LiteLLM chat chains that also use it — their overflow hook spills chat to the next order (eventually Claude) once vLLM's waiting queue stays non-empty, so filling all 8 here would push chat off the local model | muse-glimmer: 6 |
+| `max_concurrent` (per model, [`models.yaml`](models.yaml)) | requests to THAT model in flight across ALL jobs, every call type — scoring, a fast readout, box ask, refine, verify, select, describe. Each model has its own limit, acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it and a slow model never takes another's slots; a retry takes a fresh slot. Size it to the model: `muse-glimmer` schedules 8 sequences (`--max-num-seqs 8`) and the classifier takes 6, leaving 2 for the LiteLLM chat chains that also use it — their overflow hook spills chat to the next order (eventually Claude) once vLLM's waiting queue stays non-empty, so filling all 8 here would push chat off the local model | muse-glimmer: 6 |
 | `CLASSIFIER_OCR_WORKERS` | OCR passes at once (one ONNX inference each, in a worker thread) | 4 |
 
 Phases: `staging` → `pending` → `processing` → `completed` | `failed`, or
@@ -485,7 +623,10 @@ refused submit never counts as `pending`),
 `classifier_jobs_in_flight` (rows being processed), `classifier_llm_calls_total{status, model}`
 and `classifier_llm_latency_seconds` (every successful model request,
 unlabelled on purpose), plus a per-request breakdown by call **kind** and
-**model** (the registry id, a fixed set from `models.yaml`) — `score` (a
+**model** (the registry id, a fixed set from `models.yaml`) — `fast` (a
+one-token readout, `options.mode: "fast"` and the start of `"adaptive"`),
+`escalate` (an adaptive criterion's reasoned scoring call on the escalation
+model — measured like `score`), `score` (a
 scoring call, reference-guided ones included), `ask` / `refine` / `verify`
 (the box loop), `select` (`references: "auto"`), `describe` (a reference's
 description), `other`:
@@ -497,9 +638,11 @@ description), `other`:
 | `classifier_llm_cached_prompt_tokens_total{kind, model}` | `usage.prompt_tokens_details.cached_tokens` — prompt tokens vLLM's prefix cache served. Zero unless `muse-glimmer` runs `--enable-prompt-tokens-details` |
 | `classifier_llm_completion_tokens_total{kind, model}` | `usage.completion_tokens` (reasoning included) |
 | `classifier_llm_reasoning_tokens_total{kind, model}` | `usage.completion_tokens_details.reasoning_tokens` (reported because the server runs a reasoning parser) |
+| `classifier_readout_incomplete_total{model, kind, reason}` | One-token readouts that answered but were not believed — each failing its unit in mode `fast`, escalating it in mode `adaptive`: `reason` `coverage` (under `fast.min_coverage` of the answer position's probability on the labels, or no logprobs in the response) or `cap` (the probability cap, `fast.max_unseen_mass`) — [§ Fast mode](#fast-mode--a-one-token-readout) |
+| `classifier_escalations_total{model, why, outcome}` | Adaptive units whose readout escalated: `model` the escalation model's registry id, `why` `confidence` (under the threshold) \| `incomplete` \| `cap`, `outcome` `ok` (the reasoned answer is the result) \| `failed` (a complete readout's answer stood; after an unreadable one the unit errored). The escalation rate is this over the adaptive units' readouts (kind `fast` counts the fast criteria's readouts too) — [§ Adaptive mode](#adaptive-mode--escalate-when-unsure) |
 
-The kind is derived from the label each call site already passes (`score/…`,
-`bbox/…`, `refine/…`, `verify/…`, `reference/select…`,
+The kind is derived from the label each call site already passes (`fast/…`,
+`escalate/…`, `score/…`, `bbox/…`, `refine/…`, `verify/…`, `reference/select…`,
 `reference/describe`), never from a criterion name, so the label set stays
 small. Every request also writes one INFO log line — `llm call job=<id>
 model=muse-glimmer kind=score label=score/<name> attempt=1 12.34s prompt=… cached=… completion=…
@@ -687,6 +830,56 @@ window set the limit to 1, submit twice with `curl -i` both on `:8005` and on
 and `Retry-After` (LiteLLM forwards the header) — then put 32 back. Lower it
 below 32 only once the Operations Assistant (ZT-526) waits `Retry-After` and
 resubmits on a 429.
+
+**Fast mode** (`options.mode`, ZT-603 phase 1 —
+[§ Fast mode](#fast-mode--a-one-token-readout)) changes `models.yaml`
+(`qwen3.8-solo` becomes a vision entry with 3 images, `max_concurrent` 1 → 3
+and a `fast` block; `qwen3.5-4b` gains a `fast` block) and the
+`qwen3.8-solo` vLLM service (`--max-logprobs 64`). **Recreate `qwen3.8-solo`
+FIRST**: `make up vllm qwen3.8-solo` (a recreate — chat on it pauses while it
+restarts; the chains move to their next order meanwhile). Until it runs with
+the flag, every fast readout on it is refused ("the server refused
+top_logprobs 64"). Then `make build classifier && make up classifier`. No env
+var, no payload-schema bump, no drain: `options.mode` is optional, so a
+payload or stored reference without it runs as before. The pool grows by 2
+(Σ `max_concurrent` 11 → 13). **Deploy the classifier BEFORE any caller sends
+`options.mode`** — an older container refuses it as an unknown key, a 400 on
+every such request. `GET /criterion-types` → `mode` confirms the build, and
+`GET /models` → `supports.fast` lists where it may run. On every entry whose
+`models.yaml` block did not change otherwise (`muse-glimmer`, `qwen2.5-vl`,
+`qwen3.5-4b`, and `qwen3.8-solo` on a document with no page image), a
+criterion without `options.mode` is answered and reported exactly as before
+(the reasoned prompts and bodies are pinned by hash); results change only in
+`request.criteria`, whose `options` gain `mode` (`null` when unset), and in
+what `GET /models` / `GET /criterion-types` show. **`qwen3.8-solo` is a vision
+entry now**, so reasoned criteria on it change on purpose: on a page with an
+image they are sent the image (the vision prompt — "as an image and as
+extracted text" — and `detail.image_sent: true`, where it was the text-only
+prompt and `false`), and `boxes: true` and references on it are accepted
+rather than refused at submit.
+
+**Adaptive mode** (`options.mode: "adaptive"`, ZT-603 phase 2 —
+[§ Adaptive mode](#adaptive-mode--escalate-when-unsure)) adds ONE env var,
+`CLASSIFIER_ESCALATION_MODEL` (empty = the registry default, `muse-glimmer`),
+and `fast.escalate_below` in `models.yaml` (set on neither fast entry yet, so
+80). The compose file gains `- CLASSIFIER_ESCALATION_MODEL=${CLASSIFIER_ESCALATION_MODEL:-}`:
+add `CLASSIFIER_ESCALATION_MODEL=` (empty, or an entry id) to the box's
+`.env`, then `make build classifier && make up classifier`. An id that names
+no entry stops startup (the reason is in `docker logs classifier`); an
+unavailable one logs a WARNING and adaptive is refused until it is fixed. No
+payload-schema bump, no drain: `options.escalate_below` is optional, so a
+payload or stored reference without it runs as before. **Deploy the
+classifier BEFORE any caller sends `mode: "adaptive"` or `escalate_below`** —
+an older container refuses both (an unknown mode, an unknown key).
+`GET /criterion-types` → `mode.adaptive` confirms the build, and `GET /models`
+→ `escalation` shows where adaptive escalates. A criterion without `mode:
+"adaptive"` is answered and reported exactly as before (the prompts and
+bodies are pinned by hash, and the env var changes no body); results change
+only in `request.criteria`, whose `options` gain `escalate_below` (`null`
+when unset), and in what `GET /models` (`escalation`, `fast.escalate_below`)
+and `GET /criterion-types` (`mode`) show. Rolling BACK to an older container
+needs a drained queue: it refuses the `escalate_below` key every queued
+`llm` criterion now carries.
 
 ---
 
@@ -906,11 +1099,21 @@ distribution for a `logprobs` model; [§ Confidence](#confidence--measured-then-
 > refine / verify
 > ([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)).
 > `muse-glimmer` runs with `--limit-mm-per-prompt '{"image": 3}'` for this;
-> its registry entry must match it.
+> its registry entry may not exceed it (`qwen3.8-solo` sets no flag, so
+> vLLM's default limit, 999, covers its 3).
 
 A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
 from the text.
+
+A fast criterion (`options.mode: "fast"`) sends the same page image, context
+line and `DOCUMENT TEXT` block, but asks for one digit with reasoning off and
+reads the answer from that token's probabilities — no JSON
+([§ Fast mode](#fast-mode--a-one-token-readout)). An adaptive criterion
+sends that readout first and, when it escalates, the reasoned prompt above to
+the escalation model — with the page image only if that model has vision,
+and the text layer cut to ITS `text_char_budget`
+([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)).
 
 > **Prompt order is deliberate — prefix caching.** The user message is laid
 > out page image → context line → `DOCUMENT TEXT` block → rubric →
@@ -1085,6 +1288,17 @@ default. Unknown or unavailable is a 400 listing the valid ids; what each
 criterion's effective model can do is checked at submit (see
 [§ Models](#models)).
 
+There is **no request-level `mode`**. How a model answers — reasoned, a
+fast one-token readout ([§ Fast mode](#fast-mode--a-one-token-readout)), or
+that readout escalated when unsure
+([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)) — is each `llm`
+criterion's `options.mode`. `model` has a job default because
+job-wide calls (the `references: "auto"` selection) need a model; nothing
+job-wide has a mode. A top-level `mode`, in a JSON body or as a multipart
+field, is a 400: *mode is per criterion: set options.mode on each llm
+criterion. A request has a `model` default because job-wide calls (the
+references "auto" selection) need one; nothing job-wide has a mode*.
+
 `references` is optional — stored worked examples to show the vision model
 beside each llm-answered criterion: a list of reference ids, `"auto"`, or
 `{"auto": true, "tags": [...], "tags_match": "all" | "any"}`. See
@@ -1141,7 +1355,7 @@ in `options`:
 
 | `type` | `options`, with defaults |
 |---|---|
-| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), the box loop's per-criterion settings `refine` (`grid` \| `marks`), `verify_partial` (bool) and `verify_min_span` (0–1) — each only with `boxes: true`, each unset = the service default (off), see [§ The box loop's options](#the-box-loops-options--per-criterion) — `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it, its `boxes` / `text` the loop — [§ References](#references); only with `references`), `model` (a registry id from `GET /models`; default: the request's `model`, else the registry default — [§ Models](#models)), `aggregate` |
+| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), the box loop's per-criterion settings `refine` (`grid` \| `marks`), `verify_partial` (bool) and `verify_min_span` (0–1) — each only with `boxes: true`, each unset = the service default (off), see [§ The box loop's options](#the-box-loops-options--per-criterion) — `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it, its `boxes` / `text` the loop — [§ References](#references); only with `references`), `model` (a registry id from `GET /models`; default: the request's `model`, else the registry default — [§ Models](#models)), `mode` (`reasoned` \| `fast` \| `adaptive`; default `null` = `reasoned` — `fast` is a one-token readout on a model with a `fast` block, [§ Fast mode](#fast-mode--a-one-token-readout); `adaptive` is that readout, escalated to the escalation model's reasoned call when unsure, [§ Adaptive mode](#adaptive-mode--escalate-when-unsure)), `escalate_below` (0–100, `adaptive` only; default `null` = the model's `fast.escalate_below.rating`), `aggregate` |
 | `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000, `CLASSIFIER_TEXT_MIN_COUNT_CAP`), `ocr` (`auto`), `scope` (`page` default \| `document` — [text across pages](#text-across-pages--scope-document)), `aggregate` |
 | `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `reference` and `model` (only when the llm fallback is what answers — `model` picks the fallback's registry model). `aggregate` |
 | `detector` | `threshold` (0–1, default `DETECTOR_MIN_SCORE`), `aggregate` |
@@ -1192,7 +1406,32 @@ nothing is queued:
   text-only model with `options.boxes`, with `references`, as a `cv` llm
   fallback, as the job model of `references: "auto"`, or on a photo with no
   OCR; a model with fewer than 2 images per prompt with `references` — see
-  [§ Models](#models).
+  [§ Models](#models);
+* `mode` in the wrong place, each named: at the request's top level (above);
+  at a criterion's top level (*mode belongs in options: options.mode on an
+  llm criterion (reasoned | fast | adaptive)*); `options.mode` on a `text`,
+  `detector` or `cv` criterion (*only an llm criterion has a mode …* — a `cv`
+  llm fallback always runs reasoned); a value other than `reasoned` / `fast`
+  / `adaptive` / `null`; `options.mode: "fast"` or `"adaptive"` on an
+  effective model with no `fast` block, naming the mode, where that model
+  came from (`options.model`, the request's `model` or the registry default)
+  and the fast-capable ids (*criterion 'X' has options.mode 'fast', and its
+  model 'muse-glimmer' (the registry default) has no `fast` block in
+  models.yaml — its reasoning cannot be turned off; fast-capable models:
+  ['qwen3.5-4b', 'qwen3.8-solo'] …*; for adaptive it adds *(adaptive starts
+  with the fast readout)*); `options.reference` on a fast or adaptive
+  criterion (references guide the reasoned call only) —
+  [§ Fast mode](#fast-mode--a-one-token-readout);
+* the adaptive rules ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)):
+  `options.escalate_below` (an integer 0–100) on a criterion whose mode is not
+  `adaptive` (*escalate_below is the adaptive mode's threshold …*) or on a
+  `text` / `detector` / `cv` criterion (*only an llm criterion with
+  options.mode 'adaptive' has an escalation threshold …*); an adaptive
+  criterion while the escalation model is unavailable (*… the escalation
+  model 'x' (CLASSIFIER_ESCALATION_MODEL; GET /models escalation) is
+  unavailable: …*); an adaptive criterion whose escalation model is text-only
+  on a photo with OCR off or `options.ocr: "never"` (named `(escalation model
+  'x')` in the text-only refusal above).
 
 Each result echoes `options_used`: the options after defaults and caps, so
 `pattern` shows the name it defaulted to and `max_attempts` the cap it was
@@ -1201,15 +1440,20 @@ held to. An `llm` criterion's `refine`, `verify_partial` and
 whenever `reference` is: each the criterion's value, else this container's
 service default — the value the loop ran with (or would have, had it run).
 `options.model` appears there only when sent; the model that
-actually answered is `detail.model`. `options.model` is not part of a
+actually answered is `detail.model`. `options.mode` too appears there (and as
+`detail.mode`) only when sent, so a criterion without it echoes exactly what
+it always did; so does `options.escalate_below` (the threshold that ran,
+when it was not sent, is `detail.escalation.threshold`). None of
+`options.model`, `options.mode` and `options.escalate_below` is part of a
 criterion's identity — a reference saved under one model guides the same
-criterion on any other.
+criterion on any other, and an explicit `mode: "reasoned"` is the same
+criterion as no mode.
 
 ### The four types
 
 | `type` | Answered by | Cost |
 |---|---|---|
-| `llm` | One vision-model call per item — that page's image + its text layer, the rubric for its `hint`. With `options.boxes` the enforcement loop runs after, on that page. Guided by [references](#references), one call per example group instead | 1 call per item (+ up to 3 per loop attempt; guided: `max(#PASS-side, #FAIL)` examples) |
+| `llm` | One vision-model call per item — that page's image + its text layer, the rubric for its `hint`. With `options.boxes` the enforcement loop runs after, on that page. Guided by [references](#references), one call per example group instead. With `options.mode: "fast"`, one one-token readout per item instead ([§ Fast mode](#fast-mode--a-one-token-readout)); with `"adaptive"`, that readout and — only when it is unsure — one reasoned call on the escalation model ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)) | 1 call per item (adaptive: 1, or 2 when it escalates; + up to 3 per loop attempt; guided: `max(#PASS-side, #FAIL)` examples) |
 | `text` | `common.documents.match_text` over its text layer (native or OCR'd) | none |
 | `cv` | A registered OpenCV detector on the working image (in a worker thread). With no match, its `fallback`: the detector (scored from boxes) or the llm (default llm options: hint `auto`, no boxes, ocr `auto`). `method` says which answered, and `reason` says a fallback was used | none, or the fallback's |
 | `detector` | The open-vocabulary detector service, one call per item with the name as the label, scored from the boxes | one detector call per item |
@@ -1258,6 +1502,12 @@ The exact text searched is not inlined — it is linked, as
 | `quality` | 1-10 quality level | 1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS |
 | `presence` | 10=clearly present, 5=uncertain, 1=clearly absent | 7-10 = PASS, 4-6 = MARGINAL, 1-3 = FAIL |
 | `auto` | LLM infers from name | Same thresholds |
+
+A fast criterion (`options.mode: "fast"`, and an adaptive one's readout — its
+escalation is asked the rubric above) is asked the same rubric moved down
+one, on the digits 0-9 (score = digit + 1: 0-2 FAIL, 3-5 MARGINAL, 6-9 PASS;
+presence 9 / 4 / 0), so its score and verdict use these same thresholds —
+[§ Fast mode](#fast-mode--a-one-token-readout).
 
 ### Built-in `cv` detector names
 
@@ -1318,7 +1568,7 @@ every type, so the headline number reads the same whatever ran:
 
 | Type | `metric` | `value` is | Other `detail` keys |
 |---|---|---|---|
-| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `image_sent`, `text_sent`, `confidence` (below; **null** for `score: false`); `reference` when the request listed references (below) |
+| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `model`, `image_sent`, `text_sent`, `confidence` (below; **null** for `score: false`) — under `adaptive`, of the call that answered; `mode` (`reasoned` \| `fast` — under `adaptive`, `fast` when the readout stood, `reasoned` when it escalated) only when `options.mode` was sent; `escalation` (the page's) and `escalations` (the tally over every page the result covers — "escalated on 2 of 5 pages") only under `options.mode: "adaptive"` ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)); `reference` when the request listed references (below) |
 | `text` | `count` | `detail.count`, the hits | the match record above; `scope`, `separator`, `items_with_hits` with `scope: "document"` |
 | `detector` | `best_score` | `detail.best_score` | `detector_matches`, `min_score` |
 | `cv` | per detector | `detail.measurements[metric]` | `detector`, `measurements`, `thresholds`, `parameters`, `state`, `image` — keys per detector in `GET /cv-detectors` |
@@ -1349,8 +1599,9 @@ has it too, through the llm shape:
 ```
 
 `applied: false` (empty `examples` / `calls`, a `note` saying why — no matching
-reference, `use: false`, an empty `auto` pool, a failed selection) when the
-criterion scored without an example. `examples[].call` is the call it was
+reference, `use: false`, an empty `auto` pool, a failed selection, or a fast
+or adaptive criterion, which references never guide) when the criterion scored without
+an example. `examples[].call` is the call it was
 shown in (`null` past the call cap); `calls[].images` counts the candidate;
 `position` is `null` unless `options.reference.position` is `check`. It is
 **not** a stable key: under `mean` it is only in `items[]`.
@@ -1377,10 +1628,10 @@ MEASURED the way its `models.yaml` entry's `confidence.method` says
 
 | Key | Meaning |
 |---|---|
-| `method` | What the entry is configured to measure: `logprobs` \| `sampling` \| `stated` |
-| `source` | What actually produced the signals — the method, or `stated` (the fallback) when it yielded nothing: no logprobs in the response, numeric `coverage` under `min_coverage`, no sample parsed. `note` says why. A scoring call never fails because of its measurement |
-| `headline` | Which number the top-level `confidence` is: `stated` (shadow — the default) or `calibrated` |
-| `stated` / `stated_defaulted` | The model's own 0-100 number (clamped); `stated_defaulted: true` when it omitted or garbled it and the 50 is ours |
+| `method` | What the entry is configured to measure: `logprobs` \| `sampling` \| `stated` — or `readout` for a fast criterion |
+| `source` | What actually produced the signals — the method, or `stated` (the fallback) when it yielded nothing: no logprobs in the response, numeric `coverage` under `min_coverage`, no sample parsed. `note` says why. A scoring call never fails because of its measurement. `readout` for a fast criterion: the one-token readout IS the answer (a readout that yields nothing fails the unit instead — [§ Fast mode](#fast-mode--a-one-token-readout)) |
+| `headline` | Which number the top-level `confidence` is: `stated` (shadow — the default) or `calibrated`; for a fast criterion `readout` (the readout's verdict-band probability) or `calibrated` (after the entry's `fast.calibration.rating`) |
+| `stated` / `stated_defaulted` | The model's own 0-100 number (clamped); `stated_defaulted: true` when it omitted or garbled it and the 50 is ours. A fast criterion states nothing: `stated` is `null`, `stated_defaulted` `false` |
 | `calibrated` | The entry's calibration curve at its signal (0-100), or `null` (no calibration, or the signal is unavailable on this answer) |
 | `verdict_probability` | The probability mass on the reported verdict's band (PASS 7-10, MARGINAL 4-6, FAIL 1-3) — a **lower bound**: `unresolved` mass that could land in two bands counts in neither |
 | `band` | That mass for each band |
@@ -1390,8 +1641,12 @@ MEASURED the way its `models.yaml` entry's `confidence.method` says
 | `unresolved` | `[{values, mass}]` — under a split-digit tokenizer a non-sampled `1` is 1 or 10; its split is unknown, so it is not guessed |
 | `samples` | `sampling` only: `{asked, answered, agreement, stated_mean}` — `agreement` is the share with the majority verdict; else `null` |
 | `note` | Why `source` or `headline` fell back, else `null` |
+| `unseen_bound` | A fast criterion's block only: an estimate of the probability the digits missing from the returned top-k alternatives hold (`min(1 − coverage, (digits missing) × (smallest listed probability))` — one spelling per digit, so a heuristic, not a guarantee: [§ Models](#models), `max_unseen_mass`) — the probability cap's number |
 
-With `source: "stated"` every distribution key is `null`. It is **not** a
+With `source: "stated"` every distribution key is `null`. Under
+`options.mode: "adaptive"` the block is the readout's (as for a fast
+criterion) when the readout stood, and the escalation model's own
+measurement (its `confidence.method` and headline) when it escalated. It is **not** a
 stable key: under `mean` it is only in `items[]`; under `any` / `worst` /
 `all` it is the chosen member's. A guided `combine: mean` scores the averaged
 answer against the mixture of the calls' distributions. The logprob payload
@@ -1407,9 +1662,17 @@ document, its `detail` is still its type's shape, plus one block:
 
 | Rule | `detail` |
 |---|---|
-| `any` / `worst` / `all` | The chosen member's detail, whole; `from` names it |
-| `mean` | Only the type's **stable** keys — those that mean the same on every member (a `text` pattern, a `cv` detector's thresholds and parameters, an `llm` hint) — plus `metric` and `value` = the mean of the members' values. For `cv` that is the mean measurement (e.g. mean `mean_intensity`), not the mean score. Per-member keys (`measurements`, `snippets`, `text_sent`) are in `items[]` |
+| `any` / `worst` / `all` | The chosen member's detail, whole — its rebuilt keys excepted (below); `from` names it |
+| `mean` | Only the type's **stable** keys — those that mean the same on every member (a `text` pattern, a `cv` detector's thresholds and parameters, an `llm` hint and `mode`) — plus `metric` and `value` = the mean of the members' values, and the rebuilt keys. For `cv` that is the mean measurement (e.g. mean `mean_intensity`), not the mean score. Per-member keys (`measurements`, `snippets`, `text_sent`, an adaptive unit's `escalation`) are in `items[]`. The stable keys are copied from the FIRST member: under `adaptive`, where one page may escalate and another not, `model`, `mode` and `image_sent` there are that member's — read each unit's in `items[]`, and the count in `escalations` |
 | `sum` (`text`) | The full match record with the counts added; `values` holds each member's count |
+
+A **rebuilt** key (`rebuilt: true` in [`GET /criterion-types`](#get-criterion-types);
+today only an adaptive `llm` criterion's `escalations`) is rebuilt from EVERY
+counted member at every level, under every rule — never copied from the
+chosen or the first member — so a criterion over five pages reads
+"escalated on 2 of 5 pages" whichever page `any` / `worst` picked
+([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)). Skipped and
+errored members are not counted, as in `values`.
 
 `values` is always each member's `value`, by label (`item n` at the pages
 level, `document n` at the documents level). A single member passes through
@@ -1500,6 +1763,20 @@ may still STORE criteria of any type — they are inherited by an `/assess` that
 lists it (below) — but only its llm-answered criteria with an expected answer
 are examples (`usable: true`), and only they get a composite image.
 
+**References guide the REASONED scoring call only.** A fast criterion
+(`options.mode: "fast"`, [§ Fast mode](#fast-mode--a-one-token-readout)) is
+answered by the model but never guided — a one-token readout has no
+reasoning for an example to steer — and neither is an adaptive one
+(`options.mode: "adaptive"`, [§ Adaptive mode](#adaptive-mode--escalate-when-unsure)),
+which starts with that readout; its escalation is never guided either.
+Explicit and `auto` references skip both (no plan entry, never an `auto`
+target; their `detail.reference` is `applied: false` with a note saying
+why), and `options.reference` on one is a 400. Nor is a readout ever stored
+as a reference's expected answer: `POST /references` refuses explicit fast
+and adaptive criteria, and `from_job` (below) drops `options.mode` /
+`options.escalate_below` and re-scores such a criterion reasoned — unless
+the job's adaptive unit escalated, whose answer is a reasoned one.
+
 ### Creating one — `POST /references`
 
 JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceRequest`):
@@ -1526,7 +1803,7 @@ JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceR
 |---|---|
 | `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG/HEIC/HEIF/AVIF photo or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
 | `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
-| `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided. A criterion's `key` is stored with it and is how keyed `/assess` criteria find it ([§ matching order](#how-a-criterion-finds-its-examples--the-matching-order)); keys are **unique within a reference** (case-insensitive — a 400 naming both criteria), though they may repeat on `/assess` |
+| `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided — and so is `options.mode: "fast"` or `"adaptive"`: a reference records reasoned 1-10 answers (its expected answer becomes a caption in later prompts). A criterion's `key` is stored with it and is how keyed `/assess` criteria find it ([§ matching order](#how-a-criterion-finds-its-examples--the-matching-order)); keys are **unique within a reference** (case-insensitive — a 400 naming both criteria), though they may repeat on `/assess` |
 | `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
 | `regions` | `{name: [{"box": [x1, y1, x2, y2]} \| {"polygon": [[x, y], …]}]}` — where. A name left out is **located** by the creation job; `[]` means **the whole page** is the example |
 | `region_units` | `px` (default — ORIGINAL page pixels, after EXIF rotation; one pixel of overshoot is tolerated and clamped) \| `grid` (0–1000 on both axes; recommended for a PDF page, whose pixel size depends on `CLASSIFIER_PDF_RENDER_DPI`) |
@@ -1551,18 +1828,33 @@ a `text` criterion on the reference relies on OCR). The criteria are the job's
 each criterion's `options_used`, with a warning on the reference (`depends_on`
 is not recorded there and is dropped; `weight` is recovered only where the
 breakdown kept it). Inherited criteria keep their `key`s; two of them sharing
-one is a 400 — send `criteria` explicitly to choose. Every criterion whose type,
-`score` and resolved options match the job's (a `key` is not compared — it
-changes how a reference is found, not the question) takes the job's answer on
+one is a 400 — send `criteria` explicitly to choose. They lose
+`options.reference`, `options.mode` and `options.escalate_below` (a
+reference's criteria are never guided, and it records reasoned answers).
+Every criterion whose type, `score` and resolved options match the job's (a
+`key` is not compared — it changes how a reference is found, not the
+question; nor are `options.model`, `options.mode` and
+`options.escalate_below`, which change who answered and how) takes the job's answer on
 that item and its ACCEPTED regions there as supplied (`source: "pipeline"`,
 `observed.job_id`), so a reviewed job usually costs no model call at all; the
-caller's own `breakdown` / `regions` still win.
+caller's own `breakdown` / `regions` still win. **Except a criterion the job
+ran as a fast readout** (its `options.mode: "fast"` — so an errored readout,
+whose unit has an empty `detail`, too) **or adaptive without escalating**
+(its `options.mode: "adaptive"` and the unit's `detail.escalation.escalated`
+not `true` — the readout stood, or the unit errored): its answer and its
+observation are never copied — the reason is a service-written line, which
+would become a caption in later prompts — so the creation job scores that
+criterion reasoned, and a warning on the reference says so (*'X': job 'j'
+ran it as a fast readout …* / *ran it adaptive … and has no reasoned answer
+for it …*; send `breakdown[name]` to set it yourself). Its accepted regions
+are still copied. An adaptive unit that escalated (and is `ok`) answered by
+the escalation model's reasoned call, and is copied like any reasoned answer.
 
 **Refused at submit**, nothing queued:
 
 | Status | When |
 |---|---|
-| 400 | Any malformed input — both or neither of `document` / `from_job`; `page` with `from_job` or `from_job_item` with `document`; `criteria` missing with `document`; a criterion rule; two criteria with the same `key` (case-insensitive — a `from_job`'s inherited criteria too); a verdict that disagrees with its score; a breakdown for a `score: false` criterion; a `breakdown` / `regions` key naming no criterion; a malformed box (`x1 < x2`, `y1 < y2`) or polygon (≥ 3 vertices); negative coordinates; grid coordinates past 1000; a pixel region outside the page; a `.txt` / `.docx`; a page the PDF does not have; a page image under the 32 × 32 floor; an item of `from_job` that does not exist or has no page image |
+| 400 | Any malformed input — both or neither of `document` / `from_job`; `page` with `from_job` or `from_job_item` with `document`; `criteria` missing with `document`; a criterion rule; a top-level `mode` (JSON or a multipart field — as on `/assess`); an explicit criterion with `options.mode: "fast"` or `"adaptive"` (*options.mode 'fast' on ['X']: a reference records reasoned 1-10 answers …*); two criteria with the same `key` (case-insensitive — a `from_job`'s inherited criteria too); a verdict that disagrees with its score; a breakdown for a `score: false` criterion; a `breakdown` / `regions` key naming no criterion; a malformed box (`x1 < x2`, `y1 < y2`) or polygon (≥ 3 vertices); negative coordinates; grid coordinates past 1000; a pixel region outside the page; a `.txt` / `.docx`; a page the PDF does not have; a page image under the 32 × 32 floor; an item of `from_job` that does not exist or has no page image |
 | 404 | `from_job`: no such job |
 | 409 | `from_job`: the job is not a completed `/assess` job (still running, failed, or a reference job); its criteria no longer validate on this container. **And** `CLASSIFIER_REFERENCE_MAX_COUNT` (500) references already exist |
 | 410 | `from_job`: the job's artifacts are gone — the TTL sweeper or a `DELETE` took the directory, or the byte cap dropped `p{item}.base.jpg` |
@@ -1929,7 +2221,7 @@ example's position. The check reads only the examples' stored regions.
 
 | Status | Rule |
 |---|---|
-| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named — a differing `key` included); `auto` without `criteria`; an `options.reference.criterion` no listed reference has (an unmatched `key` or name is not refused — [matching order](#how-a-criterion-finds-its-examples--the-matching-order)); more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example; `reference.boxes` or `reference.text` without `options.boxes: true` (with the loop's other settings sent, all named), or on a `cv` criterion — [§ The box loop's options](#the-box-loops-options--per-criterion) |
+| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion, or on a fast or adaptive one (`options.mode: "fast"` / `"adaptive"` — references guide the reasoned call only); `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named — a differing `key` included); `auto` without `criteria`; an `options.reference.criterion` no listed reference has (an unmatched `key` or name is not refused — [matching order](#how-a-criterion-finds-its-examples--the-matching-order)); more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example; `reference.boxes` or `reference.text` without `options.boxes: true` (with the loop's other settings sent, all named), or on a `cv` criterion — [§ The box loop's options](#the-box-loops-options--per-criterion) |
 | 409 | A listed reference is not `ready` (`pending` or `failed`) |
 
 ### Retention
@@ -1979,7 +2271,7 @@ model's time goes across the process; these rows say what **one job** cost.
 | `job_id` / `job_type` | The job that made the call (`assess` \| `reference`); `null` for a call made outside a job (none today) |
 | `request_id` | The correlation id of the HTTP request that queued the job (`X-Request-ID`) |
 | `started_at` | When the request went out (`TIMESTAMPTZ`; the API returns it as a UTC ISO string) (after its model's `max_concurrent` slot was granted) |
-| `label` / `kind` | The call site's label (`score/<name>`, `bbox/<name>#2`, `reference/select#3`, …) and its kind — the same `score` / `ask` / `refine` / `verify` / `select` / `describe` / `other` the metrics use |
+| `label` / `kind` | The call site's label (`fast/<name>`, `escalate/<name>`, `score/<name>`, `bbox/<name>#2`, `reference/select#3`, …) and its kind — the same `fast` / `escalate` / `score` / `ask` / `refine` / `verify` / `select` / `describe` / `other` the metrics use. A `fast` row is one readout: `max_tokens` 1, `attempt` 1 (never retried), `finish_reason` usually `length` (the budget is the one token). An `escalate` row is an adaptive criterion's reasoned scoring call on the escalation model (`model_id` is that model's), retried on a parse failure like any scoring call |
 | `criterion` / `item` / `document` | The unit it was for. A selection call has its `item` and `document` but **no** `criterion` — it is made once per item on behalf of every criterion there; a `scope: "document"` unit has `item` `null`; a reference's describe call has none of them |
 | `attempt` | 1-based parse-retry number (`MAX_LLM_RETRIES`) |
 | `model_id` | The registry id (`models.yaml`) the request was addressed to; `null` on rows written before the registry |
@@ -2093,6 +2385,492 @@ the points, flat beyond them). An answer without the signal (no logprobs in
 that response) keeps the stated headline and says so in `note`. Re-fit after
 a model, prompt or reasoning change: a curve describes one model answering
 one prompt at one reasoning depth.
+
+**A fast criterion is its own measurement** (`options.mode: "fast"`,
+[§ Fast mode](#fast-mode--a-one-token-readout)). The model writes no number:
+its answer IS the distribution over the ten digits at the one generated
+position, so `detail.confidence` has `method` and `source` `readout`,
+`stated: null`, the usual distribution keys over scores 1-10 (score = digit +
+1), plus `unseen_bound`, and the top-level `confidence` is that distribution's
+mass on the reported verdict's band — headline `readout`, never shadowed. The
+entry's `confidence` block plays no part except where the readout is read
+(`confidence.logprobs.entries_path` / `top_key`). An entry's
+`fast.calibration.rating` (a temperature, `p ∝ exp(logprob / temperature)`)
+is applied before the band is chosen, and the headline is then
+`calibrated`. Neither checked-in fast entry has one yet, so every fast
+headline today is the raw readout. An adaptive criterion reports the
+readout's block when the readout stood, and the escalation model's own
+measurement (as above, by ITS `confidence` block) when it escalated.
+
+**Fitting a fast readout, and adaptive's threshold — `--mode fast`.** The
+same tool, on LABELLED pages: `--labels` is required (`{file: {criterion:
+verdict}}`, or `{file: {criterion: {item: verdict}}}` — a person's verdicts,
+or the default mode's `--export-labels` CSV filled in and turned into that
+JSON), and `--model` names the fast-capable entry (it needs a `fast` block;
+the default `muse-glimmer` has none):
+
+```bash
+docker exec classifier uv run python bin/confidence_calibration.py --mode fast \
+  --docs /data/calibration/docs --criteria /data/calibration/criteria.json \
+  --labels /data/calibration/labels.json --model qwen3.8-solo \
+  --concurrency 1 --out /data/calibration-fast.json
+```
+
+For every (criterion, page) it runs the readout on `--model` (capturing the
+raw digit log-probabilities; an incomplete or capped readout is recorded as
+such — adaptive would escalate it) and the reasoned answer on the escalation
+model (`--escalation-model`, else the registry's — `CLASSIFIER_ESCALATION_MODEL`,
+else the default): what adaptive would escalate to. Then it:
+
+1. **fits a temperature** for the `rating` answer type: the value on a
+   log-spaced grid from 0.25 to 8 (1.0, the raw readout, included) that
+   minimises the log loss of the labelled verdict's band under `p ∝
+   exp(logprob / T)` — a stdlib grid search, no scipy;
+2. **prints** accuracy, AUROC, ECE, Brier and seconds per unit for the raw
+   readout, the calibrated readout and the reasoned baseline (each answer's
+   headline confidence / 100 as the signal), over the units each one
+   answered (`n`) — and `acc/all`, each one's accuracy over EVERY labelled
+   unit with an unanswered one counted wrong, the like-for-like column;
+3. **prints the escalation curve**: for each threshold 50, 55, … 95, the share
+   of units adaptive would escalate (the calibrated readout's confidence
+   under it, or an incomplete / capped readout), the accuracy of the adaptive
+   result over every labelled unit (the readout at or over it, else the
+   reasoned answer — a reasoned call that failed keeps a complete readout's;
+   a readout whose own request failed is not escalated: the unit errors and
+   counts wrong, as in production) and the model-seconds per item (the
+   readout, plus the reasoned call when it escalated);
+4. **suggests `escalate_below`** — the lowest threshold whose accuracy is
+   within `--max-accuracy-loss` (default 0.01) of the reasoned `acc/all`,
+   else 95 — and prints a block to merge under the entry's `fast:`:
+
+```yaml
+      calibration:
+        rating: {temperature: 1.4142, n: 312, fitted_on: "2026-11-20", ground_truth: human}
+      escalate_below: {rating: 75}
+```
+
+`--ground-truth` (default `human`) is what the block records. Fit on the
+evaluation set's `tune` split, paste the block, `docker restart classifier`,
+then run the `holdout` split once (a fitted entry's readouts are reported
+calibrated; the records keep the raw log-probabilities either way). Re-fit
+both together after a model, prompt or template change. `--samples`, the
+`--deliberate-*` knobs and `--export-labels` belong to the default mode,
+which `--mode fast` leaves unchanged.
+
+## Fast mode — a one-token readout
+
+`options.mode: "fast"` on an `llm` criterion asks the model for ONE token with
+its reasoning OFF: the criterion's rubric on the digits 0-9, "Answer with one
+digit." The classifier does not parse what the model wrote. It reads that one
+position's top alternatives and their probabilities (`logprobs`), so the
+answer is how likely each digit was — a distribution, not a single number. No
+JSON, no stated confidence, no reason: prefill plus one token. It answers the
+1-10 rating (score = digit + 1); the box loop after it stays reasoned.
+
+**Where it runs.** Only on a model whose `models.yaml` entry has a `fast`
+block ([§ Models](#models) — every field, and how to adjust it):
+`qwen3.8-solo` (vision, 3 images) and `qwen3.5-4b` (text only) today.
+`GET /models` → `supports.fast` and `GET /criterion-types` → `mode.fast_models`
+list them for this container. The registry default, `muse-glimmer`, has
+none — its reasoning cannot be turned off — so a fast criterion names a
+fast-capable model in `options.model` (or the request's `model` does);
+otherwise it is a 400 that says where the model came from and lists the
+ones that can.
+
+**What it costs.** Measured on the box (2026-11-12, a synthetic 384-px
+image): 0.16 s per readout on `qwen3.8-solo` (p50 and p95 over 20 sequential
+readouts, nothing else running); 0.18-0.20 s on `qwen3.5-4b` after a ~2 s
+first call. A real page (~1000 px, ~2k prompt tokens) is expected at ~0.3-0.6
+s; that is not measured yet. A reasoned scoring call on `muse-glimmer` takes
+8.0 s at p50 and 19.2 s at p95 (the 14 days to 2026-11-12). A readout holds
+one slot of its model's `max_concurrent` like any call — on `qwen3.8-solo`
+those 3 slots are shared with chat — and writes one `llm_calls` row (kind
+`fast`, `max_tokens` 1). The fast criteria on one page (with the same
+`options.ocr`) send the same prefix
+(system prompt, page image, context line, DOCUMENT TEXT block) and differ
+only in the rubric, the `CRITERION:` line and the instruction, so the
+server's prefix cache serves the page once. The fast system prompt is not
+the reasoned one, so a page's fast and reasoned criteria do not share it.
+
+**When to use it.** A criterion that a glance answers — a field is present,
+the photo is sharp — gains little from seconds of reasoning. One that needs
+reading and comparing (a total that must equal its line items) belongs on
+`reasoned`. Accuracy against `reasoned` has not been measured yet (the ZT-603
+evaluation set); compare on your own criteria before moving a production
+list. A fast answer has no model-written reason; a caller who needs one uses
+`reasoned`. A criterion that is usually a glance but sometimes needs reading
+suits `adaptive`: the readout answers when it is sure, the reasoned call when
+it is not ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)).
+
+**The request** — per criterion; the rest of the request is unchanged:
+
+```json
+{
+  "documents": [{"type": "url", "data": "https://files.example.com/bill.pdf"}],
+  "criteria": [
+    {"name": "The amount due is visible",
+     "options": {"hint": "presence", "model": "qwen3.8-solo", "mode": "fast"}},
+    {"name": "The photo is sharp enough to read",
+     "options": {"hint": "quality", "model": "qwen3.8-solo", "mode": "fast"}},
+    {"name": "The total equals the sum of the line items", "options": {"hint": "presence"}}
+  ]
+}
+```
+
+* `mode`: `reasoned` (the default; `null` is the same), `fast`, or
+  `adaptive` — this readout, escalated when unsure
+  ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)). Per
+  criterion only — a request-level `mode` is a 400
+  ([§ Request](#request)). `llm` criteria only: on `text` / `detector` / `cv`
+  it is a 400 (a `cv` name's llm fallback always runs reasoned).
+* It combines with `boxes: true` (the box loop runs after the readout,
+  reasoned, exactly as it does after a reasoned score — the readout's score
+  gates it), `score: false` (the readout runs and its judgement is dropped —
+  the band probabilities too: the `reason` is just `Fast readout (no
+  reasoning).`), `depends_on`, `aggregate`, `ocr` and `weight`, as any `llm`
+  criterion.
+* A text-only model (`qwen3.5-4b`) reads the page's text layer; its fast
+  prompt says a criterion about how the page LOOKS cannot be judged from the
+  text and is answered 4 (uncertain — score 5).
+* It is never guided by references ([§ References](#references)):
+  `options.reference` on it is a 400, and with `references` on the request
+  it scores unguided, `detail.reference.applied: false` with a note.
+
+**What the model is asked** (a presence criterion on a PDF page,
+`qwen3.8-solo`; the body is `ModelSpec.fast_body`, [§ Models](#models)) —
+the system prompt ends "Answer with one character, nothing else.", and the
+user turn is the page image, then:
+
+```
+You are assessing a 1-page pdf document.
+
+DOCUMENT TEXT (extracted, may contain OCR errors):
+---
+Total due $193.33
+---
+
+
+PRESENCE criterion — detect whether the feature is present in the document:
+  9 = clearly present (PASS)  |  4 = uncertain or partially present (MARGINAL)  |  0 = clearly absent (FAIL)
+  When DOCUMENT TEXT is provided above, a phrase in that text counts as evidence just as a visual observation does.
+
+CRITERION: The amount due is visible
+
+Rate this one criterion on the 0-9 scale above: 0-2 is FAIL, 3-5 is MARGINAL, 6-9 is PASS. Answer with one digit.
+```
+
+A `quality` criterion is asked to rate image quality on the 0-9 scale (0-2
+FAIL, 3-5 MARGINAL, 6-9 PASS), and `auto` gets both, as in the reasoned
+rubric. The wording is `config.py` § Prompt wording (`FAST_*`). The entry's
+`fast.strip_markers` (chat-template markers that would turn thinking back
+on) are removed from the criterion name and the text layer.
+
+**How the answer is read** (`common.logprobs.option_distribution`, then
+`llm.confidence.rate_readout`):
+
+1. The first generated position that is not whitespace. Each listed
+   alternative is trimmed of whitespace and `[ ( ) ] . :` and compared with
+   the digits in exact case, so `9`, `[9`, `(9`, `9]` and ` 9` all count as
+   `9`, summed (the model writes `[B`-style tokens for 0.5-12% of the mass).
+2. `coverage` = the probability that matched a digit; under the entry's
+   `fast.min_coverage` (0.5) the unit errors. `unseen_bound` = an estimate of
+   what the digits missing from the list hold (a heuristic — [§ Models](#models),
+   `max_unseen_mass`); at or above `fast.max_unseen_mass` (0.02) the unit
+   errors (the probability cap). Mode `adaptive` escalates either instead
+   ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)).
+3. The digits' probabilities, renormalised (and temperature-scaled when
+   `fast.calibration.rating` is fitted), are the scores 1-10.
+   **`verdict`** = the band with the most probability (FAIL 1-3, MARGINAL
+   4-6, PASS 7-10; a tie goes to the lower band). **`score`** = the most
+   probable score inside that band (a tie to the lower score) — so it can
+   differ from the single most likely digit: digit 9 at 0.40 and digits 5
+   and 4 at 0.30 each is MARGINAL (0.60), score 5. **`confidence`** = round(100 × that
+   band's probability). **`reason`** = a service-written line of the three
+   band probabilities (`Fast readout (no reasoning).` alone under `score:
+   false`, whose judgement those probabilities are).
+
+**The result** — the same entry shape as any `llm` criterion (here the
+scripted readout `9` 0.62, `8` 0.18, `[9` 0.05, …):
+
+```json
+"The amount due is visible": {
+  "status": "ok", "type": "llm", "method": "llm", "score": 10, "verdict": "PASS", "confidence": 93,
+  "reason": "Fast readout (no reasoning): PASS 0.93, MARGINAL 0.05, FAIL 0.02.",
+  "detail": {
+    "metric": "score", "value": 10, "hint": "presence", "model": "qwen3.8-solo",
+    "image_sent": true, "text_sent": {"chars": 0, "truncated": false, "budget": 60000, "source": "none"},
+    "confidence": {
+      "method": "readout", "source": "readout", "headline": "readout",
+      "stated": null, "stated_defaulted": false, "calibrated": null,
+      "verdict_probability": 0.9278, "band": {"PASS": 0.9278, "MARGINAL": 0.0515, "FAIL": 0.0206},
+      "distribution": {"1": 0.0052, "2": 0.0155, "3": 0.0, "4": 0.0, "5": 0.0206, "6": 0.0309,
+                       "7": 0.0, "8": 0.0412, "9": 0.1856, "10": 0.701},
+      "expected_score": 9.3351, "entropy_bits": 1.4026, "certainty": 0.5778,
+      "coverage": 0.97, "unresolved": [], "samples": null, "note": null, "unseen_bound": 0.0
+    },
+    "mode": "fast"
+  },
+  "options_used": {"hint": "presence", "…": "…", "model": "qwen3.8-solo", "mode": "fast"},
+  "…": "…"
+}
+```
+
+`detail.mode` (and `options_used.mode`) appear only when the criterion sent
+`options.mode`, so a criterion without it is answered and reported exactly
+as before; an explicit `mode: "reasoned"` is the reasoned answer with
+`detail.mode: "reasoned"`. `detail.confidence` is described in
+[§ Result details](#result-details--the-same-shape-on-every-type) and
+[§ Confidence](#confidence--measured-then-calibrated). A readout is never
+saved as a reference's expected answer ([§ References](#references)).
+
+### Fast-mode errors and troubleshooting
+
+At submit, each a 400 naming the field and nothing queued: a request-level
+`mode`; `mode` at a criterion's top level; `options.mode` on `text` /
+`detector` / `cv`; a value other than `reasoned` / `fast` / `adaptive`;
+`fast` on a model with no `fast` block; `options.reference` on a fast criterion
+([§ Request — Validation](#criterioninput)); and a fast criterion in `POST
+/references` `criteria`
+([§ Creating one](#creating-one--post-references)).
+
+At run time a readout is posted ONCE and **never retried** — the same prompt
+gets the same probabilities — and a refused one fails its unit alone
+(`status: "error"`, the message in `error`, `complete: false`); the job
+completes. The first three count in
+`classifier_readout_incomplete_total{model, kind, reason}`:
+
+| The unit's `error` | Why | Fix |
+|---|---|---|
+| `readout incomplete: coverage 0.31 < 0.5 (models.yaml fast.min_coverage; the model wrote 'I') — use mode 'reasoned' for this criterion` (`reason="coverage"`) | Under `fast.min_coverage` of the answer position's probability went to a digit: the model wanted to write something else | Send the criterion `reasoned` — worded that way, it does not suit a one-digit answer on this page. Lowering `min_coverage` hides it, and the reported probabilities then overstate |
+| `readout incomplete: the response carried no token probabilities at choices.0.logprobs.content (models.yaml confidence.logprobs.entries_path) — use mode 'reasoned' for this criterion` (`reason="coverage"`) | The response had no logprobs where the entry says to read them | Check the provider returns logprobs, and the entry's `confidence.logprobs.entries_path` / `top_key` |
+| `probability cap reached: 3 of 10 labels were not among the top 20 alternatives and could hold up to 0.06 (fast.max_unseen_mass 0.02); raise models.yaml fast.top_logprobs together with the server's --max-logprobs — use mode 'reasoned' for this criterion` (`reason="cap"`) | The readout is spread thin, and digits the list did not include could hold enough to change the verdict | Raise the entry's `fast.top_logprobs` together with the server's `--max-logprobs` (server first — [§ Models](#models), *Adjusting it*), or send the criterion `reasoned` |
+| `the server refused top_logprobs 64 — its --max-logprobs is lower: raise it (ai/vllm) or lower models.yaml fast.top_logprobs (model 'qwen3.8-solo')` | The server answered a 4xx about logprobs: the entry asks for more alternatives than the server allows — `qwen3.8-solo` recreated without `--max-logprobs 64`, or the entry raised before the server | Put the flag back (`make up vllm qwen3.8-solo`) or lower the entry, then `docker restart classifier` |
+| `model 'X' has no fast block in models.yaml any more (the registry changed after this job was submitted) — use mode 'reasoned' for this criterion` | The entry lost its `fast` block between submit and run | Resubmit; the submit check now refuses it, naming the fast-capable models |
+
+Any other transport failure (a timeout, a 5xx) is the usual `model 'X' call
+failed: …`, and a 2xx whose body is not JSON (a proxy's error page, a
+truncated body) is `unexpected response from model 'X': not JSON (…)`; neither
+is retried. To see readouts at work: `llm_calls` rows of
+kind `fast` ([§ Model usage](#model-usage)),
+`classifier_llm_call_seconds{kind="fast"}` and the counter above.
+
+### Adaptive mode — escalate when unsure
+
+`options.mode: "adaptive"` on an `llm` criterion runs the fast readout above
+on the criterion's model and keeps it when it is sure. When it is not — its
+confidence is under a threshold, or it could not be read — today's
+**reasoned** scoring call on the **escalation model** answers instead. Most
+pages then cost a readout, and only the unsure ones a reasoned call. It
+answers the 1-10 rating, like fast.
+
+**Where it runs.** The criterion's effective model needs a `fast` block (the
+fast-mode 400 otherwise, naming the mode), and the escalation model must be
+available. The escalation model is the entry `CLASSIFIER_ESCALATION_MODEL`
+names — by default the registry default, `muse-glimmer`
+([§ Models](#models)); `GET /models` → `escalation` and `GET
+/criterion-types` → `mode.escalation` name it for this container. **It may be
+an external host** (the operator designates it): an escalated page and its
+text go there, so check `escalation.host` before sending pages that must stay
+on the box. route-policy never sends adaptive criteria.
+
+**The request** — per criterion, like `fast`:
+
+```json
+{"name": "The account number is legible",
+ "options": {"hint": "quality", "model": "qwen3.8-solo", "mode": "adaptive", "escalate_below": 85}}
+```
+
+* `escalate_below` (optional, an integer 0-100, `adaptive` only — a 400 with
+  any other mode, and on `text` / `detector` / `cv`) is the threshold. Unset,
+  it is the criterion's model's `fast.escalate_below.rating` in `models.yaml`
+  (`GET /models` → `fast.escalate_below`; 80 where the entry sets none —
+  [§ Models](#models)). `0` escalates only a readout that could not be read;
+  `100` escalates every readout short of 100.
+* Everything else combines as for `fast`: `boxes`, `score: false`,
+  `depends_on`, `aggregate`, `ocr`, `weight`. It is never guided by
+  references (`options.reference` on it is a 400; with `references` on the
+  request it scores unguided, `detail.reference.applied: false` with a note).
+* Neither `mode` nor `escalate_below` is part of the criterion's identity,
+  and `options_used` echoes each only when sent.
+
+**What happens, per item** (`analysis/llm_eval.py`):
+
+1. **The readout** on the criterion's model, exactly as in fast mode (label
+   `fast/<name>`, kind `fast`).
+2. **The decision.** It escalates when the readout is **incomplete**
+   (coverage under `fast.min_coverage`, or no logprobs in the response) or
+   **capped** (the probability cap) — which fast mode would fail — or when
+   its **signal**, the readout's headline confidence (after the entry's
+   `fast.calibration.rating` when one is fitted, and computed even for a
+   `score: false` criterion), is **under** the threshold. At or over it, the
+   readout is the answer.
+3. **The escalation** is today's reasoned scoring call for the criterion —
+   the same hint and rubric, the same text layer and `options.ocr` — on the
+   escalation model, with ITS settings: its reasoning and token budgets, the
+   text cut to its `text_char_budget`, the page image only if it has
+   `vision`, and its `confidence` request and headline. It is never guided by
+   references. Label `escalate/<name>`, call kind `escalate` — one
+   `llm_calls` row per request, retried on a parse failure like any scoring
+   call, holding a slot of the escalation model's `max_concurrent`.
+4. **The answer** is the escalation's when it escalated (`detail.mode:
+   "reasoned"`, `detail.model` the escalation model's id, its own
+   `detail.confidence`, `image_sent` / `text_sent` and model-written
+   `reason`), else the readout's (`detail.mode: "fast"`, the readout's
+   service-written reason). The box loop (`boxes: true`) then runs on the
+   criterion's OWN model, reasoned, gated by that answer's score — exactly as
+   after a reasoned score.
+
+**`detail.escalation`** — on every adaptive unit:
+
+| Key | Meaning |
+|---|---|
+| `escalated` | `true` when the escalation's answer is the result |
+| `model` | The escalation model's registry id (set whether or not it escalated) |
+| `threshold` | The threshold that applied: `options.escalate_below`, else the model's `fast.escalate_below.rating` |
+| `signal` | The readout's confidence; `null` when the readout could not be read, and under `score: false` |
+| `why` | `null` when the readout stood; else `confidence 62 < 80` (`confidence < 80` under `score: false`), or the readout's own `readout incomplete: …` / `probability cap reached: …` |
+| `error` | `null`, or why the escalation failed — the readout's answer then stands with `escalated: false` |
+| `fast` | `null`, or — only when it escalated — the readout it replaced: `{model, score, verdict, confidence, coverage}`; `score` / `verdict` / `confidence` are `null` when the readout could not be read, and under `score: false`; `coverage` is `null` when the response had no logprobs |
+
+The escalated result (a quality criterion on `qwen3.8-solo`, escalating to
+`muse-glimmer`):
+
+```json
+"The account number is legible": {
+  "status": "ok", "type": "llm", "method": "llm", "score": 4, "verdict": "MARGINAL", "confidence": 70,
+  "reason": "The last four digits are blurred.",
+  "detail": {
+    "metric": "score", "value": 4, "hint": "quality", "model": "muse-glimmer",
+    "image_sent": true, "text_sent": {"chars": 1840, "truncated": false, "budget": 60000, "source": "native"},
+    "confidence": {"method": "logprobs", "source": "logprobs", "headline": "stated", "stated": 70, "…": "…"},
+    "mode": "reasoned",
+    "escalation": {
+      "escalated": true, "model": "muse-glimmer", "threshold": 85, "signal": 62,
+      "why": "confidence 62 < 85", "error": null,
+      "fast": {"model": "qwen3.8-solo", "score": 8, "verdict": "PASS", "confidence": 62, "coverage": 0.98}
+    },
+    "escalations": {
+      "units": 1, "escalated": 1, "escalation_failed": 0, "readout_failed": 0,
+      "why": {"confidence": 1, "incomplete": 0, "cap": 0}, "models": ["muse-glimmer"],
+      "summary": "escalated on 1 of 1 page"
+    }
+  },
+  "options_used": {"hint": "quality", "…": "…", "model": "qwen3.8-solo", "mode": "adaptive",
+                   "escalate_below": 85},
+  "…": "…"
+}
+```
+
+A readout that stood carries `"mode": "fast"`, the readout's `model`,
+`confidence` block and reason, `"escalation": {"escalated": false,
+"model": "muse-glimmer", "threshold": 80, "signal": 93, "why": null,
+"error": null, "fast": null}`, and its page's `escalations` with
+`"escalated": 0`, `"models": []` and `"summary": "escalated on 0 of 1
+page"`. Under a `mean` aggregate `escalation` is
+per item (in `items[]` only), and the stable keys `model` / `mode` /
+`image_sent` are the first member's — one page may have escalated and
+another not ([§ Result details](#result-details--the-same-shape-on-every-type));
+under `any` / `worst` / `all` they and `escalation` are the chosen page's.
+`detail.escalations` (below) counts every page.
+Under `score: false` the judgement is withheld as for any criterion, and
+`escalation.signal` and `escalation.fast`'s score / verdict / confidence are
+nulled with it (a readout that stood gets the reason `Fast readout (no
+reasoning).`; an escalated one keeps the escalation model's). An escalation
+whose answer could not be parsed is not quoted there either: its `error` is
+``model 'x''s answer could not be parsed after 3 attempts (not quoted: a
+`score: false` criterion reports no judgement)`` — the call's own message
+quotes the answer's start, verdict and confidence included (the service log
+keeps it).
+
+**`detail.escalations`** — what adaptive did across every page the result
+covers, so a criterion over several pages or documents says it in one key
+(`analysis/llm_eval.py` `combine_escalations`):
+
+| Key | Meaning |
+|---|---|
+| `units` | The pages counted. A page counts itself (`1`); every aggregate adds its members' — the documents level adds each document's pages, so `units` is pages, never documents. An errored or skipped page is not counted, as it is left out of the aggregate's score and `values` (the criterion's `complete: false` and `reason` say so); an unreadable readout whose escalation also failed errors its page, so it is not counted either |
+| `escalated` | Pages the escalation model answered |
+| `escalation_failed` | Pages whose escalation failed — the readout's answer stood there (`escalation.error`) |
+| `readout_failed` | Pages whose readout could not be read (incomplete / capped); each of them escalated |
+| `why` | `{confidence, incomplete, cap}` — every page that escalated or tried to, by reason (the `why` of `classifier_escalations_total`); they add up to `escalated + escalation_failed` |
+| `models` | The escalation model ids that answered, each once, in page order (`[]` when none did) |
+| `summary` | `escalated on 2 of 5 pages`, plus ` and 1 escalation failed` when one did (`config.ESCALATIONS_SUMMARY*`; `1 page`, `2 escalations`) |
+
+It is on every adaptive result — a single page's too (`units: 1`, so a
+single-page criterion reads the same key), each `items[]` entry's (its own
+page), and every aggregate's, where it is **rebuilt** from all the members
+under every rule: never the chosen page's under `any` / `worst` / `all`, nor
+the first page's under `mean` (`rebuilt: true` in `GET /criterion-types`).
+Under `score: false` the counts stay — they are not a judgement (each page's
+`escalation.signal` is still nulled). Five pages, page 1 escalated on
+confidence and page 3 on an incomplete readout, `aggregate: "mean"`:
+
+```json
+"detail": {
+  "metric": "score", "hint": "quality", "model": "qwen3.8-solo", "image_sent": true,
+  "mode": "fast", "value": 6.8,
+  "escalations": {
+    "units": 5, "escalated": 2, "escalation_failed": 0, "readout_failed": 1,
+    "why": {"confidence": 1, "incomplete": 1, "cap": 0}, "models": ["muse-glimmer"],
+    "summary": "escalated on 2 of 5 pages"
+  },
+  "aggregate": {"rule": "mean", "level": "pages", "from": null,
+                "values": {"item 0": 10, "item 1": 2, "item 2": 10, "item 3": 2, "item 4": 10}}
+}
+```
+
+(`model` / `mode` are page 0's, whose readout stood; `items[1]` and
+`items[3]` carry `"mode": "reasoned"`, `"model": "muse-glimmer"` and their
+own `escalations` with `units: 1, escalated: 1`.)
+
+**When something fails** — a failed escalation never costs a complete
+readout's answer:
+
+| Situation | Result |
+|---|---|
+| The readout was under the threshold; the escalation failed (an HTTP error, a timeout, no parseable answer after the retries, the escalation model unavailable at run time, a text-only escalation model on a page with no text) | The readout's answer stands: `escalated: false`, `why` set, `error` the failure (`escalation model 'x' is unavailable: …`, `escalation model 'x' is text-only and this page has no text layer (source 'none')`, or the call's own message) |
+| The readout could not be read (incomplete / capped); the escalation answered | The escalation's answer: `escalated: true`, `signal: null`, `fast` with a null score / verdict / confidence |
+| The readout could not be read AND the escalation failed | The unit errors (`status: "error"`): `readout incomplete: … — and the escalation to model 'muse-glimmer' failed: …` |
+| The readout's own request failed (a timeout, a 5xx, the server refusing `top_logprobs`) | The unit errors, as in fast mode — a transport failure is not "unsure", so nothing escalates |
+| The criterion's model lost its `fast` block after submit | The unit errors, as in fast mode |
+
+At submit, each a 400 with nothing queued — besides fast mode's (above):
+`escalate_below` with a mode other than `adaptive`, outside 0-100, or on a
+`text` / `detector` / `cv` criterion; an adaptive criterion while the
+escalation model is unavailable (*criterion 'X' has options.mode 'adaptive',
+and the escalation model 'x' (CLASSIFIER_ESCALATION_MODEL; GET /models
+escalation) is unavailable: … — make it available, point
+CLASSIFIER_ESCALATION_MODEL at an available entry, or use mode 'fast' or
+'reasoned'*); an adaptive criterion whose escalation model is text-only, on a
+photo with OCR off or `options.ocr: "never"`; and an adaptive criterion in
+`POST /references` `criteria` ([§ Creating one](#creating-one--post-references)).
+
+**What it costs.** Per item, one readout (~0.2-0.6 s on its model, as in
+fast mode) plus, for the escalated share, one reasoned call on the escalation
+model (`muse-glimmer`: 8.0 s at p50, 19.2 s at p95 — [§ Fast mode](#fast-mode--a-one-token-readout)).
+So model-seconds per item ≈ readout + escalation rate × reasoned call, and
+the threshold sets the rate. Each call holds a slot of its OWN model's
+`max_concurrent` — the readout on the criterion's model, the escalation on
+the escalation model's — and a unit keeps its job slot while it waits for
+either. Read it in `classifier_escalations_total{model, why, outcome}`
+([§ Concurrency and durability](#concurrency-and-durability)), the
+`escalate` kind of `classifier_llm_call_seconds` and of
+[`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage) → `by_kind`, and each
+unit's `detail.escalation`.
+
+**Tuning `escalate_below`.** The default 80 is a guess until it is measured.
+`bin/confidence_calibration.py --mode fast`
+([§ Confidence](#confidence--measured-then-calibrated)) runs the readout and
+the reasoned answer on labelled pages and prints, for each threshold from 50
+to 95, the **escalation curve**: the share escalated, the accuracy of the
+adaptive result and the model-seconds per item — beside the reasoned
+baseline (both over every labelled unit, an unanswered one counted wrong).
+It suggests the lowest threshold whose accuracy is within
+`--max-accuracy-loss` (0.01) of the baseline, and prints it with the fitted
+temperature as a block for the entry's `fast:` (`calibration` and
+`escalate_below` — fit both together, since the threshold is read on the
+calibrated confidence). Paste it and `docker restart classifier`; a caller
+with its own trade-off sends `options.escalate_below`.
 
 ## Result shape
 
@@ -2226,7 +3004,7 @@ that existed before describe the AGGREGATED answer:
 | `regions` | Where, in original page pixels — the union over every item, each region's `page` its item; capped at `CLASSIFIER_INLINE_REGIONS_MAX` (`regions_truncated` says so) |
 | `artifacts` | Per-criterion links — `items`: per item it found something on, that item's layer URLs filtered to the criterion (rendered on first fetch) and its loop `attempts`; `text`: one link per text layer its units read (each tagged `item`, or `document` for scope `document`); `null` when there is neither geometry nor text |
 | `localization` | `llm` criteria: the enforcement loop's record, `{"attempts": [], "accepted_attempt": null, "calls": 0}` when it did not run. With one item it is that item's record verbatim; with several it is merged — every attempt tagged with its `item`, `calls` summed, `accepted_attempt` `null` and `accepted: [{"item", "attempt"}]` listing each accepted box. `null` for the other types. **`references`** — only when the request listed references and the criterion has a guide — is what the loop was shown: always a list, one entry per unit whose loop ran, each `{item, applied, ask_images: composite \| crop \| null, examples: [{reference_id, criterion, polarity, composite}], ask, refine, verify, note}`. `ask` / `refine` / `verify` say whether that step's calls carry examples. `applied: false` means no step did, and `note` says why: the `CLASSIFIER_REFERENCE_BOX_*` knobs are off (the criterion set no `reference.boxes` step on), `options.reference.boxes` turns every step off for this criterion (a service default was on), no example has a region, the guide never applied, or an example failed to load. Merged across items and documents by concatenation. Absent without references, so those results are unchanged |
-| `options_used` | Options after defaults and caps, `aggregate` resolved; an `llm` criterion's box-loop settings (`refine`, `verify_partial`, `verify_min_span`, and `reference.boxes` / `.text` when `reference` was sent) as they ran — the criterion's, else the service default ([§ The box loop's options](#the-box-loops-options--per-criterion)) |
+| `options_used` | Options after defaults and caps, `aggregate` resolved; an `llm` criterion's box-loop settings (`refine`, `verify_partial`, `verify_min_span`, and `reference.boxes` / `.text` when `reference` was sent) as they ran — the criterion's, else the service default ([§ The box loop's options](#the-box-loops-options--per-criterion)); `model`, `mode` and `escalate_below` only when sent |
 | `error` | Why, when `status` is `error` |
 | `complete` | `false` when any of the criterion's units errored — its answer ignores part of what was asked, and the assessment is incomplete too |
 | `aggregate_used` | The rules applied, `{"pages", "documents"}`; `"pages": null` plus a `note` for a document-scope `text` criterion |
@@ -3512,6 +4290,7 @@ curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-123
 ```json
 {
   "default": "muse-glimmer",
+  "escalation": {"id": "muse-glimmer", "host": "muse-glimmer", "authenticated": false, "available": true},
   "models": [
     {"id": "muse-glimmer",
      "description": "Muse Glimmer 30B on vLLM (…). Vision, 3 images per prompt: …",
@@ -3520,15 +4299,26 @@ curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-123
      "authenticated": false, "available": true, "unavailable_reason": null,
      "vision": true, "max_images_per_prompt": 3,
      "supports": {"boxes": true, "references": true, "contrastive_references": true,
-                  "text_only_scoring": false},
+                  "text_only_scoring": false, "fast": false},
      "reasoning": {"style": "chat_template_kwargs", "key": "reasoning_strength", "value": "low"},
      "text_char_budget": 60000,
      "max_tokens": {"score": 8192, "box": 1024, "select": 2048, "describe": 1024},
      "timeout_s": 240.0, "max_concurrent": 6, "in_flight": 0,
-     "confidence": {"method": "logprobs", "headline": "stated", "calibrated": false}},
-    {"id": "qwen2.5-vl", "…": "…"},
-    {"id": "qwen3.5-4b", "…": "…"},
-    {"id": "qwen3.8-solo", "…": "…"}
+     "confidence": {"method": "logprobs", "headline": "stated", "calibrated": false},
+     "fast": null},
+    {"id": "qwen2.5-vl", "…": "…", "fast": null},
+    {"id": "qwen3.5-4b", "…": "…",
+     "fast": {"top_logprobs": 20, "min_coverage": 0.5, "max_unseen_mass": 0.02, "calibrated": [],
+              "escalate_below": {"rating": 80}}},
+    {"id": "qwen3.8-solo",
+     "description": "Qwen3.8-27B (AWQ INT4) on vLLM, one GPU (…) — a vision document model AND a chat model: …",
+     "vision": true, "max_images_per_prompt": 3,
+     "supports": {"boxes": true, "references": true, "contrastive_references": true,
+                  "text_only_scoring": false, "fast": true},
+     "reasoning": {"style": "chat_template_kwargs", "key": "reasoning_effort", "value": "low"},
+     "max_concurrent": 3, "…": "…",
+     "fast": {"top_logprobs": 64, "min_coverage": 0.5, "max_unseen_mass": 0.02, "calibrated": [],
+              "escalate_below": {"rating": 80}}}
   ]
 }
 ```
@@ -3541,6 +4331,22 @@ its llm results' `detail.confidence` is measured (`logprobs` | `sampling` |
 `stated`), which number is the top-level `confidence` (`stated` until the
 entry is flipped to `calibrated`), and whether a calibration is fitted — never
 the points or the request keys ([§ Confidence](#confidence--measured-then-calibrated)).
+`supports.fast` says whether `options.mode: "fast"` may run on the entry,
+and `fast` is its readout settings — `null` without a `fast` block, else
+`{top_logprobs, min_coverage, max_unseen_mass, calibrated, escalate_below}`,
+`calibrated` listing the answer types with a fitted `fast.calibration` (`[]`
+or `["rating"]` today) and `escalate_below` the threshold in force per answer
+type (`{"rating": 80}` unless the entry sets one) — never the body extras
+([§ Fast mode](#fast-mode--a-one-token-readout)). A caller sending fast or
+adaptive criteria picks its `options.model` from the entries with
+`supports.fast: true` and `available: true`.
+
+`escalation` is `{id, host, authenticated, available}` of the ONE entry an
+adaptive criterion escalates to — `CLASSIFIER_ESCALATION_MODEL`, else the
+default ([§ Adaptive mode](#adaptive-mode--escalate-when-unsure)). `host` is
+where an escalated page and its text go (it may be external);
+`available: false` makes every adaptive criterion a 400 at submit until it
+is fixed. The `escalation` entry is also in `models`, with its full settings.
 
 ---
 
@@ -3564,7 +4370,12 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
                                         "max_attempts": {"…": "…"}, "refine": {"…": "…"},
                                         "verify_partial": {"…": "…"},
                                         "verify_min_span": {"…": "…"}, "ocr": {"…": "…"},
-                                        "model": {"…": "…"}}},
+                                        "model": {"…": "…"},
+                                        "mode": {"anyOf": [{"enum": ["reasoned", "fast", "adaptive"]},
+                                                           {"type": "null"}], "…": "…"},
+                                        "escalate_below": {"anyOf": [{"type": "integer", "minimum": 0,
+                                                                      "maximum": 100},
+                                                                     {"type": "null"}], "…": "…"}}},
       "defaults": {"hint": "auto", "boxes": false, "max_attempts": 3, "refine": "grid",
                    "verify_partial": false, "verify_min_span": 0.0, "ocr": "auto",
                    "aggregate": {"pages": "worst", "documents": "worst"}},
@@ -3611,14 +4422,24 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
             "default": "muse-glimmer",
             "models": ["muse-glimmer", "qwen2.5-vl", "qwen3.5-4b", "qwen3.8-solo"],
             "catalog": "GET /models", "identity": "…"},
+  "mode": {"applies_to": "llm criteria (a 400 on cv / text / detector, and at the top level of a request or a criterion)",
+           "values": ["reasoned", "fast", "adaptive"], "default": "reasoned", "request_level": false,
+           "fast_models": ["qwen3.5-4b", "qwen3.8-solo"],
+           "fast": "reasoning off, one token: a digit 0-9 read from its probabilities (score = digit + 1); …",
+           "adaptive": "the fast readout first; when its confidence is under the threshold, or it could not be read (…), the reasoned scoring call on the escalation model (…) answers instead — …",
+           "escalation": {"id": "muse-glimmer", "available": true, "env": "CLASSIFIER_ESCALATION_MODEL",
+                          "catalog": "GET /models escalation"},
+           "escalate_below": {"minimum": 0, "maximum": 100, "default": 80,
+                              "resolution": "options.escalate_below (adaptive only), else the criterion's model's models.yaml fast.escalate_below.rating (…), else the service default"},
+           "identity": "options.mode and options.escalate_below are not part of a criterion's identity ('reasoned' equals unset)"},
   "detector_configured": true
 }
 ```
 
 `reference.caps` no longer carries `images_per_llm_prompt` — images per
 prompt is per model (`GET /models`), and `reference.requires_model` says so.
-`options.model` never appears in a type's `defaults` (it is echoed only when
-sent).
+`options.model`, `options.mode` and `options.escalate_below` never appear in
+a type's `defaults` (each is echoed only when sent).
 
 Each type also carries **`result`**, the shape of the `detail` it returns:
 
@@ -3642,7 +4463,9 @@ Each type also carries **`result`**, the shape of the `detail` it returns:
 `metric_from` says where the headline number lives: `detail` (the `metric`
 names a detail key), `measurements` (a `cv` measurement; its keys per detector
 in `GET /cv-detectors`) or `score` (the `llm` score). A field without `when`
-is always present; `stable` marks what survives a `mean` aggregate;
+is always present; `stable` marks what survives a `mean` aggregate (the first
+member's value); `rebuilt` marks a key every aggregate rebuilds from all its
+members, under every rule, and keeps under `mean` (the llm `escalations`);
 `nullable` marks a value that may be `null` (the llm `value` and `confidence`
 under `score: false`, the text `fuzzy_threshold` outside `fuzzy` mode).
 `kind` is one of `number`, `integer`, `string`, `boolean`, `array`, `object`
@@ -3686,6 +4509,22 @@ default), `service_defaults` THIS container's defaults (the
 resolved), and `marks_max` the service-wide `CLASSIFIER_LLM_BBOX_MARKS_MAX`.
 Its presence is how a caller tells the build takes these options (deploy the
 classifier first).
+
+The top-level **`mode`** block is `options.mode`
+([§ Fast mode](#fast-mode--a-one-token-readout),
+[§ Adaptive mode](#adaptive-mode--escalate-when-unsure)): its `values`, its
+`default` (`reasoned`), `request_level: false` (per criterion only — a
+request-level `mode` is a 400), `fast_models` — the ids `fast` (and
+adaptive's readout) may run on in THIS container: the available entries with
+a `models.yaml` `fast` block, in file order (those `GET /models` shows with
+`supports.fast` and `available` both true) — `escalation` (`{id, available,
+env, catalog}`: the entry adaptive escalates to in THIS container, the env
+var that names it, and where its host is shown), `escalate_below`
+(`{minimum, maximum, default, resolution}`: the threshold's bounds, the
+default a `models.yaml` entry falls back to, and how it resolves), and
+one-sentence `applies_to`, `fast`, `adaptive` and `identity`. Its presence is
+how a caller tells the build takes `options.mode`, and `mode.adaptive` that
+it takes `"adaptive"` (deploy the classifier first).
 
 ---
 
@@ -3899,6 +4738,11 @@ still works — it is a one-item `documents` list.
 'references=["r1a2b3c4d5e6f"]'`); omit `criteria` to inherit the references'
 own; `"references": {"auto": true, "tags": ["houses"]}` lets the service pick
 per page. See [§ References](#references).
+
+**Fast criteria:** `{"name": "…", "options": {"model": "qwen3.8-solo",
+"mode": "fast"}}` answers that criterion by a one-token readout, reasoning
+off — per criterion, on a model with `supports.fast`. See
+[§ Fast mode](#fast-mode--a-one-token-readout).
 
 **Errors** — all at submit, nothing queued: **400** for every rule in
 [§ Validation](#criterioninput), an empty file or `text` field, invalid

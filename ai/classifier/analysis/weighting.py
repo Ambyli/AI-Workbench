@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from analysis.outcome import Outcome
 from api.schemas import CriterionInput
+from config import SCORE_HI, SCORE_LO
 from logger import logger
 from utils import verdict_from_score as _verdict_from_score
 
@@ -86,7 +87,7 @@ def compute_weighted_score(
         total_weight = sum(c.weight for c, _ in counted)
         weighted_sum = sum(o.score * c.weight for c, o in counted)
         unrounded = weighted_sum / total_weight
-        final = max(1, min(10, round(unrounded)))
+        final = max(SCORE_LO, min(SCORE_HI, round(unrounded)))
         breakdown = {
             "formula": "sum(score * weight) / total_weight",
             "total_weight": round(total_weight, 4),

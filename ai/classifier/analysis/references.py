@@ -121,6 +121,8 @@ from analysis.ocr import get_ocr_engine
 from analysis.outcome import EvaluationError, Outcome
 from api.schemas import CriterionInput
 from config import (
+    ADAPTIVE_NOT_GUIDED_NOTE,
+    FAST_NOT_GUIDED_NOTE,
     REFERENCE_AUTO_MIN_CONFIDENCE,
     REFERENCE_BOX_TEXT,
     REFERENCE_BOX_TEXT_MIN_SPAN,
@@ -130,6 +132,8 @@ from config import (
     REFERENCE_POSITION_CAP,
     REFERENCE_POSITION_MAX_OFFSET,
     REFERENCE_POSITION_MIN_IOU,
+    SCORE_HI,
+    SCORE_LO,
 )
 # A module, not names: tests script the model at `llm.client._send`, under
 # the limit, and every call must reach the one object they replaced.
@@ -202,7 +206,7 @@ def combine(answers: list[tuple[int, dict]], rule: str) -> tuple[dict, int]:
     if rule == "mean":
         scores = [a["score"] for _, a in answers]
         mean = sum(scores) / len(scores)
-        score = max(1, min(10, int(round(mean))))
+        score = max(SCORE_LO, min(SCORE_HI, int(round(mean))))
         call, nearest = min(answers, key=lambda pair: abs(pair[1]["score"] - mean))
         confidence = int(round(sum(a["confidence"] for _, a in answers) / len(answers)))
         return {
@@ -427,7 +431,14 @@ class JobReferences:
 
     def guide(self, c: CriterionInput, item: Optional[int] = None) -> Optional[CriterionGuide]:
         """The guidance for ``c`` (on ``item``, for ``auto``); None when the
-        model does not answer it."""
+        model does not answer it. A fast or adaptive criterion
+        (``options.mode: "fast"`` / ``"adaptive"``) is answered but never
+        guided: an empty guide whose note says so
+        (``config.FAST_NOT_GUIDED_NOTE`` / ``ADAPTIVE_NOT_GUIDED_NOTE``), so
+        its ``detail.reference`` reads ``applied: false`` with the reason."""
+        if c.answered_by_model() and c.reads_out():
+            note = ADAPTIVE_NOT_GUIDED_NOTE if c.is_adaptive() else FAST_NOT_GUIDED_NOTE
+            return CriterionGuide(c.name, self.mode, self._options(c), [], note=note)
         if not c.guided_by_llm():
             return None
         entry = (self.plan.get("criteria") or {}).get(c.name)

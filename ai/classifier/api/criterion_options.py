@@ -8,7 +8,8 @@ for that path:
 
     llm       LLMOptions       hint, boxes, max_attempts, refine,
                                verify_partial, verify_min_span, ocr,
-                               reference, model, aggregate
+                               reference, model, mode, escalate_below,
+                               aggregate
     text      TextOptions      pattern, match, case_sensitive, fuzzy_threshold,
                                min_count, ocr, scope, aggregate
     cv        CVOptions        fallback, reference, model, aggregate
@@ -41,8 +42,32 @@ answers the criterion — on ``llm``, and on a ``cv`` name answered by its llm
 fallback. Precedence: ``options.model``, then the request's ``model``, then
 the registry default. An unknown or unavailable id is a 400 naming the valid
 ones. Like ``reference`` it appears in ``resolve()`` only when sent, and it
-is NOT part of a criterion's identity (``without_model``): the same question
+is NOT part of a criterion's identity (``identity``): the same question
 asked of another model is the same criterion.
+
+``mode`` (``llm`` only) is how the model answers: ``reasoned`` (null, the
+default — what every criterion always did), ``fast`` — reasoning off and
+ONE generated token, a digit read from its probabilities
+(``llm.client.call_readout``) — or ``adaptive``: that readout, then, when it
+is unsure (its confidence under the threshold) or could not be read, the
+reasoned scoring call on the registry's ESCALATION model
+(``CLASSIFIER_ESCALATION_MODEL``, ``llm.models.Registry.escalation``). Both
+readout modes (``reads_out``) run on a model with a ``models.yaml`` ``fast:``
+block only (``api.schemas.check_model_rules`` names the ones that have
+one), and adaptive needs an available escalation model. Per criterion only:
+a request-level ``mode`` and a top-level criterion ``mode`` are named 400s
+(``config.MODE_NOT_REQUEST_LEVEL`` / ``MODE_IN_OPTIONS``), and so is
+``options.mode`` on cv / text / detector (``MODE_REFUSED_BY_TYPE``). A fast
+or adaptive criterion is never guided by references
+(``guided_by_references``; ``options.reference`` on one is
+``config.FAST_NOT_GUIDED`` / ``ADAPTIVE_NOT_GUIDED``).
+``escalate_below`` (0-100) is the adaptive threshold — a named 400 on any
+other mode (``config.ESCALATE_BELOW_NEEDS_ADAPTIVE``); unset, the model's
+``fast.escalate_below.rating`` applies. The values, the default, the bounds
+and those 400s' wording are ``config.py`` § Fast mode. Like ``model`` both
+appear in ``resolve()`` only when sent, and neither is part of a
+criterion's identity. Every check is on the VALUE (no ``model_fields_set``):
+criteria are ``model_dump()``ed into payloads and validated again.
 
 ``reference`` (``ReferenceOptions``) says how the request's ``references`` —
 stored worked examples, see ``references/`` — guide THIS criterion: whether
@@ -103,12 +128,26 @@ from common.documents import MAX_PATTERN_CHARS
 # default by patching them here.
 from config import (
     CRITERION_NAME_MAX_CHARS as NAME_MAX_CHARS,
+    DEFAULT_MODE,
     DETECTOR_MIN_SCORE,
+    ESCALATE_BELOW_MAX,
+    ESCALATE_BELOW_MIN,
+    ESCALATE_BELOW_NEEDS_ADAPTIVE,
+    ESCALATE_BELOW_RESOLUTION,
+    ESCALATION_CATALOG,
+    ESCALATION_MODEL_ENV,
+    FAST_DEFAULT_ESCALATE_BELOW,
     LLM_BBOX_MARKS_MAX,
     LLM_BBOX_MAX_ATTEMPTS,
     LLM_BBOX_REFINE_MODE,
     LLM_BBOX_VERIFY_MIN_SPAN,
     LLM_BBOX_VERIFY_PARTIAL,
+    MODE_ADAPTIVE_SUMMARY,
+    MODE_APPLIES_TO,
+    MODE_FAST_SUMMARY,
+    MODE_IDENTITY_NOTE,
+    MODES,
+    READOUT_MODES,
     REFERENCE_BOX_ASK,
     REFERENCE_BOX_REFINE,
     REFERENCE_BOX_TEXT,
@@ -130,6 +169,10 @@ from detector import client as detector_client
 
 OcrMode = Literal["auto", "always", "never"]
 RefineMode = Literal["grid", "marks"]
+# How an llm criterion's model answers (options.mode), null = config.DEFAULT_MODE.
+# Written out for type checkers (a Literal cannot take a variable); a test
+# pins typing.get_args(Mode) == config.MODES.
+Mode = Literal["reasoned", "fast", "adaptive"]
 
 # Server caps a caller cannot exceed — NAME_MAX_CHARS and MIN_COUNT_CAP are
 # the config env knobs under their local names (api.schemas imports them here).
@@ -492,10 +535,48 @@ class LLMOptions(_Options):
 
     model: Optional[str] = _model_field("scores this criterion (and runs its box loop)")
 
+    mode: Optional[Mode] = Field(
+        default=None,
+        description=(
+            "How the model answers. 'reasoned' (the default; null is the same): the "
+            "model reasons and writes {score, verdict, confidence, reason}. 'fast': "
+            "reasoning off and ONE generated token — a digit 0-9 read from its "
+            "probabilities (score = digit + 1), ~0.2-0.6 s instead of seconds, no "
+            "model-written reason; only on a model with a models.yaml `fast` block "
+            "(GET /models supports.fast — a 400 otherwise), never guided by "
+            "references. 'adaptive': the fast readout first; when its confidence is "
+            "under escalate_below, or it could not be read, the reasoned call on the "
+            "escalation model (GET /models escalation — it may be an external host) "
+            "answers instead; needs the fast block too and an available escalation "
+            "model, never guided by references. Per criterion only: there is no "
+            "request-level mode. The box loop (boxes: true) still runs reasoned, on "
+            "the criterion's own model."
+        ),
+    )
+    escalate_below: Optional[int] = Field(
+        default=None,
+        ge=ESCALATE_BELOW_MIN,
+        le=ESCALATE_BELOW_MAX,
+        description=(
+            "mode 'adaptive' only (a 400 otherwise): escalate when the readout's 0-100 "
+            "confidence is under this. Omitted: the model's models.yaml "
+            "fast.escalate_below.rating (GET /models fast.escalate_below)."
+        ),
+    )
+
     @field_validator("model")
     @classmethod
     def _known_model(cls, value: Optional[str]) -> Optional[str]:
         return check_model_id(value)
+
+    @model_validator(mode="after")
+    def _escalate_below_needs_adaptive(self) -> "LLMOptions":
+        """A threshold without the mode that reads it would do nothing — on
+        the VALUE (criteria are dumped into payloads with every key, null
+        included, and validated again)."""
+        if self.escalate_below is not None and self.mode != "adaptive":
+            raise ValueError(ESCALATE_BELOW_NEEDS_ADAPTIVE)
+        return self
 
     @model_validator(mode="after")
     def _position_needs_boxes(self) -> "LLMOptions":
@@ -559,7 +640,14 @@ class LLMOptions(_Options):
             "ocr": self.ocr,
             "aggregate": self.resolved_aggregate(default_aggregate("llm", self.hint)),
         }
-        return _with_model(_with_reference(resolved, self.reference, name), self.model)
+        resolved = _with_model(_with_reference(resolved, self.reference, name), self.model)
+        # Like `model`: present only when sent, so a criterion without them
+        # resolves (and echoes options_used) exactly as it always did.
+        if self.mode is not None:
+            resolved = {**resolved, "mode": self.mode}
+        if self.escalate_below is not None:
+            resolved = {**resolved, "escalate_below": self.escalate_below}
+        return resolved
 
     @classmethod
     def caps(cls) -> dict[str, Any]:
@@ -736,14 +824,27 @@ def _with_model(resolved: dict[str, Any], model: Optional[str]) -> dict[str, Any
     return {**resolved, "model": model}
 
 
-def without_model(resolved: dict[str, Any]) -> dict[str, Any]:
-    """Resolved options with ``model`` dropped — a criterion's IDENTITY.
+# The resolved keys that say HOW a question is answered, not what it is —
+# never part of a criterion's identity (``identity``).
+_NOT_IDENTITY = frozenset({"model", "mode", "escalate_below"})
 
-    Which model answers a question does not change the question, so two
-    criteria that differ only in ``options.model`` are the same criterion:
-    a reference saved under one model guides the criterion under any other
+
+def identity(resolved: dict[str, Any]) -> dict[str, Any]:
+    """Resolved options with ``model``, ``mode`` and ``escalate_below``
+    dropped — a criterion's IDENTITY.
+
+    Which model answers a question, whether it reasons first or reads one
+    token, and when an adaptive readout escalates, do not change the
+    question: two criteria that differ only in ``options.model`` /
+    ``options.mode`` / ``options.escalate_below`` are the same criterion — so
+    an explicit ``mode: "reasoned"`` equals unset, and a reference saved
+    under one model guides the criterion under any other
     (``references.resolve``, ``api.references``)."""
-    return {k: v for k, v in resolved.items() if k != "model"}
+    return {k: v for k, v in resolved.items() if k not in _NOT_IDENTITY}
+
+
+# The name it had before ``mode`` joined it.
+without_model = identity
 
 
 def box_loop_settings(resolved: dict[str, Any]) -> dict[str, Any]:
@@ -782,14 +883,42 @@ NOT_GUIDED = (
 
 
 def answered_by_llm(type_: str, name: str, resolved: dict[str, Any]) -> bool:
-    """Whether the vision model answers the criterion — the only kind a
-    reference can guide: ``llm``, or a ``cv`` name with no OpenCV detector
-    whose fallback resolves to the llm."""
+    """Whether a registry model answers the criterion (so its model rules
+    apply): ``llm``, or a ``cv`` name with no OpenCV detector whose fallback
+    resolves to the llm."""
     if type_ == "llm":
         return True
     if type_ == "cv":
         return get_detector(name) is None and resolved.get("fallback") == "llm"
     return False
+
+
+def is_fast(type_: str, resolved: dict[str, Any]) -> bool:
+    """Whether an llm criterion answers by the one-token readout alone
+    (``options.mode: "fast"``)."""
+    return type_ == "llm" and resolved.get("mode") == "fast"
+
+
+def is_adaptive(type_: str, resolved: dict[str, Any]) -> bool:
+    """Whether an llm criterion answers by the readout and, when unsure, the
+    escalation model's reasoned call (``options.mode: "adaptive"``)."""
+    return type_ == "llm" and resolved.get("mode") == "adaptive"
+
+
+def reads_out(type_: str, resolved: dict[str, Any]) -> bool:
+    """Whether an llm criterion starts with the one-token readout
+    (``config.READOUT_MODES``: fast, adaptive) — so its model needs a
+    ``fast:`` block and references never guide it."""
+    return type_ == "llm" and resolved.get("mode") in READOUT_MODES
+
+
+def guided_by_references(type_: str, name: str, resolved: dict[str, Any]) -> bool:
+    """Whether references can guide the criterion: the model answers it
+    (:func:`answered_by_llm`) by its REASONED scoring call — a fast readout
+    has no reasoning for an example to steer, and an adaptive criterion
+    starts with one (its escalation is never guided either), so neither is
+    guided (the same precedent as a cv name an OpenCV detector answers)."""
+    return answered_by_llm(type_, name, resolved) and not reads_out(type_, resolved)
 
 
 OPTIONS_MODELS: dict[str, type[_Options]] = {
@@ -836,6 +965,43 @@ def can_locate(type_: str, name: str, resolved: dict[str, Any]) -> bool:
             return fn not in _WHOLE_PAGE_DETECTORS
         return resolved.get("fallback") == "detector"
     return False
+
+
+def _mode_block() -> dict[str, Any]:
+    """``GET /criterion-types`` ``mode``: options.mode's values and default,
+    that it is per criterion, where ``fast`` (and adaptive's readout) may run
+    on THIS container, what ``adaptive`` escalates to (``escalation``: the
+    registry's escalation model, ``CLASSIFIER_ESCALATION_MODEL``) and how its
+    threshold resolves (``escalate_below``)."""
+    registry = llm_models.get_registry()
+    escalation = registry.escalation
+    return {
+        "applies_to": MODE_APPLIES_TO,
+        "values": list(MODES),
+        "default": DEFAULT_MODE,
+        "request_level": False,
+        # Where "fast" — and adaptive's readout — may run on THIS container:
+        # the available entries with a models.yaml `fast` block (GET /models
+        # supports.fast).
+        "fast_models": registry.fast_ids(),
+        "fast": MODE_FAST_SUMMARY,
+        "adaptive": MODE_ADAPTIVE_SUMMARY,
+        # Where an adaptive criterion escalates on THIS container (GET
+        # /models escalation has its host and whether it is authenticated).
+        "escalation": {
+            "id": escalation.id,
+            "available": escalation.available,
+            "env": ESCALATION_MODEL_ENV,
+            "catalog": ESCALATION_CATALOG,
+        },
+        "escalate_below": {
+            "minimum": ESCALATE_BELOW_MIN,
+            "maximum": ESCALATE_BELOW_MAX,
+            "default": FAST_DEFAULT_ESCALATE_BELOW,
+            "resolution": ESCALATE_BELOW_RESOLUTION,
+        },
+        "identity": MODE_IDENTITY_NOTE,
+    }
 
 
 def criterion_types() -> dict[str, Any]:
@@ -955,5 +1121,7 @@ def criterion_types() -> dict[str, Any]:
             "identity": "options.model is not part of a criterion's identity: references "
                         "match across models",
         },
+        # options.mode on llm criteria — per criterion only.
+        "mode": _mode_block(),
         "detector_configured": detector_client.is_configured(),
     }

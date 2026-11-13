@@ -24,6 +24,9 @@ runs) and criterion keys unique within the reference
 (``check_unique_keys``, which /assess does not run: there keys may repeat);
 a breakdown verdict that disagrees with its score
 (``utils.verdict_from_score``); a breakdown for a ``score: false`` criterion;
+a request-level ``mode`` and a criterion with ``options.mode: "fast"`` or
+``"adaptive"`` (a reference records reasoned 1-10 answers —
+``config.REFERENCE_REFUSES_READOUT_MODE``);
 breakdown / regions keys that name no criterion; a malformed box or polygon;
 grid coordinates outside 0–1000; a blank ``criteria_keys`` value. What needs
 the bytes (the page exists, a pixel region lies inside it) or the store
@@ -51,19 +54,21 @@ from api.schemas import (
 )
 from config import (
     LLM_BBOX_GRID,
+    MODE_NOT_REQUEST_LEVEL,
+    READOUT_MODES,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_MAX_TAGS,
+    REFERENCE_REASON_MAX_CHARS,
+    REFERENCE_REFUSES_READOUT_MODE,
     REFERENCE_TAG_MAX_CHARS,
     REFERENCE_TITLE_MAX_CHARS,
+    SCORE_HI,
+    SCORE_LO,
 )
 from utils import verdict_from_score
 
 # A job id is common.jobs' 12 hex.
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-
-# The longest breakdown reason a caller may store; it is pasted into the
-# example's caption, so it is kept to a few sentences.
-REASON_MAX_CHARS = 1000
 
 
 class BreakdownInput(BaseModel):
@@ -72,14 +77,14 @@ class BreakdownInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    score: int = Field(ge=1, le=10, description="The expected 1-10 score.")
+    score: int = Field(ge=SCORE_LO, le=SCORE_HI, description="The expected 1-10 score.")
     verdict: Optional[Literal["PASS", "MARGINAL", "FAIL"]] = Field(
         default=None,
         description="Optional; must be the score's verdict (7-10 PASS, 4-6 MARGINAL, 1-3 FAIL).",
     )
     reason: Optional[str] = Field(
         default=None,
-        max_length=REASON_MAX_CHARS,
+        max_length=REFERENCE_REASON_MAX_CHARS,
         description="Why — shown to the model as the example's caption.",
     )
 
@@ -227,6 +232,14 @@ class ReferenceRequest(_Meta):
                     "the registry default. A criterion's options.model still wins for it.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _no_request_mode(cls, data: Any) -> Any:
+        """A request-level ``mode`` is a named 400, as on /assess."""
+        if isinstance(data, dict) and "mode" in data:
+            raise ValueError(MODE_NOT_REQUEST_LEVEL)
+        return data
+
     @field_validator("model")
     @classmethod
     def _known_model(cls, value: Optional[str]) -> Optional[str]:
@@ -255,6 +268,15 @@ class ReferenceRequest(_Meta):
                     f"options.reference on {guided}: a reference's own criteria are "
                     "not guided by other references; drop it"
                 )
+            # Explicit fast / adaptive criteria (both start with a readout,
+            # and adaptive's stays the answer whenever it does not escalate).
+            for mode in READOUT_MODES:
+                names = [
+                    c.name for c in self.criteria
+                    if c.reads_out() and c.resolved_options().get("mode") == mode
+                ]
+                if names:
+                    raise ValueError(REFERENCE_REFUSES_READOUT_MODE.format(mode=mode, names=names))
             self.check_keys([c.name for c in self.criteria], {c.name: c for c in self.criteria})
         # Every model the creation job uses must see images: the job model,
         # and each criterion's own options.model. (A from_job reference's

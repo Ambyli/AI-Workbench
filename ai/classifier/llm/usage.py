@@ -82,6 +82,7 @@ from typing import Any, Iterator, Optional
 import asyncpg
 import httpx
 
+from config import LLM_CALL_ERROR_MAX_CHARS
 from db import Database, create_schema, database
 from logger import logger
 from metrics import llm_usage_write_errors
@@ -230,9 +231,6 @@ _AGGREGATES = (
 # is whatever the server or the role was configured with.
 _DAY = "to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
 
-# A short error string: the class and the message, never a traceback.
-_ERROR_MAX_CHARS = 500
-
 
 def _count(value: Any) -> Optional[int]:
     """A non-negative int token count, or None for anything else."""
@@ -317,7 +315,8 @@ def build_row(
     if error is not None:
         if isinstance(error, httpx.HTTPStatusError):
             http_status = error.response.status_code
-        error_text = f"{type(error).__name__}: {error}"[:_ERROR_MAX_CHARS]
+        # A short error string: the class and the message, never a traceback.
+        error_text = f"{type(error).__name__}: {error}"[:LLM_CALL_ERROR_MAX_CHARS]
 
     request_id = request_id_var.get()
     max_tokens = body.get("max_tokens", body.get("max_completion_tokens"))

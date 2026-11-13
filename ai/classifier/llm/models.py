@@ -12,18 +12,24 @@ bind-mounted read-only over the same path in the container), validated here:
                       ``default``, an ``api_key_env`` on a plain-``http://``
                       URL to a dotted host, a reasoning key set twice, a
                       "Reasoning strength" system line on Muse Glimmer, an
-                      unavailable default.
+                      unavailable default, a ``CLASSIFIER_ESCALATION_MODEL``
+                      that names no entry.
     get_registry()    the process-wide registry, loaded on first use from
                       ``DEFAULT_PATH``. Every caller looks it up at CALL time,
                       so ``use_registry()`` (tests) swaps it everywhere.
     startup_check()   what ``main``'s lifespan runs first: load (so a bad file
-                      fails startup with its reason), log the entries, and
-                      WARN once about any removed env var still set.
-    Registry          the entries by id, the default, ``resolve(id)``,
-                      ``check_selectable(id)`` (the 400 messages) and
-                      ``public()`` (the GET /models payload — never a key).
+                      fails startup with its reason), log the entries (the
+                      ``[default]`` and the ``[escalation]`` marked), WARN
+                      once about any removed env var still set, and WARN
+                      when the escalation model is unavailable.
+    Registry          the entries by id, the default, the ``escalation``
+                      model, ``resolve(id)``, ``check_selectable(id)`` (the
+                      400 messages), ``fast_ids()`` (where ``mode: "fast"``
+                      may run) and ``public()`` (the GET /models payload —
+                      never a key).
     ModelSpec         one loaded entry: everything a prompt builder and the
-                      transport need, plus its own ``ConcurrencyLimit``.
+                      transport need (``body()``; ``fast_body()`` for a
+                      readout), plus its own ``ConcurrencyLimit``.
 
 **Keys never live in the YAML.** An entry names an environment variable
 (``api_key_env``); its value is read once, at load, into the spec's request
@@ -44,7 +50,39 @@ writes numbers, how many samples) is a knob with a default. Load refuses a
 ``headline: calibrated`` without points, a calibration ``signal`` the method
 cannot produce, a reserved body key in ``logprobs.request`` /
 ``sampling.extra_body``, and ``sampling`` via ``n_param`` with ``n`` above
-``max_concurrent`` (one such call holds n slots). See ``llm.confidence``.
+``max_concurrent`` (one such call holds n slots). The defaults and the bounds
+of ``sampling.n`` are ``config.py`` § Measured confidence. See
+``llm.confidence``.
+
+**Fast is configuration too.** An entry's optional ``fast:`` block
+(``FastConfig``) says it can answer with reasoning OFF and ONE generated
+token whose probabilities are the answer (``options.mode: "fast"``):
+the ``chat_template_kwargs`` that turn reasoning off, the body extras
+(default ``{temperature: 0}``), ``top_logprobs`` (≥ 11, never above the
+server's ``--max-logprobs``), ``min_coverage`` / ``max_unseen_mass`` (when a
+readout is believed — ``llm.client.call_readout``), ``strip_markers`` (caller
+text that would turn thinking back on), a per-answer-type
+``calibration`` and a per-answer-type ``escalate_below`` (0-100: an
+``options.mode: "adaptive"`` criterion escalates when its readout's
+confidence is under it; a type left out is filled with the default at load).
+``ModelSpec.fast_body`` builds the request. No block = fast and adaptive are
+a 400 on that entry; nothing branches on a model name. Load refuses a
+reserved key in ``fast.extra_body`` (as in ``confidence.logprobs.request``,
+plus ``logprobs`` / ``top_logprobs``), ``top_logprobs`` under 11, a
+``max_unseen_mass`` of 0 (it would cap every readout), an unknown
+calibration or escalate_below answer type and a threshold outside 0-100. The
+defaults, that floor (11), the bounds and the answer types are ``config.py``
+§ Fast mode.
+
+**The escalation model.** ``CLASSIFIER_ESCALATION_MODEL`` names the ONE entry
+an adaptive criterion escalates to (its reasoned scoring call); unset is the
+default. It is read by :func:`parse_registry` from the env mapping it is
+given (the same one the keys come from), decided on static facts only — an
+id that is not an entry stops the container, and nothing resolves a host at
+load. It may be an external entry (Claude): the operator designates it, and
+``GET /models`` reports it as ``escalation: {id, host, authenticated,
+available}``. Unavailable (its key unset), ``startup_check`` warns and
+adaptive is a 400 at submit.
 
 **Replaced settings.** The registry replaced ``VISION_LLM_API``,
 ``VISION_LLM_MODEL``, ``VISION_LLM_REASONING_STRENGTH`` /
@@ -57,8 +95,11 @@ logs one WARNING naming whichever are still set, so a stale ``.env`` is
 visible rather than silently ignored.
 
 Process flow position: a leaf of the ``llm`` package — it imports no other
-classifier module but ``logger``, so ``config``-level code (``db``'s pool
-size) can ask it for the total concurrency without an import cycle.
+classifier module but ``logger`` and ``config`` (the ``confidence:`` and
+``fast:`` blocks' defaults; ``config`` imports only the standard library and
+``common.net``),
+so ``config``-level code (``db``'s pool size) can ask it for the total
+concurrency without an import cycle.
 """
 
 from __future__ import annotations
@@ -68,7 +109,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping, Optional
+from typing import Annotated, Any, Literal, Mapping, Optional
 from urllib.parse import urlsplit
 
 import yaml
@@ -76,6 +117,30 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from common.jobs.limits import ConcurrencyLimit
 
+from config import (
+    CONFIDENCE_DEFAULT_HEADLINE,
+    CONFIDENCE_DEFAULT_METHOD,
+    CONFIDENCE_FALLBACK,
+    CONFIDENCE_LOGPROBS_DEFAULT_ENTRIES_PATH,
+    CONFIDENCE_LOGPROBS_DEFAULT_MIN_COVERAGE,
+    CONFIDENCE_LOGPROBS_DEFAULT_NUMBER_TOKENS,
+    CONFIDENCE_LOGPROBS_DEFAULT_REQUEST,
+    CONFIDENCE_LOGPROBS_DEFAULT_TOP_KEY,
+    CONFIDENCE_SAMPLING_DEFAULT_N,
+    CONFIDENCE_SAMPLING_DEFAULT_VIA,
+    CONFIDENCE_SAMPLING_MAX_N,
+    CONFIDENCE_SAMPLING_MIN_N,
+    ESCALATE_BELOW_MAX,
+    ESCALATE_BELOW_MIN,
+    ESCALATION_MODEL_ENV,
+    FAST_ANSWER_TYPES,
+    FAST_DEFAULT_ESCALATE_BELOW,
+    FAST_DEFAULT_EXTRA_BODY,
+    FAST_DEFAULT_MAX_UNSEEN_MASS,
+    FAST_DEFAULT_MIN_COVERAGE,
+    FAST_DEFAULT_TOP_LOGPROBS,
+    FAST_MIN_TOP_LOGPROBS,
+)
 from logger import logger
 
 # The checked-in registry. The container bind-mounts the box's copy over this
@@ -176,7 +241,9 @@ class MaxTokens(_Strict):
 # signal is acquired and every knob has a default. An entry without the block
 # is `method: stated` — nothing extra is requested, which is safe on any
 # provider. What each method produces is `llm.confidence`'s job; the request
-# body changes (score calls only) are `ModelSpec.body`'s.
+# body changes (score calls only) are `ModelSpec.body`'s. The defaults, and
+# the bounds of sampling.n, are config.py § Measured confidence
+# (CONFIDENCE_*); an entry's own value wins. The Literals stay written out.
 
 CONFIDENCE_METHODS: tuple[str, ...] = ("logprobs", "sampling", "stated")
 
@@ -212,16 +279,16 @@ class LogprobsConfig(_Strict):
     """``confidence.logprobs`` — reading the score's token distribution."""
 
     request: dict[str, Any] = Field(
-        default_factory=lambda: {"logprobs": True, "top_logprobs": 20},
+        default_factory=lambda: dict(CONFIDENCE_LOGPROBS_DEFAULT_REQUEST),
         description="Merged into the SCORE request body only — whatever this provider's API wants.",
     )
     entries_path: str = Field(
-        default="choices.0.logprobs.content", min_length=1,
+        default=CONFIDENCE_LOGPROBS_DEFAULT_ENTRIES_PATH, min_length=1,
         description="Dotted path to the [{token, logprob, <top_key>}] list in the response.",
     )
-    top_key: str = Field(default="top_logprobs", min_length=1)
-    number_tokens: Literal["auto", "single", "digits"] = "auto"
-    min_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
+    top_key: str = Field(default=CONFIDENCE_LOGPROBS_DEFAULT_TOP_KEY, min_length=1)
+    number_tokens: Literal["auto", "single", "digits"] = CONFIDENCE_LOGPROBS_DEFAULT_NUMBER_TOKENS
+    min_coverage: float = Field(default=CONFIDENCE_LOGPROBS_DEFAULT_MIN_COVERAGE, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _body(self) -> "LogprobsConfig":
@@ -232,8 +299,12 @@ class LogprobsConfig(_Strict):
 class SamplingConfig(_Strict):
     """``confidence.sampling`` — the empirical distribution of n answers."""
 
-    n: int = Field(default=5, ge=2, le=32)
-    via: Literal["n_param", "repeat"] = "n_param"
+    n: int = Field(
+        default=CONFIDENCE_SAMPLING_DEFAULT_N,
+        ge=CONFIDENCE_SAMPLING_MIN_N,
+        le=CONFIDENCE_SAMPLING_MAX_N,
+    )
+    via: Literal["n_param", "repeat"] = CONFIDENCE_SAMPLING_DEFAULT_VIA
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -274,11 +345,11 @@ class ConfidenceConfig(_Strict):
     """An entry's ``confidence:`` block. Every knob has a default; no block at
     all is ``method: stated``."""
 
-    method: Literal["logprobs", "sampling", "stated"] = "stated"
+    method: Literal["logprobs", "sampling", "stated"] = CONFIDENCE_DEFAULT_METHOD
     logprobs: LogprobsConfig = Field(default_factory=LogprobsConfig)
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
-    fallback: Literal["stated"] = "stated"
-    headline: Literal["stated", "calibrated"] = "stated"
+    fallback: Literal["stated"] = CONFIDENCE_FALLBACK
+    headline: Literal["stated", "calibrated"] = CONFIDENCE_DEFAULT_HEADLINE
     calibration: Optional[CalibrationConfig] = None
 
     @model_validator(mode="after")
@@ -318,6 +389,153 @@ class ConfidenceConfig(_Strict):
         return 1
 
 
+# ── fast: the one-token readout (options.mode "fast") ────────────────────
+#
+# An entry with a `fast:` block can answer a criterion with reasoning OFF and
+# ONE generated token, read from that token's probabilities
+# (common.logprobs.option_distribution) instead of from what it wrote. No
+# block = fast is a 400 on this entry (a model that cannot turn reasoning
+# off — Muse Glimmer's lowest level is `low` — simply has none). How the body
+# is built is `ModelSpec.fast_body`; what the readout must look like before
+# it is believed is `min_coverage` / `max_unseen_mass` (llm.client.call_readout).
+# The defaults, the top_logprobs floor and the calibratable answer types are
+# config.py § Fast mode (FAST_DEFAULT_*, FAST_MIN_TOP_LOGPROBS,
+# FAST_ANSWER_TYPES); an entry's own value wins.
+
+# A fast.calibration / fast.escalate_below key: one of config.FAST_ANSWER_TYPES
+# (the 1-10 rating only today; typed answers — yes / no, choice, levels — join
+# when they exist). Written out for type checkers (a Literal cannot take a
+# variable); a test pins typing.get_args(FastAnswerType) ==
+# config.FAST_ANSWER_TYPES.
+FastAnswerType = Literal["rating"]
+
+# One fast.escalate_below value: the 0-100 readout confidence under which an
+# adaptive criterion escalates (config.ESCALATE_BELOW_MIN / _MAX).
+EscalateBelow = Annotated[int, Field(ge=ESCALATE_BELOW_MIN, le=ESCALATE_BELOW_MAX)]
+
+# Body keys fast.extra_body may not set: the confidence block's reserved keys
+# (model / messages / the token field / response_format / chat_template_kwargs
+# — its own field below — stream / n) plus the two a readout owns.
+_FAST_RESERVED = _CONFIDENCE_RESERVED | {"logprobs", "top_logprobs"}
+
+
+class FastCalibration(_Strict):
+    """``fast.calibration.<answer type>`` — a fitted temperature (and, for a
+    two-way answer, a Platt bias) applied to the readout before it is
+    reported (``bin/confidence_calibration.py --mode fast`` fits and prints
+    it, with the ``escalate_below`` its escalation curve suggests)."""
+
+    temperature: float = Field(gt=0.0, description="p ∝ exp(logprob / temperature)")
+    bias: float = Field(
+        default=0.0, description="Platt offset — two-way (yes / no) answers only; unused "
+                                 "for rating",
+    )
+    n: Optional[int] = Field(default=None, ge=0)
+    fitted_on: Optional[str] = None
+    ground_truth: Optional[str] = None
+
+
+class FastConfig(_Strict):
+    """An entry's ``fast:`` block — how a one-token readout is asked for and
+    when it is believed. Every knob but the reasoning switch has a default."""
+
+    chat_template_kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Merged LAST into a fast body's chat_template_kwargs (after the "
+                    "entry's own, with its reasoning key dropped) — the switch that turns "
+                    "reasoning off, e.g. {enable_thinking: false}.",
+    )
+    extra_body: dict[str, Any] = Field(
+        default_factory=lambda: dict(FAST_DEFAULT_EXTRA_BODY),
+        description="Merged into a fast body after the entry's extra_body. Default "
+                    "{temperature: 0}: greedy, so a written answer is the most probable "
+                    "path (the logprobs read are raw, before temperature).",
+    )
+    top_logprobs: int = Field(
+        default=FAST_DEFAULT_TOP_LOGPROBS, ge=FAST_MIN_TOP_LOGPROBS,
+        description="Alternatives asked for at the answer position. Never above the "
+                    "server's --max-logprobs (vLLM's default is 20; a request over it is "
+                    "a 400).",
+    )
+    min_coverage: float = Field(
+        default=FAST_DEFAULT_MIN_COVERAGE, ge=0.0, le=1.0,
+        description="The share of the answer position's probability that must fall on "
+                    "the labels; below it the readout is incomplete.",
+    )
+    max_unseen_mass: float = Field(
+        default=FAST_DEFAULT_MAX_UNSEEN_MASS, gt=0.0, le=1.0,
+        description="The probability cap: what labels missing from the top_logprobs list "
+                    "hold is estimated as n_unseen × the smallest listed probability "
+                    "(capped by 1 − coverage; one spelling per label, so a heuristic, not "
+                    "a guarantee); at or above this the readout is refused "
+                    "(ReadoutCapped). Above 0: at 0 even a readout listing every label "
+                    "(estimate 0.0) would be refused.",
+    )
+    strip_markers: list[str] = Field(
+        default_factory=list,
+        description="Strings removed from the caller text a fast prompt carries (the "
+                    "criterion name and the text layer): chat-template markers that would "
+                    "turn reasoning back on.",
+    )
+    calibration: dict[FastAnswerType, FastCalibration] = Field(
+        default_factory=dict,
+        description="Per answer type: {temperature, bias, n, fitted_on, ground_truth}. "
+                    "{} = uncalibrated (the raw readout is reported).",
+    )
+    escalate_below: dict[FastAnswerType, EscalateBelow] = Field(
+        default_factory=dict,
+        description="Per answer type, 0-100: an options.mode 'adaptive' criterion on this "
+                    "entry escalates to the escalation model's reasoned call when the "
+                    "readout's confidence (the headline, after calibration) is under it, "
+                    "unless the criterion sends options.escalate_below. A type left out is "
+                    "config.FAST_DEFAULT_ESCALATE_BELOW (filled in at load).",
+    )
+
+    @field_validator("strip_markers")
+    @classmethod
+    def _markers(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(m, str) or not m for m in value):
+            raise ValueError("fast.strip_markers are non-empty strings")
+        return value
+
+    @model_validator(mode="after")
+    def _body(self) -> "FastConfig":
+        reserved = sorted(_FAST_RESERVED & set(self.extra_body))
+        if reserved:
+            raise ValueError(
+                f"fast.extra_body may not set {reserved} — the readout builder owns model / "
+                "messages / the token field (1) / logprobs / top_logprobs, the client reads "
+                "one non-streamed body, response_format and n are dropped, and "
+                "chat_template_kwargs is fast.chat_template_kwargs"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _every_threshold(self) -> "FastConfig":
+        """``escalate_below`` complete: every answer type, the default where
+        the entry left one out — so ``GET /models`` shows what will run."""
+        self.escalate_below = {
+            t: int(self.escalate_below.get(t, FAST_DEFAULT_ESCALATE_BELOW))
+            for t in FAST_ANSWER_TYPES
+        }
+        return self
+
+    def escalate_below_for(self, answer_type: str) -> int:
+        """The threshold an adaptive criterion of ``answer_type`` escalates
+        under on this entry (its ``options.escalate_below`` wins)."""
+        return int(self.escalate_below.get(answer_type, FAST_DEFAULT_ESCALATE_BELOW))
+
+    def public(self) -> dict[str, Any]:
+        """The GET /models ``fast`` block — never the body extras."""
+        return {
+            "top_logprobs": self.top_logprobs,
+            "min_coverage": self.min_coverage,
+            "max_unseen_mass": self.max_unseen_mass,
+            "calibrated": [t for t in FAST_ANSWER_TYPES if t in self.calibration],
+            "escalate_below": dict(self.escalate_below),
+        }
+
+
 class ModelEntry(_Strict):
     """One ``models:`` entry, as written in the file."""
 
@@ -337,6 +555,7 @@ class ModelEntry(_Strict):
     max_concurrent: int = Field(ge=1)
     text_char_budget: int = Field(ge=0)
     confidence: ConfidenceConfig = Field(default_factory=ConfidenceConfig)
+    fast: Optional[FastConfig] = None
 
     @field_validator("url")
     @classmethod
@@ -458,6 +677,11 @@ class ModelSpec:
     # body() for score calls, by llm.client (what to extract) and by
     # llm.confidence (the signals, the headline).
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    # The parsed `fast:` block, or None (fast / adaptive are then a 400 on
+    # this entry). Read by fast_body(), llm.client.call_readout (top_logprobs,
+    # min_coverage, max_unseen_mass), llm.prompts (strip_markers) and
+    # analysis.llm_eval (calibration, escalate_below).
+    fast: Optional[FastConfig] = None
     _headers: dict[str, str] = field(default_factory=dict, repr=False)
     limit: ConcurrencyLimit = field(init=False, repr=False)
 
@@ -512,6 +736,51 @@ class ModelSpec:
             out["chat_template_kwargs"] = kwargs
         return out
 
+    def fast_body(self, messages: list[dict]) -> dict[str, Any]:
+        """A one-token READOUT request body (``options.mode: "fast"``).
+
+        Beside :meth:`body`, from the entry's ``fast:`` block:
+
+          * the token field is set to 1 directly (``MaxTokens`` refuses
+            budgets under 16 — this is not a budget, it is the answer);
+          * no ``response_format`` (the answer is one bare token, not JSON),
+            no sampling ``n`` (an ``n`` in ``extra_body`` is dropped) and none
+            of the ``confidence`` request keys;
+          * the entry's ``extra_body`` (minus ``chat_template_kwargs`` and
+            ``n``), then ``logprobs: true, top_logprobs: fast.top_logprobs``,
+            then ``fast.extra_body`` (default ``{temperature: 0}``);
+          * ``chat_template_kwargs`` = the entry's own, WITHOUT its reasoning
+            key (``reasoning.key`` — a reasoning depth would turn thinking back
+            on), then ``fast.chat_template_kwargs`` merged LAST (the switch
+            that turns reasoning off, e.g. ``enable_thinking: false``).
+
+        Key order is model, messages, the token field, the extras, logprobs,
+        top_logprobs, the fast extras, chat_template_kwargs.
+
+        Raises:
+            ValueError: The entry has no ``fast:`` block.
+        """
+        if self.fast is None:
+            raise ValueError(f"model {self.id!r} has no fast block in models.yaml")
+        out: dict[str, Any] = {
+            "model": self.served_name,
+            "messages": messages,
+            self.token_param: 1,
+        }
+        out.update({
+            k: v for k, v in self.extra_body.items() if k not in ("chat_template_kwargs", "n")
+        })
+        out["logprobs"] = True
+        out["top_logprobs"] = int(self.fast.top_logprobs)
+        out.update(self.fast.extra_body)
+        kwargs = dict(self.extra_body.get("chat_template_kwargs") or {})
+        if self.reasoning.get("style") == "chat_template_kwargs":
+            kwargs.pop(self.reasoning["key"], None)
+        kwargs.update(self.fast.chat_template_kwargs)
+        if kwargs:
+            out["chat_template_kwargs"] = kwargs
+        return out
+
     # ── What it supports ──────────────────────────────────────────────────
     @property
     def supports_boxes(self) -> bool:
@@ -525,8 +794,17 @@ class ModelSpec:
     def supports_contrastive(self) -> bool:
         return self.vision and self.max_images_per_prompt >= 3
 
+    @property
+    def supports_fast(self) -> bool:
+        """Whether ``options.mode: "fast"`` may run here (a ``fast:`` block)."""
+        return self.fast is not None
+
     def public(self) -> dict[str, Any]:
-        """The GET /models entry. Never a key value — only whether there is one."""
+        """The GET /models entry. Never a key value — only whether there is one.
+
+        ``fast`` is null without a ``fast:`` block, else ``{top_logprobs,
+        min_coverage, max_unseen_mass, calibrated: [answer types],
+        escalate_below: {answer type: 0-100}}`` — never the body extras."""
         parts = urlsplit(self.url)
         return {
             "id": self.id,
@@ -543,6 +821,7 @@ class ModelSpec:
                 "references": self.supports_references,
                 "contrastive_references": self.supports_contrastive,
                 "text_only_scoring": not self.vision,
+                "fast": self.supports_fast,
             },
             "reasoning": dict(self.reasoning),
             "text_char_budget": self.text_char_budget,
@@ -557,20 +836,55 @@ class ModelSpec:
                 "headline": self.confidence.headline,
                 "calibrated": self.confidence.calibration is not None,
             },
+            # The one-token readout (options.mode "fast" / "adaptive"): null =
+            # not here.
+            "fast": self.fast.public() if self.fast is not None else None,
+        }
+
+    def where(self) -> dict[str, Any]:
+        """``{id, host, authenticated, available}`` — where a request to this
+        entry goes (GET /models ``escalation``)."""
+        return {
+            "id": self.id,
+            "host": urlsplit(self.url).hostname,
+            "authenticated": self.authenticated,
+            "available": self.available,
         }
 
 
 class Registry:
-    """The loaded entries, by id, and the default."""
+    """The loaded entries, by id, the default and the escalation model.
 
-    def __init__(self, models: dict[str, ModelSpec], default: str, *, path: Optional[Path] = None):
+    ``escalation`` (``escalation_id``) is the ONE entry an ``options.mode:
+    "adaptive"`` criterion escalates to — ``CLASSIFIER_ESCALATION_MODEL``
+    (``config.ESCALATION_MODEL_ENV``), read by :func:`parse_registry`; None
+    here means the default. It is the same ``ModelSpec`` as its entry, so it
+    shares that entry's ``ConcurrencyLimit`` (and ``db.pool_max`` does not
+    change). It may be unavailable (its key unset): adaptive is then a 400 at
+    submit (``api.schemas.check_model_rules``)."""
+
+    def __init__(
+        self,
+        models: dict[str, ModelSpec],
+        default: str,
+        *,
+        path: Optional[Path] = None,
+        escalation: Optional[str] = None,
+    ):
         self.models = dict(models)
         self.default_id = default
         self.path = path
+        self.escalation_id = escalation or default
 
     @property
     def default(self) -> ModelSpec:
         return self.models[self.default_id]
+
+    @property
+    def escalation(self) -> ModelSpec:
+        """The entry an adaptive criterion escalates to (the default when
+        ``CLASSIFIER_ESCALATION_MODEL`` is unset)."""
+        return self.models[self.escalation_id]
 
     def ids(self) -> list[str]:
         return list(self.models)
@@ -608,14 +922,24 @@ class Registry:
             raise ValueError(f"model {model_id!r} is unavailable: {spec.unavailable_reason}")
         return spec
 
+    def fast_ids(self) -> list[str]:
+        """The ids ``options.mode: "fast"`` (and the readout of ``"adaptive"``)
+        may run on: entries with a ``fast:`` block that are available, in file
+        order."""
+        return [mid for mid, spec in self.models.items() if spec.supports_fast and spec.available]
+
     def total_concurrency(self) -> int:
-        """Σ max_concurrent — every request slot the registry can hold at once."""
+        """Σ max_concurrent — every request slot the registry can hold at once.
+        The escalation model is one of the entries, counted once."""
         return sum(spec.max_concurrent for spec in self.models.values())
 
     def public(self) -> dict[str, Any]:
-        """The GET /models payload."""
+        """The GET /models payload: ``{default, escalation: {id, host,
+        authenticated, available}, models: [...]}`` — ``escalation`` says
+        where an adaptive criterion may send its pages."""
         return {
             "default": self.default_id,
+            "escalation": self.escalation.where(),
             "models": [spec.public() for spec in self.models.values()],
         }
 
@@ -698,6 +1022,7 @@ def _build(model_id: str, entry: ModelEntry, env: Mapping[str, str]) -> ModelSpe
         available=available,
         unavailable_reason=reason,
         confidence=entry.confidence,
+        fast=entry.fast,
         _headers=headers,
     )
 
@@ -705,7 +1030,16 @@ def _build(model_id: str, entry: ModelEntry, env: Mapping[str, str]) -> ModelSpe
 def parse_registry(
     data: Any, *, env: Optional[Mapping[str, str]] = None, path: Optional[Path] = None
 ) -> Registry:
-    """A parsed YAML document → ``Registry``. Raises ``RegistryError``."""
+    """A parsed YAML document → ``Registry``. Raises ``RegistryError``.
+
+    ``env`` (default ``os.environ``) gives each entry's API key and
+    ``CLASSIFIER_ESCALATION_MODEL`` (``config.ESCALATION_MODEL_ENV``): the
+    entry adaptive criteria escalate to — unset or empty is the default; an
+    id that is not an entry is a ``RegistryError``. Every check here is on
+    STATIC facts — the file and the env mapping: nothing resolves a host or
+    opens a connection (the image build and the offline test registries
+    call this, and a DNS lookup would fail them whenever the target is
+    down). An unavailable escalation entry loads; ``startup_check`` warns."""
     env = os.environ if env is None else env
     where = str(path) if path else "models.yaml"
     try:
@@ -713,7 +1047,14 @@ def parse_registry(
     except ValidationError as exc:
         raise RegistryError(f"{where} is not a valid model registry: {_format(exc)}") from None
     specs = {mid: _build(mid, entry, env) for mid, entry in parsed.models.items()}
-    registry = Registry(specs, parsed.default, path=path)
+    escalation = (env.get(ESCALATION_MODEL_ENV) or "").strip() or None
+    if escalation is not None and escalation not in specs:
+        raise RegistryError(
+            f"{ESCALATION_MODEL_ENV}={escalation!r} names no entry in {where} (models: "
+            f"{list(specs)}) — set it to one of them, or leave it empty for the default "
+            f"{parsed.default!r}"
+        )
+    registry = Registry(specs, parsed.default, path=path, escalation=escalation)
     if not registry.default.available:
         raise RegistryError(
             f"{where}: the default model {parsed.default!r} is unavailable — "
@@ -765,8 +1106,11 @@ def removed_env_set(env: Optional[Mapping[str, str]] = None) -> list[str]:
 
 
 def startup_check() -> Registry:
-    """Load the registry (raising ``RegistryError`` for a bad file), log what
-    loaded, and warn once about removed env vars still set."""
+    """Load the registry (raising ``RegistryError`` for a bad file or an
+    unknown ``CLASSIFIER_ESCALATION_MODEL``), log what loaded — the default
+    marked ``[default]``, the escalation model ``[escalation]`` — warn once
+    about removed env vars still set, and warn when the escalation model is
+    unavailable (adaptive criteria are then refused at submit)."""
     registry = get_registry()
     stale = removed_env_set()
     if stale:
@@ -777,12 +1121,23 @@ def startup_check() -> Registry:
         )
     for spec in registry.models.values():
         logger.info(
-            "models: %s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs "
-            "confidence=%s/%s%s",
+            "models: %s%s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs "
+            "confidence=%s/%s fast=%s%s",
             spec.id, " [default]" if spec.id == registry.default_id else "",
+            " [escalation]" if spec.id == registry.escalation_id else "",
             urlsplit(spec.url).hostname, spec.served_name, spec.vision,
             spec.max_images_per_prompt, spec.max_concurrent, spec.timeout_s,
             spec.confidence.method, spec.confidence.headline,
+            f"top{spec.fast.top_logprobs}" if spec.fast is not None else "no",
             "" if spec.available else f" UNAVAILABLE: {spec.unavailable_reason}",
+        )
+    escalation = registry.escalation
+    if not escalation.available:
+        logger.warning(
+            "models: the escalation model %s [escalation] (%s) is unavailable — %s; "
+            "options.mode 'adaptive' is refused at submit until it is available or %s "
+            "names another entry",
+            escalation.id, ESCALATION_MODEL_ENV, escalation.unavailable_reason,
+            ESCALATION_MODEL_ENV,
         )
     return registry

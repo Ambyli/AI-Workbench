@@ -37,7 +37,13 @@ from analysis.result_specs import (
     with_metric,
 )
 from api.schemas import CriterionInput
-from config import DETAIL_FLOAT_DECIMALS, DETECTOR_STRONG_SCORE
+from config import (
+    DETAIL_FLOAT_DECIMALS,
+    DETECTOR_STRONG_SCORE,
+    SCORE_HI,
+    SCORE_LO,
+    SCORE_PASS_MIN,
+)
 # Imported as a module, not by name: `detector_client.is_configured()` reads
 # DETECTOR_URL at call time, which is what lets a test point it at a stub.
 from detector import client as detector_client
@@ -107,9 +113,10 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
     """Score one criterion from the detector's boxes alone — no LLM call.
 
     The rubric mirrors the rest of the service. A box at or above
-    ``DETECTOR_STRONG_SCORE`` is a clear PASS (10); a box above the floor but
-    below it is a real finding that should not be built on (7 — PASS, same
-    meaning as everywhere else); nothing at all is a FAIL (1).
+    ``DETECTOR_STRONG_SCORE`` is a clear PASS (``SCORE_HI``, 10); a box above
+    the floor but below it is a real finding that should not be built on
+    (``SCORE_PASS_MIN``, 7 — PASS, same meaning as everywhere else); nothing
+    at all is a FAIL (``SCORE_LO``, 1).
 
     **No LLM second opinion on a negative.** A criterion the detector looked
     for and did not find is FAILed here. If you want the model's opinion, ask
@@ -118,7 +125,7 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
     if not regions:
         return Outcome(
             method="detector",
-            score=1,
+            score=SCORE_LO,
             verdict="FAIL",
             # The floor is what we asked for, so "nothing above it" is a
             # statement about the floor as much as about the document.
@@ -136,7 +143,7 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
         )
 
     best = max(float(r.score or 0.0) for r in regions)
-    score = 10 if best >= DETECTOR_STRONG_SCORE else 7
+    score = SCORE_HI if best >= DETECTOR_STRONG_SCORE else SCORE_PASS_MIN
     return Outcome(
         method="detector",
         score=score,
@@ -144,8 +151,8 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
         confidence=int(round(min(1.0, best) * 100)),
         reason=(
             f"The open-vocabulary detector found {len(regions)} '{name}' box(es); "
-            f"best confidence {best:.2f} (>={DETECTOR_STRONG_SCORE:.2f} scores 10, "
-            f"above the {threshold:.2f} floor scores 7)."
+            f"best confidence {best:.2f} (>={DETECTOR_STRONG_SCORE:.2f} scores {SCORE_HI}, "
+            f"above the {threshold:.2f} floor scores {SCORE_PASS_MIN})."
         ),
         detail=with_metric(
             {

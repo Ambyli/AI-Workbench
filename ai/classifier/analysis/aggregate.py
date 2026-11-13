@@ -41,6 +41,12 @@ The rules around the rules:
     already carries its own ``page = item``), whatever the rule picked, and
     whether or not the criterion is scored: a ``score: false`` criterion
     aggregates geometry and never a judgement.
+  * **Rebuilt keys are rebuilt, whatever the rule.** A ``detail`` key
+    declared with ``rebuild=`` (``result_specs.FieldSpec`` — today an
+    adaptive llm criterion's ``escalations`` tally) is rebuilt from every
+    counted member by ``result_specs.aggregated_detail`` at both levels,
+    never copied from the chosen or first member; the excluded (skipped /
+    errored) members are not counted, as in ``values``.
   * **The LLM loop's record merges.** One member: its ``localization`` as-is.
     Several: every attempt, tagged with its ``item``, the total ``calls``,
     and ``accepted`` listing ``{"item", "attempt"}`` per accepted box
@@ -74,7 +80,7 @@ from analysis.outcome import Outcome
 from analysis.result_specs import aggregated_detail, member_value, with_metric
 from analysis.text_eval import score_text
 from api.schemas import CriterionInput
-from config import DETAIL_FLOAT_DECIMALS
+from config import DETAIL_FLOAT_DECIMALS, SCORE_HI, SCORE_LO
 from utils import verdict_from_score
 
 
@@ -207,7 +213,7 @@ def aggregate_level(
     if which == "mean":
         scores = [float(m.outcome.score) for m in scored]
         mean = sum(scores) / len(scores)
-        score = max(1, min(10, round(mean)))
+        score = max(SCORE_LO, min(SCORE_HI, round(mean)))
         confidences = [m.outcome.confidence for m in scored if m.outcome.confidence is not None]
         # `value` is the mean of the members' headline numbers — their
         # measurement (cv), count (text), best box (detector) or score (llm).

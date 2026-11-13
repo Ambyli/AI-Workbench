@@ -11,7 +11,16 @@ other:
                             EXAMPLES (``ReferenceExample``), each a captioned
                             image with its known answer. The answer is one
                             flat JSON object — score, verdict, confidence,
-                            reason.
+                            reason. With ``style="fast"`` (an llm
+                            criterion's ``options.mode: "fast"``) the same
+                            prefix asks for ONE digit 0-9 instead (score =
+                            digit + 1), reasoning off, read from the token's
+                            probabilities (``ModelSpec.fast_body``,
+                            ``llm.client.call_readout``) — wording in
+                            config.py § Prompt wording (``FAST_*``).
+    strip_markers()       — a fast prompt's caller text minus the entry's
+                            ``fast.strip_markers`` (template markers that
+                            would turn reasoning back on).
     ReferenceExample      — one example as the prompt needs it: a plain
                             dataclass, so ``llm`` never imports ``references``.
     build_bbox_prompt()   — the enforcement loop's "where is it?": one
@@ -107,18 +116,28 @@ from cache. The text block used to sit after the criterion, which made vLLM
 re-prefill up to ~15k tokens of identical text per criterion. Keep it first;
 ``classifier_llm_cached_prompt_tokens_total{kind="score"}`` shows the saving.
 
-The rubric strings (HINT_RUBRICS) and the extracted-text block heading
-(DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, and the wording
-the examples add (captions, guards, headings, system sentences —
-``REFERENCE_GUARD``, ``BOX_CAPTIONS`` and the rest) in config.py § Prompt
-wording — the reference examples, beside the box loop's opt-in wording (an
-example's text ``BOX_CAPTION_TEXT``, the marks ask ``MARKS_*``, the verify's
-``VERIFY_PARTIAL_*``), so prompt wording can be tuned without touching the
-assembly logic here. This module imports those names, so
-``from llm.prompts import BOX_CANDIDATE_HEADING`` still works.
+The rubric strings (HINT_RUBRICS), the extracted-text block heading
+(DOCUMENT_TEXT_HEADING) and the scoring system prompt's sentences — the
+opening one (SCORING_ROLE_SENTENCE), the four source sentences
+(``SCORING_*_SENTENCE``, three of them shared by the reasoned and fast
+prompts), the confidence sentence (SCORING_CONFIDENCE_SENTENCE) and
+JSON_ONLY_SENTENCE, which also ends every small call's system prompt — live
+in config.py § LLM prompt text, and the wording the examples add (captions,
+guards, headings, system sentences — ``REFERENCE_GUARD``,
+``REFERENCE_SYSTEM_SENTENCE``, ``BOX_CAPTIONS`` and the rest) in config.py
+§ Prompt wording — the reference examples, beside the box loop's opt-in
+wording (an example's text ``BOX_CAPTION_TEXT``, the marks ask ``MARKS_*``,
+the verify's ``VERIFY_PARTIAL_*``) and the fast readout's (``FAST_*``), so
+prompt wording can be tuned without touching the assembly logic here;
+``style``'s values are ``config.PROMPT_STYLES`` (an adaptive criterion's
+readout is the fast prompt, its escalation the reasoned one). This module
+imports those names, so ``from llm.prompts import BOX_CANDIDATE_HEADING``
+still works.
 ``SCORING_SCAFFOLD`` stays here: it is the answer contract ``llm.validate``
 parses, not wording — as does ``MARKS_SCAFFOLD``, the one ``llm.boxes``
-parses.
+parses. So does the wording built around per-call values: the scoring
+call's user turn (its context line, the truncation note, the "Score this
+one criterion…" instruction) and the small calls' own sentences.
 
 Process flow position: called by ``analysis.llm_eval`` (the scoring prompt),
 ``llm.boxes`` (the loop's ask, refine — grid or marks — and verify) and
@@ -137,16 +156,30 @@ from config import (
     BOX_REFERENCE_GUARD,
     BOX_SYSTEM_SENTENCE,
     CANDIDATE_HEADING,
+    DEFAULT_MODE,
     DOCUMENT_TEXT_HEADING,
+    FAST_INSTRUCTION,
+    FAST_RUBRICS,
+    FAST_SYSTEM_LINE,
+    FAST_TEXT_ONLY_SENTENCE,
     HINT_RUBRICS,
+    JSON_ONLY_SENTENCE,
     LLM_BBOX_GRID,
     MARKS_FEEDBACK_HEADING,
     MARKS_PROMPT,
     MARKS_REFERENCE_GUARD,
     MARKS_SYSTEM_PROMPT,
+    PROMPT_STYLES,
     REFERENCE_BOX_TEXT_MAX_CHARS,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_GUARD,
+    REFERENCE_SYSTEM_SENTENCE,
+    SCORING_CONFIDENCE_SENTENCE,
+    SCORING_IMAGE_AND_TEXT_SENTENCE,
+    SCORING_IMAGE_ONLY_SENTENCE,
+    SCORING_NO_IMAGE_SENTENCE,
+    SCORING_ROLE_SENTENCE,
+    SCORING_TEXT_ONLY_SENTENCE,
     VERIFY_CANDIDATE_HEADING,
     VERIFY_PARTIAL_QUESTION,
     VERIFY_PARTIAL_SCAFFOLD,
@@ -293,6 +326,22 @@ def _example_parts(references: list[BoxExample]) -> list[dict]:
     return parts
 
 
+def strip_markers(text: str, markers) -> str:
+    """``text`` with every one of ``markers`` removed (a fast prompt's
+    ``fast.strip_markers``: chat-template markers that would turn reasoning
+    back on). Repeated until none is left, so a marker split around another
+    (``<|think<|think_on|>_on|>``) cannot reassemble."""
+    if not text or not markers:
+        return text
+    previous = None
+    while previous != text:
+        previous = text
+        for marker in markers:
+            if marker:
+                text = text.replace(marker, "")
+    return text
+
+
 def build_llm_prompt(
     image_b64: str | None,
     name: str,
@@ -303,8 +352,23 @@ def build_llm_prompt(
     text_truncated: bool = False,
     references: Optional[list[ReferenceExample]] = None,
     model: Optional[ModelSpec] = None,
+    style: str = DEFAULT_MODE,
 ) -> dict:
     """Assemble the chat completion request for ONE criterion.
+
+    ``style`` is ``"reasoned"`` (the default: everything below, byte for byte
+    what it always was) or ``"fast"`` (``options.mode: "fast"``): the same
+    layout — system prompt, page image, context line, DOCUMENT TEXT block —
+    so every fast criterion on a page shares that prefix, then the digit
+    rubric (``config.FAST_RUBRICS``), ``CRITERION:`` and
+    ``FAST_INSTRUCTION`` ("Answer with one digit."); the system prompt ends
+    in ``FAST_SYSTEM_LINE`` instead of the confidence / JSON sentences
+    (``SCORING_CONFIDENCE_SENTENCE``, ``JSON_ONLY_SENTENCE``), a
+    ``system_line`` model's reasoning line is NOT appended, the entry's
+    ``fast.strip_markers`` are removed from the criterion name and the text
+    layer, and the body is ``ModelSpec.fast_body`` (one token, logprobs, no
+    response_format). A fast prompt takes no ``references`` (a readout is
+    never guided) and needs a model with a ``fast:`` block.
 
     The user text is laid out context line → DOCUMENT TEXT block → rubric →
     ``CRITERION:`` → instructions + answer scaffold, so system prompt, image,
@@ -339,11 +403,26 @@ def build_llm_prompt(
         text_truncated: True when document_text was cut at the char budget.
         references:     Worked examples to show before the candidate.
         model:          The registry entry the request is for (None: default).
+        style:          "reasoned" (default) | "fast".
 
     Returns:
         A dict ready to POST to the model's chat-completions endpoint.
+
+    Raises:
+        ValueError: ``style`` is unknown, or "fast" with references or on a
+            model without a ``fast:`` block.
     """
     spec = _model(model)
+    if style not in PROMPT_STYLES:
+        raise ValueError(f"style must be 'reasoned' or 'fast', got {style!r}")
+    fast = style == "fast"
+    if fast:
+        if spec.fast is None:
+            raise ValueError(f"model {spec.id!r} has no fast block in models.yaml")
+        if references:
+            raise ValueError("a fast readout is never reference-guided")
+        name = strip_markers(name, spec.fast.strip_markers)
+        document_text = strip_markers(document_text, spec.fast.strip_markers)
     # A text-only model reads the text of an image page; the page itself is
     # not sent.
     text_only_page = bool(image_b64) and not spec.vision
@@ -360,7 +439,8 @@ def build_llm_prompt(
         len(document_text),
     )
 
-    rubric_def = HINT_RUBRICS.get(hint) or HINT_RUBRICS["auto"]
+    rubrics = FAST_RUBRICS if fast else HINT_RUBRICS
+    rubric_def = rubrics.get(hint) or rubrics["auto"]
     rubric = f"{rubric_def['heading']}:\n  {rubric_def['rubric']}"
     if rubric_def["extra"]:
         rubric += f"\n  {rubric_def['extra']}"
@@ -398,6 +478,12 @@ def build_llm_prompt(
             "---\n"
         )
 
+    if fast:
+        return _fast_prompt(
+            spec, image_b64, name, document_text, rubric,
+            context_line=context_line, text_block=text_block, text_only_page=text_only_page,
+        )
+
     scaffold = json.dumps(SCORING_SCAFFOLD, indent=2)
     # ORDER IS DELIBERATE — prefix caching. Everything up to the rubric
     # (system prompt, page image, context line, DOCUMENT TEXT block) depends
@@ -420,43 +506,16 @@ def build_llm_prompt(
         f"{scaffold}"
     )
 
-    if text_only_page:
-        source_sentence = (
-            "You are given one page of a document as extracted text only — you cannot "
-            "see the page. Judge the criterion from that text; a criterion about how the "
-            "page LOOKS cannot be judged from it, so say so and score it 5 (uncertain). "
-            "The text may be OCR output and can contain recognition errors — judge "
-            "meaning, not exact spelling. "
-        )
-    elif document_text.strip():
-        # Both modalities are available: say so explicitly, and warn that the
-        # text may be OCR output so the model treats near-misses sensibly.
-        source_sentence = (
-            "You are given a document as an image and as extracted text. Use BOTH: "
-            "the image for anything visual (legibility, lighting, framing, stamps, "
-            "signatures) and the text for anything about content (wording, amounts, "
-            "dates, clauses). The text may be OCR output and can contain recognition "
-            "errors — judge meaning, not exact spelling. "
-            if image_b64
-            else
-            "You are given a document as extracted text only — it has no page image. "
-            "Judge the criterion from that text. It may be OCR output and can "
-            "contain recognition errors — judge meaning, not exact spelling. "
-        )
-    else:
-        source_sentence = "Analyze the provided image and score it against the criterion. "
+    source_sentence = _source_sentence(image_b64, document_text, text_only_page)
 
     system_prompt = (
-        "You are a document assessment expert. "
+        f"{SCORING_ROLE_SENTENCE}"
         f"{source_sentence}"
-        "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
-        "Return ONLY a valid JSON object."
+        f"{SCORING_CONFIDENCE_SENTENCE}"
+        f"{JSON_ONLY_SENTENCE}"
     )
     if references:
-        system_prompt += (
-            " Reference examples with known answers come first; score ONLY the image "
-            "marked CANDIDATE."
-        )
+        system_prompt += f" {REFERENCE_SYSTEM_SENTENCE}"
     # Reasoning depth normally rides in the body (chat_template_kwargs, see
     # the module docstring); only a `system_line` model gets a line here.
     system_prompt = _system_prompt(system_prompt, spec)
@@ -496,6 +555,70 @@ def build_llm_prompt(
             {"role": "user", "content": user_content},
         ],
         "score",
+    )
+
+
+def _source_sentence(image_b64: str | None, document_text: str, text_only_page: bool) -> str:
+    """The scoring system prompt's sentence about what the model is given —
+    the page image, its text, or both (config.py § LLM prompt text:
+    ``SCORING_TEXT_ONLY_SENTENCE``, ``SCORING_IMAGE_AND_TEXT_SENTENCE``,
+    ``SCORING_NO_IMAGE_SENTENCE``, ``SCORING_IMAGE_ONLY_SENTENCE``; the fast
+    prompt swaps only the text-only one, ``FAST_TEXT_ONLY_SENTENCE``)."""
+    if text_only_page:
+        return SCORING_TEXT_ONLY_SENTENCE
+    if document_text.strip():
+        # Both modalities are available: say so explicitly, and warn that the
+        # text may be OCR output so the model treats near-misses sensibly.
+        return SCORING_IMAGE_AND_TEXT_SENTENCE if image_b64 else SCORING_NO_IMAGE_SENTENCE
+    return SCORING_IMAGE_ONLY_SENTENCE
+
+
+def _fast_prompt(
+    spec: ModelSpec,
+    image_b64: str | None,
+    name: str,
+    document_text: str,
+    rubric: str,
+    *,
+    context_line: str,
+    text_block: str,
+    text_only_page: bool,
+) -> dict:
+    """``build_llm_prompt(style="fast")``'s request: the reasoned prompt's
+    layout (image, context line, DOCUMENT TEXT block first — the cached
+    prefix), then the digit rubric, ``CRITERION:`` and ``FAST_INSTRUCTION``;
+    ``ModelSpec.fast_body``. The name and the text arrive with the entry's
+    ``fast.strip_markers`` already removed, and ``rubric`` is the hint's
+    ``FAST_RUBRICS`` entry (heading, rubric, extra)."""
+    user_text = (
+        f"{context_line}"
+        f"{text_block}\n\n"
+        f"{rubric}\n\n"
+        f"CRITERION: {name}\n\n"
+        f"{FAST_INSTRUCTION}"
+    )
+    source_sentence = (
+        FAST_TEXT_ONLY_SENTENCE if text_only_page
+        else _source_sentence(image_b64, document_text, text_only_page)
+    )
+    # No reasoning line, even for a `system_line` model: the readout is the
+    # answer with reasoning OFF (fast.chat_template_kwargs), and a reasoning
+    # line would ask for the opposite.
+    system_prompt = f"{SCORING_ROLE_SENTENCE}{source_sentence}{FAST_SYSTEM_LINE}"
+    user_content: list[dict] = []
+    if image_b64:
+        user_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+            }
+        )
+    user_content.append({"type": "text", "text": user_text})
+    return spec.fast_body(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
     )
 
 
@@ -630,7 +753,7 @@ def build_bbox_prompt(
 
     system_prompt = (
         "You locate features in images. You answer with coordinates "
-        "and nothing else. Return ONLY a valid JSON object."
+        f"and nothing else. {JSON_ONLY_SENTENCE}"
     )
     user_content: list[dict] = []
     if references:
@@ -766,7 +889,7 @@ def build_verify_prompt(
     )
     system_prompt = (
         "You say what is in an image crop. You judge only the crop "
-        "you are shown. Return ONLY a valid JSON object."
+        f"you are shown. {JSON_ONLY_SENTENCE}"
     )
     user_content: list[dict] = []
     if references:
@@ -913,7 +1036,7 @@ def build_describe_prompt(
                 "role": "system",
                 "content": _system_prompt(
                     "You write short, factual catalogue descriptions of images. "
-                    "Return ONLY a valid JSON object.",
+                    f"{JSON_ONLY_SENTENCE}",
                     model,
                 ),
             },
@@ -990,7 +1113,7 @@ def build_reference_selection_prompt(
                 "role": "system",
                 "content": _system_prompt(
                     "You match an image to stored reference examples. You rank catalogue "
-                    "entries; you do not score the image. Return ONLY a valid JSON object.",
+                    f"entries; you do not score the image. {JSON_ONLY_SENTENCE}",
                     model,
                 ),
             },

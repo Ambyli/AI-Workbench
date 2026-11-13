@@ -65,6 +65,7 @@ from config import (
     ACCEPTED_CONTENT_TYPES,
     BLOCKED_NETWORKS,
     FETCH_TIMEOUT,
+    FETCH_USER_AGENT,
     HTTP_CONNECT_TIMEOUT,
     MAX_ITEMS,
     MIN_IMAGE_HEIGHT,
@@ -73,19 +74,16 @@ from config import (
     SVG_FETCH_MAX_BYTES,
     SVG_FETCH_MAX_IMAGES,
     SVG_FETCH_TIMEOUT_S,
+    SVG_WARNING_URL_MAX_CHARS,
 )
 from logger import logger
-
-# Sent with every fetch: some servers 403 httpx's default User-Agent.
-_USER_AGENT = {"User-Agent": "Classifier/1.0"}
-# A URL in a warning is cut to this many characters (the loader's own
-# "not rendered" lines use the same bound).
-_WARNING_URL_CHARS = 200
 
 # ACCEPTED_CONTENT_TYPES lives in config.py (§ Document analysis constants)
 # with the rest of the tunables; the SSRF blocklist itself (BLOCKED_NETWORKS)
 # lives there too (§ SSRF blocklist), seeded from
-# common.net.DEFAULT_BLOCKED_NETWORKS.
+# common.net.DEFAULT_BLOCKED_NETWORKS; so do the fetch's User-Agent
+# (FETCH_USER_AGENT, § LLM call behaviour) and the warnings' URL cut
+# (SVG_WARNING_URL_MAX_CHARS, § SVG external images).
 
 
 def validate_content_type(content_type: str | None) -> None:
@@ -278,6 +276,7 @@ def load_document_bytes(
             render_dpi=PDF_RENDER_DPI,
             image_decoder=_decode_image_bgr,
             keep_source=keep_source,
+            max_warning_url_chars=SVG_WARNING_URL_MAX_CHARS,
         )
     except UnsupportedDocumentError as exc:
         logger.warning("load_document_bytes: rejected %s: %s", filename, exc)
@@ -341,6 +340,7 @@ def load_document_page(
             render_dpi=PDF_RENDER_DPI,
             image_decoder=_decode_image_bgr,
             keep_source=keep_source,
+            max_warning_url_chars=SVG_WARNING_URL_MAX_CHARS,
         )
     except UnsupportedDocumentError as exc:
         logger.warning("load_document_page: rejected %s: %s", filename, exc)
@@ -389,10 +389,11 @@ async def load_input_bytes(data: str, type_: str) -> bytes:
 
     For URL inputs: ``common.net.fetch_url`` performs the SSRF check before
     fetching, refuses redirects (a 3xx could point past the check), and the
-    request carries a descriptive User-Agent to avoid 403 responses from
-    servers that block default request libraries. No size cap — the item cap
-    and the payload store bound what a document can cost — and the same
-    FETCH_TIMEOUT / HTTP_CONNECT_TIMEOUT per-operation timeouts as always.
+    request carries a descriptive User-Agent (``config.FETCH_USER_AGENT``) to
+    avoid 403 responses from servers that block default request libraries.
+    No size cap — the item cap and the payload store bound what a document
+    can cost — and the same FETCH_TIMEOUT / HTTP_CONNECT_TIMEOUT
+    per-operation timeouts as always.
 
     Args:
         data:  Base64 string, URL string, or the document text itself.
@@ -429,7 +430,7 @@ async def load_input_bytes(data: str, type_: str) -> bytes:
                 timeout=FETCH_TIMEOUT,
                 connect_timeout=HTTP_CONNECT_TIMEOUT,
                 blocked_networks=BLOCKED_NETWORKS,
-                headers=_USER_AGENT,
+                headers={"User-Agent": FETCH_USER_AGENT},
             )
             logger.debug("load_input_bytes: fetched %d bytes from URL", len(raw))
         except BlockedURLError as exc:
@@ -454,7 +455,9 @@ async def load_input_bytes(data: str, type_: str) -> bytes:
 
 
 def _short(url: str) -> str:
-    return url if len(url) <= _WARNING_URL_CHARS else url[:_WARNING_URL_CHARS] + "…"
+    if len(url) <= SVG_WARNING_URL_MAX_CHARS:
+        return url
+    return url[:SVG_WARNING_URL_MAX_CHARS] + "…"
 
 
 async def _fetch_svg_image(url: str) -> tuple[Optional[str], Optional[str]]:
@@ -475,7 +478,7 @@ async def _fetch_svg_image(url: str) -> tuple[Optional[str], Optional[str]]:
             deadline=SVG_FETCH_TIMEOUT_S,
             max_bytes=SVG_FETCH_MAX_BYTES,
             blocked_networks=BLOCKED_NETWORKS,
-            headers=_USER_AGENT,
+            headers={"User-Agent": FETCH_USER_AGENT},
         )
     except BlockedURLError as exc:
         return None, f"blocked: {str(exc).rstrip('.')}"

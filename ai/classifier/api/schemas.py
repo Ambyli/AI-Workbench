@@ -19,7 +19,16 @@ caller and a multipart caller can never be treated differently:
 
 A criterion's top level is only what every type shares — ``name``, ``type``,
 ``weight``, ``depends_on``, ``score``; everything type-specific is in
-``options``, validated per type by ``api.criterion_options``. The optional
+``options``, validated per type by ``api.criterion_options`` — ``mode``
+included: a ``mode`` on the request or at a criterion's top level, and
+``options.mode`` / ``options.escalate_below`` on a cv / text / detector
+criterion, are each a named 400, and ``options.mode: "fast"`` /
+``"adaptive"`` on a model without a ``fast:`` block (and adaptive with an
+unavailable escalation model) is ``check_model_rules``'. Four questions are
+kept apart: ``answered_by_model()`` (the model rules apply), ``is_fast()``
+/ ``is_adaptive()`` (the one-token readout alone / with escalation;
+``reads_out()`` either), and ``guided_by_llm()`` (references can guide it —
+a fast or adaptive criterion cannot). The optional
 ``key`` is a caller's label used ONLY to match reference examples
 (``references.resolve``): never shown to the model, never a file name, and
 results, ``depends_on`` and prompts stay on ``name``. The
@@ -62,9 +71,24 @@ from api.criterion_options import (
     answered_by_llm,
     can_locate,
     check_model_id,
+    guided_by_references,
+    is_adaptive,
+    is_fast,
+    reads_out,
 )
 from config import (
+    ADAPTIVE_ESCALATION_UNAVAILABLE,
+    ADAPTIVE_NOT_GUIDED,
     DEFAULT_CRITERIA,
+    ESCALATE_BELOW_NOT_LLM,
+    FAST_NOT_GUIDED,
+    MODE_IN_OPTIONS,
+    MODE_NOT_REQUEST_LEVEL,
+    MODE_REFUSED_BY_TYPE,
+    READOUT_ADAPTIVE_STARTS,
+    READOUT_MODEL_SOURCE,
+    READOUT_NO_FAST_BLOCK,
+    READOUT_NONE_CAPABLE,
     REFERENCE_MAX_PER_REQUEST,
     REFERENCE_MAX_TAGS,
     REFERENCE_TAG_MAX_CHARS,
@@ -201,8 +225,11 @@ class CriterionInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _legacy_keys(cls, data: Any) -> Any:
-        """Name the old top-level keys instead of a bare 'extra inputs' error."""
+        """Name the old top-level keys instead of a bare 'extra inputs' error
+        — and ``mode``, which was never top-level but belongs in options."""
         if isinstance(data, dict):
+            if "mode" in data:
+                raise ValueError(MODE_IN_OPTIONS)
             stray = [k for k in data if k in LEGACY_TOP_LEVEL_KEYS]
             if stray:
                 raise ValueError(
@@ -231,13 +258,24 @@ class CriterionInput(BaseModel):
             raise ValueError(f"options must be an object, got {type(raw).__name__}")
         if "reference" in raw and self.type in ("text", "detector"):
             raise ValueError(f"options.reference: {NOT_GUIDED} (a {self.type} criterion)")
+        if "mode" in raw and self.type != "llm":
+            # Named per type (config.MODE_REFUSED_BY_TYPE), not a bare
+            # "extra inputs".
+            raise ValueError(f"options.mode: {MODE_REFUSED_BY_TYPE[self.type]}")
+        if "escalate_below" in raw and self.type != "llm":
+            raise ValueError(f"options.escalate_below: {ESCALATE_BELOW_NOT_LLM}")
         try:
             self.options = model.model_validate(raw)
         except ValidationError as exc:
             raise ValueError(_format_errors(exc, "options.")) from None
+        if self.type == "llm" and self.options.reference is not None:
+            if self.options.mode == "fast":
+                raise ValueError(f"options.reference: {FAST_NOT_GUIDED} ('{self.name}')")
+            if self.options.mode == "adaptive":
+                raise ValueError(f"options.reference: {ADAPTIVE_NOT_GUIDED} ('{self.name}')")
         if self.type == "text":
             _check_pattern(self.name, self.options)
-        if self.type == "cv" and not self.guided_by_llm():
+        if self.type == "cv" and not self.answered_by_model():
             answered = (
                 "an OpenCV detector" if get_detector(self.name) is not None
                 else "the detector service (options.fallback)"
@@ -262,10 +300,33 @@ class CriterionInput(BaseModel):
         """Whether this criterion can produce any geometry at all."""
         return can_locate(self.type, self.name, self.resolved_options())
 
-    def guided_by_llm(self) -> bool:
-        """Whether the vision model answers it — the only criteria a reference
-        can guide (``llm``, or a ``cv`` name answered by the llm fallback)."""
+    def answered_by_model(self) -> bool:
+        """Whether a registry model answers it (``llm``, or a ``cv`` name
+        answered by the llm fallback) — the criteria the model rules
+        (``check_model_rules``) apply to, fast ones included."""
         return answered_by_llm(self.type, self.name, self.resolved_options())
+
+    def is_fast(self) -> bool:
+        """Whether it answers by the one-token readout alone (``options.mode:
+        "fast"``)."""
+        return is_fast(self.type, self.resolved_options())
+
+    def is_adaptive(self) -> bool:
+        """Whether it answers by the readout and, when unsure, the escalation
+        model's reasoned call (``options.mode: "adaptive"``)."""
+        return is_adaptive(self.type, self.resolved_options())
+
+    def reads_out(self) -> bool:
+        """Whether it starts with the one-token readout (fast or adaptive):
+        its model needs a ``fast:`` block, and references never guide it."""
+        return reads_out(self.type, self.resolved_options())
+
+    def guided_by_llm(self) -> bool:
+        """Whether references can guide it: the model answers it
+        (:meth:`answered_by_model`) by its REASONED scoring call. A fast or
+        adaptive criterion is not guided — explicit and ``auto`` references
+        skip it with a note, and it is never a reference's example."""
+        return guided_by_references(self.type, self.name, self.resolved_options())
 
     def reference_options(self) -> Optional[dict[str, Any]]:
         """The resolved ``options.reference``, or None when it was not sent."""
@@ -274,7 +335,7 @@ class CriterionInput(BaseModel):
     def model_id(self, job_model: Optional[str] = None) -> Optional[str]:
         """The registry id this criterion's model calls go to: its own
         ``options.model``, else ``job_model``; None means the registry
-        default. Only meaningful when :meth:`guided_by_llm`."""
+        default. Only meaningful when :meth:`answered_by_model`."""
         return self.resolved_options().get("model") or job_model
 
     def scope(self) -> str:
@@ -395,6 +456,14 @@ class AssessRequest(BaseModel):
             "the references \"auto\" selection call. Omitted: the registry default."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_request_mode(cls, data: Any) -> Any:
+        """A request-level ``mode`` is a named 400, not a bare 'extra inputs'."""
+        if isinstance(data, dict) and "mode" in data:
+            raise ValueError(MODE_NOT_REQUEST_LEVEL)
+        return data
 
     @field_validator("model")
     @classmethod
@@ -584,7 +653,22 @@ def check_model_rules(
       * ``references: "auto"`` with a text-only JOB model — its per-item
         selection call sends the page image;
       * ``require_vision`` (POST /references): any text-only model at all —
-        a reference is an image example, and its creation job locates on it.
+        a reference is an image example, and its creation job locates on it;
+      * ``options.mode: "fast"`` or ``"adaptive"`` (both start with the
+        readout) on an effective model with no ``fast:`` block in
+        ``models.yaml`` — named with where the model came from
+        (``options.model``, the request's ``model``, the registry default)
+        and the fast-capable ids;
+      * ``options.mode: "adaptive"`` while the escalation model
+        (``CLASSIFIER_ESCALATION_MODEL``, ``Registry.escalation``) is
+        unavailable — ``config.ADAPTIVE_ESCALATION_UNAVAILABLE``. Its other
+        capability rule — a text-only escalation model and a photo with no
+        OCR — needs the documents (``api.assess._check_documents``); the
+        box loop stays on the criterion's own model and references never
+        guide an adaptive criterion, so no other rule applies to it.
+
+    A fast or adaptive criterion is never guided, so the references rule
+    skips it.
 
     The one rule that needs the uploaded documents (a text-only model on an
     image-only document with no OCR) is ``api.assess._check_documents``'s.
@@ -603,11 +687,25 @@ def check_model_rules(
             "to a vision model"
         )
     for c in criteria:
-        if not c.guided_by_llm():
+        if not c.answered_by_model():
             continue
         spec = registry.resolve(c.model_id(job_model))
         opts = c.resolved_options()
         where = f"criterion {c.name!r} runs on model {spec.id!r}"
+        if c.reads_out() and spec.fast is None:
+            source = READOUT_MODEL_SOURCE[
+                "option" if opts.get("model") else "request" if job_model else "default"
+            ]
+            raise ValueError(READOUT_NO_FAST_BLOCK.format(
+                name=c.name, mode=opts.get("mode"), model=spec.id, source=source,
+                starts=READOUT_ADAPTIVE_STARTS if c.is_adaptive() else "",
+                capable=registry.fast_ids() or READOUT_NONE_CAPABLE,
+            ))
+        if c.is_adaptive() and not registry.escalation.available:
+            escalation = registry.escalation
+            raise ValueError(ADAPTIVE_ESCALATION_UNAVAILABLE.format(
+                name=c.name, model=escalation.id, reason=escalation.unavailable_reason,
+            ))
         if not spec.vision:
             if require_vision:
                 raise ValueError(
@@ -625,7 +723,7 @@ def check_model_rules(
                     f"{where}, which is text-only, so it cannot locate (options.boxes "
                     "sends page crops); drop boxes or pick a vision model"
                 )
-        if references and (opts.get("reference") or {}).get("use", True):
+        if references and c.guided_by_llm() and (opts.get("reference") or {}).get("use", True):
             if not spec.supports_references:
                 why = (
                     "is text-only" if not spec.vision

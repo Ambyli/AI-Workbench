@@ -42,7 +42,10 @@ which is why a ``score: false`` llm criterion has ``value: null``
                  (measurements, snippets, what text was sent) are in ``items[]``
     sum          (text) the full match record, counts added
 
-A single member passes through with no aggregate block.
+Under EVERY rule a REBUILT key (a field declared with ``rebuild=``, today the
+llm ``escalations`` tally) is then rebuilt from all the counted members'
+values by its declared combiner — never one member's value — and is kept
+under ``mean`` too. A single member passes through with no aggregate block.
 
 Process flow position: imported by the evaluators (to declare), by
 ``analysis.aggregate`` and ``analysis.scheduler`` (to look up), and by
@@ -71,13 +74,26 @@ class FieldSpec:
 
     description: str
     kind: str                       # JSON kind, one of KINDS
-    stable: bool = False            # same meaning on every member → kept under `mean`
+    # Same MEANING on every member → kept under `mean`, with the FIRST member's
+    # value (values may differ: `image_sent` across mixed documents, an
+    # adaptive criterion's `model` / `mode` — each unit's is in items[]).
+    stable: bool = False
     when: Optional[str] = None      # present only in this case; None = always present
     nullable: bool = False          # the value may be null (the description says when)
+    # A key every aggregate REBUILDS from all its counted members' values, under
+    # every rule (any / worst / all / mean / sum): `rebuild(values)` is the
+    # aggregate's value, so it is never one member's (`aggregated_detail`),
+    # and it is kept under `mean`. Served as `rebuilt: true`. A unit's value
+    # is its own; it must be one the combiner can take back in, so the levels
+    # nest (the documents level combines the per-document values).
+    rebuild: Optional[Callable[[list[Any]], Any]] = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"unknown kind {self.kind!r}; expected one of {sorted(KINDS)}")
+        if self.stable and self.rebuild is not None:
+            raise ValueError("a field is stable (the first member's value) or rebuilt "
+                             "(from every member), not both")
 
 
 @dataclass(frozen=True)
@@ -101,6 +117,9 @@ class ResultSpec:
     def stable(self) -> set[str]:
         return {k for k, f in self.fields.items() if f.stable}
 
+    def rebuilt(self) -> set[str]:
+        return {k for k, f in self.fields.items() if f.rebuild is not None}
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "metric": self.metric,
@@ -111,6 +130,7 @@ class ResultSpec:
                     "description": f.description,
                     **({"when": f.when} if f.when else {}),
                     **({"stable": True} if f.stable else {}),
+                    **({"rebuilt": True} if f.rebuild is not None else {}),
                     **({"nullable": True} if f.nullable else {}),
                 }
                 for key, f in self.fields.items()
@@ -236,18 +256,45 @@ def clear_judgement(detail: Any, method: Optional[str]) -> Any:
     """For ``score: false``: drop ``value`` when the metric IS the judgement
     (llm) — and the llm's measured ``confidence`` block with it (its stated
     number, verdict probability and score distribution are the judgement
-    too)."""
+    too), and, under ``options.mode: "adaptive"``, ``escalation.signal`` and
+    the readout's ``escalation.fast`` score / verdict / confidence (the
+    judgement that escalated; the rest of the block — whether, why, to which
+    model — stays)."""
     spec = spec_for(method)
     if isinstance(detail, dict) and spec is not None and spec.metric_from == "score":
         cleared = {**detail, "value": None}
         if "confidence" in cleared:
             cleared["confidence"] = None
+        escalation = cleared.get("escalation")
+        if isinstance(escalation, dict):
+            escalation = {**escalation, "signal": None}
+            if isinstance(escalation.get("fast"), dict):
+                escalation["fast"] = {
+                    **escalation["fast"], "score": None, "verdict": None, "confidence": None,
+                }
+            cleared["escalation"] = escalation
         return cleared
     return detail
 
 
 def member_value(detail: Any) -> Any:
     return detail.get("value") if isinstance(detail, dict) else None
+
+
+def rebuilt_keys(spec: Optional[ResultSpec], members: list[tuple[str, Any]]) -> dict:
+    """Each rebuilt key (``FieldSpec.rebuild``) that some counted member
+    carries, rebuilt from ALL their values; ``{}`` for a type without one,
+    and for a key no member carries (its ``when`` did not hold)."""
+    if spec is None:
+        return {}
+    out: dict[str, Any] = {}
+    for key, f in spec.fields.items():
+        if f.rebuild is None:
+            continue
+        values = [d[key] for _, d in members if isinstance(d, dict) and key in d]
+        if values:
+            out[key] = f.rebuild(values)
+    return out
 
 
 def aggregated_detail(
@@ -267,9 +314,14 @@ def aggregated_detail(
         rule:    The rule as sent (``all`` stays ``all``).
         level:   "pages" | "documents".
         members: ``[(label, detail), ...]`` of the members that were counted.
-        chosen:  ``(label, detail)`` for any / worst — that detail is kept whole.
+        chosen:  ``(label, detail)`` for any / worst — that detail is kept whole,
+                 its rebuilt keys excepted.
         base:    A complete detail to use instead (sum builds its own record).
         value:   The aggregated value, for mean and sum.
+
+    Whatever the rule, the type's rebuilt keys (:func:`rebuilt_keys`) are
+    rebuilt from every member and replace the chosen / base / first
+    member's — in place, so the key order is the member's.
     """
     values = {label: member_value(d) for label, d in members}
     block = {
@@ -278,18 +330,21 @@ def aggregated_detail(
         "from": chosen[0] if chosen else None,
         "values": values,
     }
+    spec = spec_for(method)
+    rebuilt = rebuilt_keys(spec, members)
     if chosen is not None:
         source = chosen[1]
         if not isinstance(source, dict):
             return {"aggregate": block}
-        return {**source, "aggregate": block}
+        return {**source, **rebuilt, "aggregate": block}
     if base is not None:
-        return {**base, "aggregate": block}
+        return {**base, **rebuilt, "aggregate": block}
 
-    # mean: only what means the same on every member, plus the mean value.
+    # mean: only what means the same on every member, plus the mean value
+    # and the rebuilt keys.
     first = next((d for _, d in members if isinstance(d, dict)), None)
-    spec = spec_for(method)
     if first is None or spec is None:
         return {"value": value, "aggregate": block}
     kept = {k: v for k, v in first.items() if k in spec.stable()}
-    return {**kept, "metric": first.get("metric", spec.metric), "value": value, "aggregate": block}
+    return {**kept, "metric": first.get("metric", spec.metric), "value": value, **rebuilt,
+            "aggregate": block}

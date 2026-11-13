@@ -181,6 +181,8 @@ from config import (
     REFERENCE_BOX_ASK,
     REFERENCE_BOX_REFINE,
     REFERENCE_BOX_VERIFY,
+    SCORE_HI,
+    SCORE_LO,
     VERIFY_PARTIAL_REJECT,
 )
 # Imported as modules, not by name, so a test can script the model by
@@ -1456,7 +1458,7 @@ def _score_of(verdict: Any) -> Optional[int]:
     if not isinstance(verdict, dict):
         return None
     try:
-        return max(1, min(10, int(float(verdict.get("score")))))
+        return max(SCORE_LO, min(SCORE_HI, int(float(verdict.get("score")))))
     except (TypeError, ValueError):
         return None
 

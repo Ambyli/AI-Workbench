@@ -94,8 +94,10 @@ def _check(detail, method: str, *, score=None, scored=True, aggregated=False):
     assert keys <= set(spec.fields), (method, sorted(keys - set(spec.fields)))
     required = spec.required()
     if aggregated and detail.get("aggregate", {}).get("rule") == "mean":
-        # A mean keeps only the stable keys, plus metric / value / aggregate.
-        assert keys <= spec.stable() | {"metric", "value", "aggregate"}, (method, keys)
+        # A mean keeps only the stable keys, plus metric / value / aggregate
+        # and the rebuilt keys (rebuilt from every member under every rule).
+        assert keys <= spec.stable() | spec.rebuilt() | {"metric", "value", "aggregate"}, (
+            method, keys)
     else:
         assert required <= keys, (method, sorted(required - keys))
     if method != "cv":
@@ -309,6 +311,44 @@ def test_a_field_kind_must_be_a_json_kind():
     # nullable is declared, and served beside stable / when.
     assert specs()["llm"].as_dict()["fields"]["value"]["nullable"] is True
     assert "nullable" not in specs()["text"].as_dict()["fields"]["count"]
+
+
+def test_a_rebuilt_field_is_rebuilt_from_every_member_under_every_rule():
+    """``FieldSpec(rebuild=...)``: served as ``rebuilt: true``, never also
+    stable, and ``aggregated_detail`` replaces the chosen / base / first
+    member's value with the combiner's over ALL the members — while a type
+    without one (or members without the key) aggregates exactly as before."""
+    from analysis.result_specs import FieldSpec, aggregated_detail, rebuilt_keys
+
+    with pytest.raises(ValueError, match="not both"):
+        FieldSpec("x", "object", stable=True, rebuild=lambda values: values)
+    # Today the one rebuilt key is the adaptive llm tally.
+    assert {t: s.rebuilt() for t, s in specs().items()} == {
+        "llm": {"escalations"}, "text": set(), "detector": set(), "cv": set()}
+    served = specs()["llm"].as_dict()["fields"]
+    assert served["escalations"]["rebuilt"] is True
+    assert all("rebuilt" not in f for k, f in served.items() if k != "escalations")
+
+    def unit(value, escalated):
+        from analysis.llm_eval import _unit_escalations
+
+        tally = _unit_escalations(why="confidence", answered_by="m") if escalated \
+            else _unit_escalations()
+        return {"metric": "score", "value": value, "hint": "auto", "escalations": tally}
+
+    members = [("item 0", unit(9, False)), ("item 1", unit(3, True)), ("item 2", unit(8, False))]
+    expected = rebuilt_keys(specs()["llm"], members)["escalations"]
+    assert (expected["units"], expected["escalated"]) == (3, 1)
+    for chosen in (members[0], members[1], None):          # any, worst, mean
+        detail = aggregated_detail(method="llm", rule="mean" if chosen is None else "any",
+                                   level="pages", members=members, chosen=chosen, value=6.67)
+        assert detail["escalations"] == expected
+        assert list(detail)[-1] == "aggregate"
+    # Members without the key (any non-adaptive criterion): nothing added.
+    plain = [(label, {k: v for k, v in d.items() if k != "escalations"}) for label, d in members]
+    assert rebuilt_keys(specs()["llm"], plain) == {}
+    assert "escalations" not in aggregated_detail(method="llm", rule="mean", level="pages",
+                                                  members=plain, value=6.67)
 
 
 # ---------------------------------------------------------------------------

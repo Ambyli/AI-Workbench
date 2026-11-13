@@ -57,17 +57,21 @@ request, never a creation job that fails a minute later:
                      ``depends_on``; ``weight`` only where the breakdown kept
                      it). Inherited criteria keep their ``key``s, and two
                      sharing one is a 400 (send ``criteria`` explicitly),
-                     and lose ``options.reference`` and ``options.mode``.
+                     and lose ``options.reference``, ``options.mode`` and
+                     ``options.escalate_below``.
                      Each criterion whose type, ``score`` and resolved
                      options match the job's takes the job's answer on that
                      item and its ACCEPTED regions there as supplied (the key
                      is not compared: it changes how a reference is found,
                      not the question) — except a criterion the job ran as
                      a fast readout (its ``options.mode: "fast"``, so an
-                     errored readout too), whose answer and observation
-                     are never copied (a warning says so; the creation job
-                     scores it reasoned unless the caller's breakdown
-                     answers it);
+                     errored readout too) or adaptive without escalating
+                     (``detail.escalation.escalated`` not true — an errored
+                     unit too), whose answer and observation are never
+                     copied (a warning says so; the creation job scores it
+                     reasoned unless the caller's breakdown answers it). An
+                     adaptive unit that escalated answered reasoned and is
+                     copied;
   4. every breakdown / regions key names a criterion; every pixel region lies
      inside the page (``grid`` regions are converted to pixels here) — 400;
   5. register the creation job ("staging", metadata type "reference" —
@@ -121,6 +125,10 @@ from api.schemas import (
 # A module, not names: SVG_FETCH_IMAGES is read at call time (see api.assess).
 import config
 from config import (
+    FROM_JOB_RAN_AS,
+    FROM_JOB_READOUT_NOT_COPIED,
+    FROM_JOB_THEN_BREAKDOWN,
+    FROM_JOB_THEN_RESCORED,
     LLM_BBOX_GRID,
     LLM_BBOX_MAX_ATTEMPTS,
     MODE_NOT_REQUEST_LEVEL,
@@ -400,13 +408,40 @@ def _same_question(a: CriterionInput, b: CriterionInput) -> bool:
     )
 
 
+def _readout_answered(
+    name: str, unit: Optional[dict], readout_modes: dict[str, str]
+) -> Optional[str]:
+    """The mode (``fast`` | ``adaptive``) whose READOUT answered the job's
+    ``unit`` of criterion ``name`` — so it must not be copied as an expected
+    answer or an observation — or None (a reasoned answer, or no unit).
+
+    ``readout_modes`` is the job's own criteria's readout modes by name (an
+    errored unit's ``detail`` is ``{}`` and cannot say). A fast criterion's
+    unit always is; an adaptive one's is unless ``detail.escalation
+    .escalated`` is true (its answer then came from the escalation model's
+    reasoned call). A unit whose ``detail.mode`` is ``fast`` is a readout's
+    whatever the criteria say."""
+    if unit is None:
+        return None
+    detail = unit.get("detail") or {}
+    mode = readout_modes.get(name)
+    if mode == "adaptive":
+        escalated = (detail.get("escalation") or {}).get("escalated") is True
+        return None if escalated and unit.get("status") == "ok" else "adaptive"
+    if mode == "fast" or detail.get("mode") == "fast":
+        return "fast"
+    return None
+
+
 def _as_reference_criterion(c: CriterionInput) -> CriterionInput:
     """A job's criterion as a reference's: ``options.reference`` dropped (a
-    reference's own criteria are never guided) and ``options.mode`` dropped
-    (a reference records reasoned answers; the creation job scores it
-    reasoned). The rest — the question — is unchanged."""
+    reference's own criteria are never guided), and ``options.mode`` and
+    ``options.escalate_below`` dropped (a reference records reasoned
+    answers; the creation job scores it reasoned — and a threshold without
+    adaptive would be a 400 when the criterion is validated again). The rest
+    — the question — is unchanged."""
     update = {
-        key: None for key in ("reference", "mode")
+        key: None for key in ("reference", "mode", "escalate_below")
         if getattr(c.options, key, None) is not None
     }
     if not update:
@@ -504,17 +539,18 @@ async def _resolve_from_job(model: ReferenceRequest) -> _Source:
     else:
         job_criteria, warning = _legacy_criteria(job_id, result)
         warnings.append(warning)
-    # Which of the job's criteria ran as fast readouts — read from the job's
-    # OWN criteria, before the mode is stripped below: an errored fast unit
-    # (an incomplete or capped readout) has `detail: {}`, so its unit cannot
-    # say it was fast, and its observation must not be copied either.
-    fast_names = {
-        c.name for c in job_criteria if getattr(c.options, "mode", None) == "fast"
+    # Which of the job's criteria started with a readout, by mode — read from
+    # the job's OWN criteria, before the mode is stripped below: an errored
+    # fast / adaptive unit (an incomplete or capped readout, and for
+    # adaptive a failed escalation too) has `detail: {}`, so its unit cannot
+    # say how it ran, and its observation must not be copied either.
+    readout_modes = {
+        c.name: c.options.mode for c in job_criteria if c.reads_out()
     }
     # A guided job's criteria carry options.reference; a reference's own
     # criteria are never guided, so it is dropped (the answer still stands).
-    # options.mode is dropped too: a reference records reasoned answers (a
-    # fast unit's answer is not copied below).
+    # options.mode / escalate_below are dropped too: a reference records
+    # reasoned answers (a readout's answer is not copied below).
     job_criteria = [_as_reference_criterion(c) for c in job_criteria]
     criteria = list(model.criteria) if model.criteria is not None else job_criteria
     if model.criteria is None:
@@ -546,25 +582,23 @@ async def _resolve_from_job(model: ReferenceRequest) -> _Source:
             (u for u in (per.get(c.name) or {}).get("items") or [] if u.get("item") == item),
             None,
         )
-        if unit is not None and (
-            c.name in fast_names or (unit.get("detail") or {}).get("mode") == "fast"
-        ):
-            # A fast readout's answer is never an expected answer: its reason
-            # is service-written ("Fast readout (no reasoning): …") and would
+        ran = _readout_answered(c.name, unit, readout_modes)
+        if ran is not None:
+            # A readout's answer is never an expected answer: its reason is
+            # service-written ("Fast readout (no reasoning): …") and would
             # become a caption in later prompts. Neither it nor the unit's
-            # observation is copied — an errored readout's included; the
+            # observation is copied — an errored unit's included; the
             # creation job scores the criterion (reasoned — its mode was
             # dropped above) unless the caller supplies the answer. Regions
-            # still are.
+            # still are. An adaptive unit that ESCALATED answered reasoned
+            # (on the escalation model) and is copied like any reasoned one.
             then = (
-                "your breakdown is the answer" if c.name in model.breakdown
-                else f"the creation job scores it reasoned; send breakdown[{c.name!r}] "
-                     "to set it yourself"
+                FROM_JOB_THEN_BREAKDOWN if c.name in model.breakdown
+                else FROM_JOB_THEN_RESCORED.format(name=c.name)
             )
-            warnings.append(
-                f"{c.name!r}: job {job_id!r} ran it as a fast readout (options.mode 'fast'), "
-                f"which is never copied as an expected answer or an observation — {then}"
-            )
+            warnings.append(FROM_JOB_READOUT_NOT_COPIED.format(
+                name=c.name, job_id=job_id, ran=FROM_JOB_RAN_AS[ran], then=then,
+            ))
             unit = None
         if unit is not None:
             entry["observed"] = {

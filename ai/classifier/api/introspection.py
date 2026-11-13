@@ -83,7 +83,12 @@ router = APIRouter(tags=["introspection"])
 
 @router.get("/models")
 def list_models():
-    """The model registry: ``{default, models: [...]}``.
+    """The model registry: ``{default, escalation, models: [...]}``.
+
+    ``escalation`` is ``{id, host, authenticated, available}`` of the ONE
+    entry an ``options.mode: "adaptive"`` criterion escalates to
+    (``CLASSIFIER_ESCALATION_MODEL``, else the default) — where adaptive may
+    send pages, an external host included.
 
     One entry per ``models.yaml`` model, in file order: ``id`` (what a
     request's ``model`` and a criterion's ``options.model`` name), its
@@ -102,7 +107,8 @@ def list_models():
     number is the headline, and whether a calibration is fitted (never the
     points or the request keys) — and ``fast``: null without a models.yaml
     ``fast`` block, else ``{top_logprobs, min_coverage, max_unseen_mass,
-    calibrated: [answer types]}`` (never the body extras).
+    calibrated: [answer types], escalate_below: {answer type: 0-100}}``
+    (never the body extras).
     """
     return JSONResponse(content=llm_models.get_registry().public())
 
@@ -119,8 +125,11 @@ def list_criterion_types():
     in the ``box_loop`` block); ``caps`` are the server limits a request
     may not exceed. The ``mode`` block names ``options.mode``'s values, its
     default (``reasoned``), that it is per criterion only
-    (``request_level: false``), and ``fast_models`` — the ids ``fast`` may
-    run on in THIS container.
+    (``request_level: false``), ``fast_models`` — the ids ``fast`` (and
+    adaptive's readout) may run on in THIS container — what ``adaptive``
+    does, its ``escalation`` model here (``{id, available, env, catalog}``)
+    and how ``escalate_below`` resolves (``{minimum, maximum, default,
+    resolution}``).
 
     Each type also carries ``result``: the shape of the ``detail`` it returns
     (``analysis.result_specs``) — its headline ``metric``, every field with

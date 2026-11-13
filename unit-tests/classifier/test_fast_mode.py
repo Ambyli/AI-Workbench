@@ -982,7 +982,8 @@ def test_options_mode_on_another_type_is_named(registry, type_, needle):
     assert "options.mode: only an llm criterion has a mode" in message and needle in message
 
 
-@pytest.mark.parametrize("mode", ["adaptive", "FAST", 1])
+# "adaptive" was refused here in phase 1; phase 2 built it (test_adaptive_mode.py).
+@pytest.mark.parametrize("mode", ["ADAPTIVE", "FAST", "slow", 1])
 def test_unknown_modes_are_refused(registry, mode):
     message = _refusal({"documents": [TXT], "criteria": [
         {"name": "x", "options": {"model": "quick", "mode": mode}}]})
@@ -1169,7 +1170,8 @@ def test_get_models_reports_fast(checked_in):
     by_id = {m["id"]: m for m in payload["models"]}
     assert by_id["qwen3.8-solo"]["supports"]["fast"] is True
     assert by_id["qwen3.8-solo"]["fast"] == {"top_logprobs": 64, "min_coverage": 0.5,
-                                             "max_unseen_mass": 0.02, "calibrated": []}
+                                             "max_unseen_mass": 0.02, "calibrated": [],
+                                             "escalate_below": {"rating": 80}}
     assert by_id["qwen3.8-solo"]["vision"] is True
     assert by_id["qwen3.8-solo"]["max_images_per_prompt"] == 3
     assert by_id["muse-glimmer"]["supports"]["fast"] is False and by_id["muse-glimmer"]["fast"] is None
@@ -1192,7 +1194,7 @@ def test_get_criterion_types_has_the_mode_block(checked_in):
 
     payload = json.loads(list_criterion_types().body.decode("utf-8"))
     block = payload["mode"]
-    assert block["values"] == ["reasoned", "fast"] and block["default"] == "reasoned"
+    assert block["values"] == ["reasoned", "fast", "adaptive"] and block["default"] == "reasoned"
     assert block["request_level"] is False
     assert block["fast_models"] == ["qwen3.5-4b", "qwen3.8-solo"]
     llm = payload["types"]["llm"]

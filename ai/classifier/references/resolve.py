@@ -55,8 +55,9 @@ examples), the first that is set deciding, every comparison case-folded:
 
 Only reference criteria that are ``usable`` (they guide the llm and have an
 expected answer) are examples. A criterion the model does not answer is
-never guided — nor is a fast one (``options.mode: "fast"``, a one-token
-readout: ``CriterionInput.guided_by_llm`` is false, so it gets no plan entry
+never guided — nor is a fast or adaptive one (``options.mode: "fast"`` /
+``"adaptive"``, which start with a one-token readout:
+``CriterionInput.guided_by_llm`` is false, so it gets no plan entry
 and no ``auto`` pool target; the worker notes why on its
 ``detail.reference``) — and one with no matching example simply scores
 without one (``detail.reference.applied: false`` says why). The plan records the rule

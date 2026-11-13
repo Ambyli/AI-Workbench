@@ -114,6 +114,24 @@ reference_calls_total = Counter(
     #              a box call is `failed` when it returned no usable answer
     ["kind", "outcome"],  # outcome: ok | failed
 )
+# Adaptive criteria (options.mode "adaptive", analysis/llm_eval.py): one per
+# unit whose fast readout escalated to the escalation model's reasoned call
+# (CLASSIFIER_ESCALATION_MODEL). The escalation rate is this over the fast
+# readouts of adaptive units (classifier_llm_call_seconds_count{kind="fast"}
+# counts every readout).
+escalations_total = Counter(
+    "classifier_escalations_total",
+    "Adaptive criteria escalated from the fast readout to the escalation model's "
+    "reasoned call, by escalation model (registry id), why and outcome",
+    # model   — the escalation model's registry id
+    # why     — confidence (the readout's confidence under the threshold) |
+    #           incomplete (its coverage under fast.min_coverage, or no
+    #           logprobs) | cap (the probability cap)
+    # outcome — ok (the reasoned answer is the result) | failed (the call
+    #           failed: a complete readout's answer stands; after an
+    #           incomplete / capped readout the unit errors)
+    ["model", "why", "outcome"],
+)
 # Model usage records (llm/usage.py): a row that could not be written. The
 # model call it describes is unaffected — accounting never fails a call — so
 # this counter is the only sign that GET /jobs/{id}/usage is missing calls.

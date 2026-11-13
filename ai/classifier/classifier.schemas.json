@@ -3145,13 +3145,14 @@
             "object",
             "null"
           ],
-          "description": "The one-token readout (options.mode \"fast\", `FastConfig.public`): null without a models.yaml `fast` block — never the body extras",
+          "description": "The one-token readout (options.mode \"fast\", and the readout an \"adaptive\" criterion starts with; `FastConfig.public`): null without a models.yaml `fast` block — never the body extras",
           "additionalProperties": false,
           "required": [
             "top_logprobs",
             "min_coverage",
             "max_unseen_mass",
-            "calibrated"
+            "calibrated",
+            "escalate_below"
           ],
           "properties": {
             "top_logprobs": {
@@ -3163,13 +3164,13 @@
               "type": "number",
               "minimum": 0,
               "maximum": 1,
-              "description": "Below this share of the answer position's probability on the labels, the readout is incomplete (the unit errors)"
+              "description": "Below this share of the answer position's probability on the labels, the readout is incomplete (the unit errors in mode fast; mode adaptive escalates)"
             },
             "max_unseen_mass": {
               "type": "number",
               "exclusiveMinimum": 0,
               "maximum": 1,
-              "description": "The probability cap: at or above it, the readout's estimate of what labels missing from the top-k hold (unseen_bound, a heuristic), the readout is refused (the unit errors)"
+              "description": "The probability cap: at or above it, the readout's estimate of what labels missing from the top-k hold (unseen_bound, a heuristic), the readout is refused (the unit errors in mode fast; mode adaptive escalates)"
             },
             "calibrated": {
               "type": "array",
@@ -3179,6 +3180,21 @@
                 ]
               },
               "description": "The answer types with a fitted fast.calibration"
+            },
+            "escalate_below": {
+              "type": "object",
+              "description": "Per answer type, the 0-100 readout confidence under which an options.mode \"adaptive\" criterion on this entry escalates (its options.escalate_below wins); every type is filled in at load (a type the entry leaves out is the service default, 80)",
+              "additionalProperties": false,
+              "required": [
+                "rating"
+              ],
+              "properties": {
+                "rating": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100
+                }
+              }
             }
           }
         }
@@ -4769,15 +4785,15 @@
         },
         "model": {
           "type": "string",
-          "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
+          "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default — under options.mode 'adaptive', the escalation model's id when it escalated (detail.escalation); under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[])"
         },
         "image_sent": {
           "type": "boolean",
-          "description": "Whether the page image was attached (never, for a text-only model)"
+          "description": "Whether the page image was attached to the call that answered (never, for a text-only model); under a `mean` aggregate, the first member's (each unit's is in items[])"
         },
         "text_sent": {
           "type": "object",
-          "description": "The text attached: `{chars, truncated, budget, source}`",
+          "description": "The text attached to the call that answered: `{chars, truncated, budget, source}` (budget: that model's text_char_budget)",
           "additionalProperties": true
         },
         "confidence": {
@@ -4785,12 +4801,17 @@
             "object",
             "null"
           ],
-          "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated | readout, headline: stated | calibrated | readout, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; under options.mode 'fast' method and source are `readout` (the one-token readout's digit probabilities, score = digit + 1), `stated` is null, headline is `readout` (or `calibrated` after the entry's fast.calibration.rating), and the block adds `unseen_bound` (an estimate of what the digits missing from the top-k hold); the whole block is null for a `score: false` criterion",
+          "description": "How sure the model was, measured per models.yaml `confidence.method` (llm.confidence): `{method, source: logprobs | sampling | stated | readout, headline: stated | calibrated | readout, stated, stated_defaulted, calibrated, verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: {\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, unresolved: [{values, mass}], samples: null | {asked, answered, agreement, stated_mean}, note}` — the distribution keys are null when source is `stated`; under options.mode 'fast' method and source are `readout` (the one-token readout's digit probabilities, score = digit + 1), `stated` is null, headline is `readout` (or `calibrated` after the entry's fast.calibration.rating), and the block adds `unseen_bound` (an estimate of what the digits missing from the top-k hold); under options.mode 'adaptive' it is the readout's block when the readout stood and the escalation model's measured block when it escalated; the whole block is null for a `score: false` criterion",
           "additionalProperties": true
         },
         "mode": {
           "type": "string",
-          "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent (present only when options.mode was sent)"
+          "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when it escalated; under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[]) (present only when options.mode was sent)"
+        },
+        "escalation": {
+          "type": "object",
+          "description": "What the adaptive mode did: `{escalated, model, threshold, signal, why, error, fast}` — `model` the escalation model's id (CLASSIFIER_ESCALATION_MODEL), `threshold` the 0-100 confidence it escalates under (options.escalate_below, else the model's fast.escalate_below.rating), `signal` the readout's confidence (null when the readout was incomplete / capped, and under `score: false`), `why` null | 'confidence 62 < 80' | the readout's 'readout incomplete: …' / 'probability cap reached: …', `error` null or why the escalation failed (the readout's answer then stands, escalated false; under `score: false` an unparseable answer is not quoted), `fast` null or — only when it escalated — the readout it replaced: `{model, score, verdict, confidence, coverage}` (score / verdict / confidence null when the readout was incomplete, and under `score: false`) (present only when options.mode was 'adaptive')",
+          "additionalProperties": true
         },
         "reference": {
           "type": "object",
@@ -4835,15 +4856,15 @@
         },
         "model": {
           "type": "string",
-          "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default"
+          "description": "The registry id of the model that answered (GET /models): options.model, else the request's model, else the registry default — under options.mode 'adaptive', the escalation model's id when it escalated (detail.escalation); under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[])"
         },
         "image_sent": {
           "type": "boolean",
-          "description": "Whether the page image was attached (never, for a text-only model)"
+          "description": "Whether the page image was attached to the call that answered (never, for a text-only model); under a `mean` aggregate, the first member's (each unit's is in items[])"
         },
         "mode": {
           "type": "string",
-          "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent (present only when options.mode was sent)"
+          "description": "How the model answered: `reasoned` | `fast` — the criterion's options.mode as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when it escalated; under a `mean` aggregate, the first member's (adaptive members may differ — each unit's is in items[]) (present only when options.mode was sent)"
         },
         "aggregate": {
           "type": "object",
@@ -5345,12 +5366,45 @@
             "additionalProperties": false,
             "required": [
               "default",
+              "escalation",
               "models"
             ],
             "properties": {
               "default": {
                 "type": "string",
                 "description": "The registry default"
+              },
+              "escalation": {
+                "type": "object",
+                "description": "The ONE entry an options.mode \"adaptive\" criterion escalates to (CLASSIFIER_ESCALATION_MODEL, else the default; `Registry.escalation`, `ModelSpec.where`) — where adaptive may send pages, an external host included",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "host",
+                  "authenticated",
+                  "available"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Its registry id (one of `models`)"
+                  },
+                  "host": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Where its requests' pages and text GO"
+                  },
+                  "authenticated": {
+                    "type": "boolean",
+                    "description": "Whether a key is sent (never the key)"
+                  },
+                  "available": {
+                    "type": "boolean",
+                    "description": "False while its API key variable is unset: adaptive is then a 400 at submit"
+                  }
+                }
               },
               "models": {
                 "type": "array",
@@ -5668,6 +5722,9 @@
                   "request_level",
                   "fast_models",
                   "fast",
+                  "adaptive",
+                  "escalation",
+                  "escalate_below",
                   "identity"
                 ],
                 "properties": {
@@ -5679,7 +5736,8 @@
                     "items": {
                       "enum": [
                         "reasoned",
-                        "fast"
+                        "fast",
+                        "adaptive"
                       ]
                     }
                   },
@@ -5695,10 +5753,70 @@
                     "items": {
                       "type": "string"
                     },
-                    "description": "Where \"fast\" may run on THIS container: the available entries with a models.yaml `fast` block (GET /models supports.fast), in file order"
+                    "description": "Where \"fast\" (and adaptive's readout) may run on THIS container: the available entries with a models.yaml `fast` block (GET /models supports.fast), in file order"
                   },
                   "fast": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "What mode \"fast\" does"
+                  },
+                  "adaptive": {
+                    "type": "string",
+                    "description": "What mode \"adaptive\" does"
+                  },
+                  "escalation": {
+                    "type": "object",
+                    "description": "Where an adaptive criterion escalates on THIS container",
+                    "additionalProperties": false,
+                    "required": [
+                      "id",
+                      "available",
+                      "env",
+                      "catalog"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "The escalation model's registry id"
+                      },
+                      "available": {
+                        "type": "boolean",
+                        "description": "False: adaptive is a 400 at submit"
+                      },
+                      "env": {
+                        "type": "string",
+                        "description": "The env var that names it"
+                      },
+                      "catalog": {
+                        "type": "string",
+                        "description": "Where its host is shown (GET /models escalation)"
+                      }
+                    }
+                  },
+                  "escalate_below": {
+                    "type": "object",
+                    "description": "options.escalate_below: its bounds, the service default and how it resolves",
+                    "additionalProperties": false,
+                    "required": [
+                      "minimum",
+                      "maximum",
+                      "default",
+                      "resolution"
+                    ],
+                    "properties": {
+                      "minimum": {
+                        "type": "integer"
+                      },
+                      "maximum": {
+                        "type": "integer"
+                      },
+                      "default": {
+                        "type": "integer",
+                        "description": "A models.yaml fast.escalate_below type the entry leaves out"
+                      },
+                      "resolution": {
+                        "type": "string"
+                      }
+                    }
                   },
                   "identity": {
                     "type": "string"

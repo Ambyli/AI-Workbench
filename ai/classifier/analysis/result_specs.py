@@ -71,7 +71,10 @@ class FieldSpec:
 
     description: str
     kind: str                       # JSON kind, one of KINDS
-    stable: bool = False            # same meaning on every member → kept under `mean`
+    # Same MEANING on every member → kept under `mean`, with the FIRST member's
+    # value (values may differ: `image_sent` across mixed documents, an
+    # adaptive criterion's `model` / `mode` — each unit's is in items[]).
+    stable: bool = False
     when: Optional[str] = None      # present only in this case; None = always present
     nullable: bool = False          # the value may be null (the description says when)
 
@@ -236,12 +239,23 @@ def clear_judgement(detail: Any, method: Optional[str]) -> Any:
     """For ``score: false``: drop ``value`` when the metric IS the judgement
     (llm) — and the llm's measured ``confidence`` block with it (its stated
     number, verdict probability and score distribution are the judgement
-    too)."""
+    too), and, under ``options.mode: "adaptive"``, ``escalation.signal`` and
+    the readout's ``escalation.fast`` score / verdict / confidence (the
+    judgement that escalated; the rest of the block — whether, why, to which
+    model — stays)."""
     spec = spec_for(method)
     if isinstance(detail, dict) and spec is not None and spec.metric_from == "score":
         cleared = {**detail, "value": None}
         if "confidence" in cleared:
             cleared["confidence"] = None
+        escalation = cleared.get("escalation")
+        if isinstance(escalation, dict):
+            escalation = {**escalation, "signal": None}
+            if isinstance(escalation.get("fast"), dict):
+                escalation["fast"] = {
+                    **escalation["fast"], "score": None, "verdict": None, "confidence": None,
+                }
+            cleared["escalation"] = escalation
         return cleared
     return detail
 

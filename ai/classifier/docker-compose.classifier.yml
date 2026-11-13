@@ -77,6 +77,16 @@ services:
       # and set in .env. Unset or empty → the entry loads but is unavailable
       # (a request that selects it is a 400). None today: every entry is a
       # local vLLM service with no key.
+      #
+      # The ONE model setting that is an env var: the models.yaml entry an
+      # options.mode "adaptive" criterion escalates to (the reasoned scoring
+      # call that answers when its fast readout is unsure). Empty = the
+      # registry default. An id that names no entry stops startup; an entry
+      # whose key is unset logs a WARNING and adaptive is a 400 at submit. It
+      # may be an external entry (GET /models `escalation` shows its host). A
+      # change needs `make up classifier`, not a restart. See API.md
+      # § Adaptive mode.
+      - CLASSIFIER_ESCALATION_MODEL=${CLASSIFIER_ESCALATION_MODEL:-}
       - LOG_LEVEL=INFO
       # The three process-wide concurrency limits: jobs at once,
       # (criterion, item) units one job evaluates at once, and OCR passes at

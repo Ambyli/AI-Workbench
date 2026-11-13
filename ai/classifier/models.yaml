@@ -10,8 +10,24 @@
 # Precedence: a criterion's options.model, then the request's model, then
 # `default` below. Nothing ever picks an external model on its own: the
 # default is local, and an external entry is only used when a request names
-# it. An external entry sends document pages and text to that provider —
-# GET /models reports each entry's host so a caller can see where data goes.
+# it — except the operator-designated escalation model, for a criterion that
+# asked for options.mode "adaptive". An external entry sends document pages
+# and text to that provider — GET /models reports each entry's host so a
+# caller can see where data goes.
+#
+# The escalation model: the env var CLASSIFIER_ESCALATION_MODEL (not this
+# file) names ONE entry below that an "adaptive" criterion escalates to — the
+# reasoned scoring call that answers when the criterion's fast readout is
+# unsure (its confidence under fast.escalate_below) or could not be read.
+# Unset or empty = `default`. It MAY be an external entry (an https URL with
+# api_key_env — Claude, say): the operator designates it, and GET /models
+# reports it as `escalation: {id, host, authenticated, available}` so a
+# caller sees where adaptive may send pages. An id that is not an entry here
+# stops the container at startup (decided on the file and the env alone —
+# nothing is resolved or contacted at load); an entry whose key is unset
+# loads with a startup WARNING, and "adaptive" is then a 400 at submit. It is
+# the entry itself, so it shares that entry's max_concurrent slots. A change
+# needs `make up classifier` (an env change), not a restart.
 #
 # Editing this file on the box takes effect with `docker restart classifier`
 # (it is bind-mounted read-only; the classifier is recreate-class, so compose
@@ -149,11 +165,13 @@
 #                          score = digit + 1), the answer read from that
 #                          token's probabilities (common.logprobs
 #                          .option_distribution) instead of from what it
-#                          wrote — prefill plus one token, no reason written.
-#                          No block = mode "fast" on this entry is a 400 that
-#                          names the entries that have one. Only for a model
-#                          whose reasoning can be turned OFF (Muse Glimmer's
-#                          lowest level is `low`, so it has none). The
+#                          wrote — prefill plus one token, no reason written
+#                          — and the readout of options.mode "adaptive".
+#                          No block = mode "fast" / "adaptive" on this entry
+#                          is a 400 that names the entries that have one.
+#                          Only for a model whose reasoning can be turned OFF
+#                          (Muse Glimmer's lowest level is `low`, so it has
+#                          none; it can still be the escalation model). The
 #                          response is read at confidence.logprobs
 #                          .entries_path / top_key (where this provider keeps
 #                          the entries). Fields:
@@ -188,8 +206,9 @@
 #                          probability cap (below) fire less
 #     min_coverage         the share of the answer position's probability
 #                          that must fall on the labels (default 0.5); below
-#                          it the readout is incomplete and the unit fails
-#                          naming mode "reasoned"
+#                          it the readout is incomplete: in mode "fast" the
+#                          unit fails naming mode "reasoned"; mode "adaptive"
+#                          escalates it
 #     max_unseen_mass      the probability cap (default 0.02; above 0, at most
 #                          1): what labels missing from the top_logprobs list
 #                          hold is ESTIMATED as (labels missing) x (the
@@ -197,9 +216,10 @@
 #                          — one spelling per label, so a heuristic, not a
 #                          guarantee (a label also matches as " 3", "[3", …);
 #                          at or above this the readout is refused, naming
-#                          top_logprobs and --max-logprobs. A confident answer
-#                          whose other labels simply fell off the list stays
-#                          far below it
+#                          top_logprobs and --max-logprobs (mode "fast": the
+#                          unit fails; mode "adaptive" escalates it). A
+#                          confident answer whose other labels simply fell
+#                          off the list stays far below it
 #     strip_markers        strings removed from the caller text a fast prompt
 #                          carries (the criterion name, the text layer):
 #                          chat-template markers that would turn reasoning
@@ -211,10 +231,21 @@
 #                          bias, n, fitted_on, ground_truth} — p ∝
 #                          exp(logprob / temperature) before the verdict
 #                          band is chosen (bias: a Platt offset for two-way
-#                          answers, unused by rating). The fitting tool,
-#                          bin/confidence_calibration.py --mode fast, is
-#                          ZT-603 phase 2 (not built yet): until it is, leave
-#                          {}. Re-fit after a model, prompt or template change
+#                          answers, unused by rating). Fitted and printed by
+#                          bin/confidence_calibration.py --mode fast (a
+#                          log-loss temperature on labelled pages). Re-fit
+#                          after a model, prompt or template change
+#     escalate_below       per answer type ({rating: 80} today), 0-100: an
+#                          options.mode "adaptive" criterion on this entry
+#                          escalates to the escalation model (above) when
+#                          the readout's confidence — after `calibration` —
+#                          is under it (a criterion's options.escalate_below
+#                          wins). A type left out is 80 (the default; GET
+#                          /models shows the value in force). Set it from
+#                          bin/confidence_calibration.py --mode fast's
+#                          escalation curve (escalation rate vs accuracy vs
+#                          model-seconds per threshold), which prints it
+#                          beside the calibration; refit both together
 
 default: muse-glimmer
 
@@ -412,3 +443,6 @@ models:
         - "<|think_max|>"
         - "<|think_extreme|>"
         - "<|think_ultracode|>"
+      # calibration / escalate_below unset: the raw readout, and adaptive
+      # escalates under 80 (the default), until bin/confidence_calibration.py
+      # --mode fast on the ZT-603 evaluation set prints both.

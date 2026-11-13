@@ -33,8 +33,9 @@ request rather than a job that fails in a worker a minute later:
      names, dependencies, cycles, ``score: false`` only where there is
      geometry, the static reference rules, the ``model`` / ``options.model``
      ids and what each criterion's effective model can do — boxes and
-     references need vision, ``options.mode: "fast"`` needs a ``fast:``
-     block; a request-level ``mode``, JSON or multipart, is a named 400) —
+     references need vision, ``options.mode: "fast"`` / ``"adaptive"`` need
+     a ``fast:`` block, adaptive an available escalation model; a
+     request-level ``mode``, JSON or multipart, is a named 400) —
      ``AssessRequest``;
   1b. resolve ``references`` against the store (``references.resolve``):
      unknown ids 400, not-ready 409, inherited criteria merged and
@@ -52,8 +53,9 @@ request rather than a job that fails in a worker a minute later:
      count, capped at CLASSIFIER_MAX_ITEMS inclusively; over it is a 400
      naming each document's pages. A ``score: false`` criterion is refused
      when NO document has a page image; a ``detector`` criterion is refused
-     when DETECTOR_URL is unset; a criterion on a text-only model is refused
-     when a photo would give it no text (OCR off, or ``options.ocr: never``);
+     when DETECTOR_URL is unset; a criterion on a text-only model (or an
+     adaptive one whose escalation model is text-only) is refused when a
+     photo would give it no text (OCR off, or ``options.ocr: never``);
   3b. with CLASSIFIER_SVG_FETCH_IMAGES on, fetch each SVG's external
      ``<image>`` links and inline them (``analysis.resolve_svg_images``) —
      here, because the worker never touches the network. A link that cannot
@@ -91,7 +93,7 @@ from api.schemas import AssessRequest, ClassifierMetadata, DocumentInput, valida
 # A module, not names: SVG_FETCH_IMAGES is read at call time, so a test (or a
 # future live-reload) can flip it without re-importing this module.
 import config
-from config import MAX_ITEMS, MODE_NOT_REQUEST_LEVEL
+from config import MAX_ITEMS, MODE_NOT_REQUEST_LEVEL, TEXT_ONLY_MODEL_ROLES
 from cv import get_detector
 # A module, not names: is_configured() reads DETECTOR_URL at call time.
 from detector import client as detector_client
@@ -367,17 +369,24 @@ def _check_documents(model: AssessRequest, uploads: list[_Upload]) -> list[Submi
     # (kind "image") has no native text, so with no OCR — the engine is off,
     # or the criterion's options.ocr is "never" — it would have nothing to
     # read. (A PDF or SVG page may carry native text, which is only known
-    # once it is loaded; that case fails the unit at run time instead.)
+    # once it is loaded; that case fails the unit at run time instead.) An
+    # adaptive criterion's escalation model must answer its items too: a
+    # text-only one is checked the same way.
     photos = [_label(i, d.filename) for i, d in enumerate(submitted) if d.kind == "image"]
     if photos:
         registry = llm_models.get_registry()
+        no_ocr = not config.OCR_ENGINE or config.OCR_ENGINE == "none"
         blind_text = [
-            f"{c.name!r} (model {spec.id!r})"
+            f"{c.name!r} ({role} {spec.id!r})"
             for c in model.criteria
             if c.answered_by_model()
-            and not (spec := registry.resolve(c.model_id(model.model))).vision
-            and (not config.OCR_ENGINE or config.OCR_ENGINE == "none"
-                 or c.resolved_options().get("ocr") == "never")
+            and (no_ocr or c.resolved_options().get("ocr") == "never")
+            for role, spec in (
+                (TEXT_ONLY_MODEL_ROLES["model"], registry.resolve(c.model_id(model.model))),
+                *(((TEXT_ONLY_MODEL_ROLES["escalation"], registry.escalation),)
+                  if c.is_adaptive() else ()),
+            )
+            if not spec.vision
         ]
         if blind_text:
             raise _bad(

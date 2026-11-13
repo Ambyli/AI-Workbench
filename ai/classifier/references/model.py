@@ -106,8 +106,9 @@ def guides_llm(c: CriterionInput) -> bool:
     the resolved fallback is the llm (the fallback's answer has the llm
     shape). ``text`` / ``detector`` / an OpenCV-answered ``cv`` never — the
     model is not what scores them, so an example cannot steer them — nor an
-    ``options.mode: "fast"`` criterion (a readout has no reasoning to steer;
-    POST /references refuses one, and ``from_job`` drops the mode).
+    ``options.mode: "fast"`` or ``"adaptive"`` criterion (a readout has no
+    reasoning to steer; POST /references refuses one, and ``from_job`` drops
+    the mode).
     """
     return c.guided_by_llm()  # api.criterion_options.guided_by_references — one rule
 

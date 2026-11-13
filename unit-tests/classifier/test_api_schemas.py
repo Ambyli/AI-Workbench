@@ -27,8 +27,8 @@ collection body, the rendered copies -- are ``unit-tests/apidocs``).
       aggregate under every rule, ``mean`` across documents, document-scope
       text, dependencies, the box loop (one and several items), a guided
       (references) run, measured confidence, a fast readout (``options.mode:
-      "fast"``, alone and under ``mean``), a failed model, a cv criterion
-      on a text document;
+      "fast"``, alone and under ``mean``), an adaptive one (stood, escalated,
+      under ``mean``), a failed model, a cv criterion on a text document;
     * the four artifact routes (``api.artifacts.build_artifacts_router`` over
       a registry stub that returns the job): the manifest, scoped and not,
       every file kind, the zip, the DELETE and its 404 / 410 afterwards.
@@ -481,6 +481,73 @@ def test_a_fast_readout(schema_file, monkeypatch):
     mean = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [
         C(name="mean quality", type="llm", options={"model": fast_model, "mode": "fast", "aggregate": "mean"})]))
     assert _entries(mean)["mean quality"]["detail"]["mode"] == "fast"
+
+
+def test_an_adaptive_readout(schema_file, monkeypatch):
+    """options.mode "adaptive" (the readout, escalated to the registry's
+    escalation model's reasoned call when unsure): a readout that stood, one
+    that escalated (``detail.escalation``, the escalation model's
+    ``detail.model`` / ``mode``), and the two under ``mean`` across two
+    documents."""
+    from api.schemas import CriterionInput as C
+    from llm import client as llm_client
+    from llm.models import get_registry
+
+    registry = get_registry()
+    fast_model = next(mid for mid in registry.fast_ids() if registry.get(mid).vision)
+    top = {"9": 0.90, "8": 0.05, "[9": 0.02, "5": 0.02, "1": 0.01}
+
+    async def send(prompt):
+        if prompt.get("logprobs") is True and "response_format" not in prompt:
+            row = {"token": "9", "logprob": math.log(0.9),
+                   "top_logprobs": [{"token": t, "logprob": math.log(p)} for t, p in top.items()]}
+            return {"choices": [{"message": {"content": "9"}, "finish_reason": "length",
+                                 "logprobs": {"content": [row]}}]}
+        return {"choices": [{"message": {"content": json.dumps(
+            {"score": 3, "verdict": "FAIL", "confidence": 70, "reason": "No meter here."})}}]}
+
+    monkeypatch.setattr(llm_client, "_send", send)
+    one = check_result(schema_file, _run([_doc(_png(), "p.png")], [
+        C(name="has a meter", type="llm",
+          options={"hint": "presence", "model": fast_model, "mode": "adaptive", "escalate_below": 50}),
+        C(name="has a roof", type="llm",
+          options={"hint": "presence", "model": fast_model, "mode": "adaptive", "escalate_below": 99})]))
+    stood, escalated = _entries(one)["has a meter"], _entries(one)["has a roof"]
+    assert stood["detail"]["mode"] == "fast" and stood["detail"]["escalation"]["escalated"] is False
+    assert stood["detail"]["model"] == fast_model
+    assert escalated["detail"]["mode"] == "reasoned" and escalated["reason"] == "No meter here."
+    assert escalated["detail"]["model"] == registry.escalation_id
+    assert escalated["detail"]["escalation"]["escalated"] is True
+    assert escalated["detail"]["escalation"]["fast"]["model"] == fast_model
+    mean = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [
+        C(name="mean quality", type="llm",
+          options={"model": fast_model, "mode": "adaptive", "aggregate": "mean"})]))
+    assert "escalation" not in _entries(mean)["mean quality"]["detail"]          # not a stable key
+    assert all("escalation" in unit["detail"] for unit in _entries(mean)["mean quality"]["items"])
+
+    # Mixed members: one page's readout stands, the other's escalates. The
+    # mean keeps the FIRST member's stable keys (as declared); each unit's
+    # model / mode / escalation is in items[].
+    readouts = iter([top, {"9": 0.6, "1": 0.4}])
+
+    async def mixed_send(prompt):
+        nonlocal top
+        if prompt.get("logprobs") is True and "response_format" not in prompt:
+            top = next(readouts)
+        return await send(prompt)
+
+    monkeypatch.setattr(llm_client, "_send", mixed_send)
+    mixed = check_result(schema_file, _run([_doc(_png(), "a.png"), _doc(_png(90), "b.png")], [
+        C(name="mean quality", type="llm",
+          options={"model": fast_model, "mode": "adaptive", "aggregate": "mean",
+                   "escalate_below": 80})]))
+    entry = _entries(mixed)["mean quality"]
+    units = [unit["detail"] for unit in entry["items"]]
+    assert sorted((u["mode"], u["model"], u["escalation"]["escalated"]) for u in units) == sorted([
+        ("fast", fast_model, False), ("reasoned", registry.escalation_id, True)])
+    assert (entry["detail"]["model"], entry["detail"]["mode"]) == (units[0]["model"],
+                                                                   units[0]["mode"])
+    assert "escalation" not in entry["detail"]
 
 
 # -- (b) the artifact routes ---------------------------------------------------------------------

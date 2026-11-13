@@ -18,8 +18,11 @@ the prompt with; ``None`` means the registry's default.
                                model there — and written as one ``llm_calls``
                                row linked to its job (``llm.usage``), with the
                                registry id and the URL actually posted to.
-    call_kind()              — label -> fast | score | ask | refine | verify |
-                               select | describe | other (the metric label).
+    call_kind()              — label -> fast | escalate | score | ask |
+                               refine | verify | select | describe | other
+                               (the metric label; ``escalate`` is an adaptive
+                               criterion's scoring call on the escalation
+                               model, measured like ``score``).
     usage_counts()           — a response's prompt / cached / completion /
                                reasoning token counts, None where absent.
     call_model()              — the SCORING call. Retries a parse failure up to
@@ -71,8 +74,8 @@ replaces ``call_model`` returns plain answers and gets the fallback.
 because both calls produce them and nothing else reads them — and so do the
 per-request ``classifier_llm_call_seconds`` histogram and the four
 ``classifier_llm_*_tokens_total`` counters ``_post`` records from each
-response's ``usage``. Those are labelled by call KIND — fast, score, ask,
-refine, verify, select, describe, other — derived from the ``label`` every caller
+response's ``usage``. Those are labelled by call KIND — fast, escalate, score,
+ask, refine, verify, select, describe, other — derived from the ``label`` every caller
 already passes (:func:`call_kind`), and by ``model`` — the REGISTRY id, a
 fixed set from ``models.yaml`` — so they say where time goes without a
 criterion name or a free-form string ever becoming a label value.
@@ -229,13 +232,15 @@ readout_incomplete = Counter(
 
 # label prefix -> call kind. The callers' labels are "score/<name>",
 # "score/<name>/ref<k>", "fast/<name>" (a one-token readout, call_readout),
-# "bbox/<name>#<n>", "refine/<name>#<n>", "verify/<name>#<n>",
-# "reference/select#<item>" and "reference/describe"; a label that matches
-# none of them is "other". A new call site picks one of these prefixes (or
-# adds a row here, AHEAD of any more generic prefix it shares) so its tokens
-# are attributed.
+# "escalate/<name>" (an adaptive criterion's reasoned scoring call on the
+# escalation model), "bbox/<name>#<n>", "refine/<name>#<n>",
+# "verify/<name>#<n>", "reference/select#<item>" and "reference/describe"; a
+# label that matches none of them is "other". A new call site picks one of
+# these prefixes (or adds a row here, AHEAD of any more generic prefix it
+# shares) so its tokens are attributed.
 _KIND_PREFIXES: tuple[tuple[str, str], ...] = (
     ("fast/", "fast"),
+    ("escalate/", "escalate"),
     ("score/", "score"),
     ("bbox/", "ask"),
     ("refine/", "refine"),
@@ -244,6 +249,10 @@ _KIND_PREFIXES: tuple[tuple[str, str], ...] = (
     ("reference/describe", "describe"),
 )
 CALL_KINDS: tuple[str, ...] = tuple(kind for _, kind in _KIND_PREFIXES) + ("other",)
+# The kinds that are SCORING calls (a ModelSpec.body(..., "score") body), so
+# call_model measures their confidence per the entry's confidence.method: the
+# plain / guided scoring call and an adaptive criterion's escalation.
+_SCORING_KINDS: frozenset[str] = frozenset({"score", "escalate"})
 
 
 def call_kind(label: str) -> str:
@@ -308,6 +317,14 @@ class LLMCallError(RuntimeError):
     response shape, or ``MAX_LLM_RETRIES`` unparseable answers. The message
     is caller-facing: it lands in the criterion's ``error`` field.
     """
+
+
+class AnswerUnparsed(LLMCallError):
+    """The ``MAX_LLM_RETRIES`` unparseable answers case of
+    :class:`LLMCallError`. Its message quotes the start of the model's last
+    answer — which can carry a verdict and a confidence — so a caller that
+    must not report a judgement (an adaptive ``score: false`` unit's
+    ``detail.escalation.error``) tells it apart by type."""
 
 
 class ReadoutIncomplete(RuntimeError):
@@ -513,7 +530,8 @@ async def call_model(
         prompt: The dict produced by ``llm.prompts.build_llm_prompt``.
         label:     What this call is for: the log lines, and — through
                    :func:`call_kind` — the kind its metrics are labelled by.
-                   Start it with ``score/`` or ``reference/...`` (see
+                   Start it with ``score/``, ``escalate/`` (an adaptive
+                   criterion's escalation) or ``reference/...`` (see
                    ``_KIND_PREFIXES``).
         validator: Optional ``parsed -> answer`` function. A ``ValueError``
                    from it counts as a parse failure and retries, so "valid
@@ -524,8 +542,9 @@ async def call_model(
 
     Returns:
         The model's JSON object, or ``validator``'s result for it. For a
-        ``score/`` call to an entry whose ``confidence.method`` measures
-        something, a dict result also carries the private keys
+        ``score/`` or ``escalate/`` call to an entry whose
+        ``confidence.method`` measures something, a dict result also carries
+        the private keys
         ``llm.confidence`` reads (``_score_dist``, ``_samples``,
         ``_confidence_note``) — see :func:`_measure`.
 
@@ -534,10 +553,12 @@ async def call_model(
     """
     spec = _spec(model)
     conf = spec.confidence
-    # Only the SCORE call kind is measured — the same rule ModelSpec.body
-    # uses to add the confidence request keys; box / select / describe calls
-    # are sent and read exactly as before.
-    measure = conf.method if conf.method != "stated" and call_kind(label) == "score" else None
+    # Only a SCORING call is measured (kind score, or escalate — the same
+    # score body, ModelSpec.body's rule for the confidence request keys); box
+    # / select / describe calls are sent and read exactly as before.
+    measure = (
+        conf.method if conf.method != "stated" and call_kind(label) in _SCORING_KINDS else None
+    )
     repeat = measure == "sampling" and conf.sampling.via == "repeat"
     slots = conf.slots if measure == "sampling" else 1
     logger.debug(
@@ -576,7 +597,7 @@ async def call_model(
 
     llm_calls_total.labels(status="failed", model=spec.id).inc()
     logger.error("call_model(%s): all %d attempts failed", label, MAX_LLM_RETRIES)
-    raise LLMCallError(
+    raise AnswerUnparsed(
         f"model {spec.id!r}'s answer could not be parsed after {MAX_LLM_RETRIES} "
         f"attempts: {last_exc}"
     )

@@ -26,6 +26,20 @@ references (its ``detail.reference``, in a request with references, is
 only when it was sent. The box loop after a fast score runs reasoned,
 exactly as it does after a reasoned one.
 
+**``options.mode: "adaptive"``** (``_adaptive``) runs that readout, then —
+when its confidence is under the threshold (``options.escalate_below``, else
+the model's ``fast.escalate_below.rating``) or it was incomplete / capped —
+today's REASONED scoring call on the registry's ESCALATION model
+(``CLASSIFIER_ESCALATION_MODEL``; ``_escalate``, label ``escalate/<name>``,
+call kind ``escalate``): its text budget, vision, reasoning and confidence
+method, never reference-guided. The escalated answer is the unit's
+(``detail.model`` the escalation id, ``detail.mode`` ``reasoned``), else the
+readout's (``detail.mode`` ``fast``); ``detail.escalation`` records whether,
+why, the threshold and signal, a failure and — when it escalated — the
+readout it replaced. A failed escalation keeps a complete readout's answer;
+only an unreadable readout whose escalation failed errors the unit. The box
+loop stays on the criterion's own model, reasoned.
+
 A TEXT-ONLY model (``vision: false``) is sent the text layer and no image;
 an item with no text at all fails the unit ("no text available for a
 text-only model"), and the box loop never runs for it (the submit refuses
@@ -90,7 +104,11 @@ imports ``analysis``) — left out under the criterion's ``options.ocr:
                        how a `cv` criterion's "llm" fallback reaches it (its
                        ``reference`` guide passed through).
     _guided()        — the reference-guided scoring calls, combined.
-    _fast()          — the one-token readout (``options.mode: "fast"``).
+    _readout()       — the one-token readout, rated (fast and adaptive).
+    _fast()          — ``options.mode: "fast"``: the readout or a unit error.
+    _adaptive()      — ``options.mode: "adaptive"``: the readout, escalated
+                       when unsure (``_escalate``, the reasoned call on the
+                       escalation model).
     _box_reference_entry() — what the loop was shown: the unit's
                        ``localization.references`` entry, references.json
                        rows and the metric.
@@ -111,6 +129,7 @@ dispatches to; also called by ``analysis.cv_eval``.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from common.jobs import progress
@@ -130,7 +149,21 @@ from analysis.result_specs import (
 from analysis.outcome import EvaluationError
 from api.criterion_options import box_loop_settings
 from api.schemas import CriterionInput
-from config import FAST_DIGITS, FAST_REASON_UNJUDGED
+from config import (
+    ADAPTIVE_BOTH_FAILED,
+    DEFAULT_ANSWER_TYPE,
+    DETAIL_FLOAT_DECIMALS,
+    ESCALATION_NO_TEXT,
+    ESCALATION_UNAVAILABLE_AT_RUN,
+    ESCALATION_UNPARSED_UNJUDGED,
+    ESCALATION_WHY_CONFIDENCE,
+    ESCALATION_WHY_CONFIDENCE_UNJUDGED,
+    FAST_DIGITS,
+    FAST_REASON_UNJUDGED,
+    FAST_UNIT_ERROR_FIX,
+    MAX_LLM_RETRIES,
+    READOUT_MODES,
+)
 # Modules, not names: a test scripts the model by replacing
 # `llm.client.call_model` / `call_model_json`, and must reach the one object
 # every caller uses; the registry is looked up at call time (tests swap it).
@@ -142,7 +175,7 @@ from llm.models import ModelSpec
 from llm.prompts import ReferenceExample, build_llm_prompt
 from llm.validate import answer_validator
 from logger import logger
-from metrics import reference_calls_total
+from metrics import escalations_total, reference_calls_total
 
 
 def _budgeted(text: str, budget: int) -> tuple[str, bool]:
@@ -177,14 +210,20 @@ LLM_RESULT = ResultSpec(
         "hint": FieldSpec("The rubric the model was asked to use", "string", stable=True),
         "model": FieldSpec(
             "The registry id of the model that answered (GET /models): options.model, "
-            "else the request's model, else the registry default", "string", stable=True,
+            "else the request's model, else the registry default — under options.mode "
+            "'adaptive', the escalation model's id when it escalated "
+            "(detail.escalation); under a `mean` aggregate, the first member's (adaptive "
+            "members may differ — each unit's is in items[])", "string", stable=True,
         ),
         "image_sent": FieldSpec(
-            "Whether the page image was attached (never, for a text-only model)", "boolean",
+            "Whether the page image was attached to the call that answered (never, for "
+            "a text-only model); under a `mean` aggregate, the first member's (each "
+            "unit's is in items[])", "boolean",
             stable=True,
         ),
         "text_sent": FieldSpec(
-            "The text attached: `{chars, truncated, budget, source}`", "object",
+            "The text attached to the call that answered: `{chars, truncated, budget, "
+            "source}` (budget: that model's text_char_budget)", "object",
         ),
         "confidence": FieldSpec(
             "How sure the model was, measured per models.yaml `confidence.method` "
@@ -198,13 +237,33 @@ LLM_RESULT = ResultSpec(
             "one-token readout's digit probabilities, score = digit + 1), `stated` is "
             "null, headline is `readout` (or `calibrated` after the entry's "
             "fast.calibration.rating), and the block adds `unseen_bound` (an estimate of "
-            "what the digits missing from the top-k hold); the whole block is null for a "
+            "what the digits missing from the top-k hold); under options.mode 'adaptive' "
+            "it is the readout's block when the readout stood and the escalation model's "
+            "measured block when it escalated; the whole block is null for a "
             "`score: false` criterion",
             "object", nullable=True,
         ),
         "mode": FieldSpec(
             "How the model answered: `reasoned` | `fast` — the criterion's options.mode "
-            "as sent", "string", stable=True, when="options.mode was sent",
+            "as sent; under 'adaptive', `fast` when the readout stood and `reasoned` when "
+            "it escalated; under a `mean` aggregate, the first member's (adaptive members "
+            "may differ — each unit's is in items[])", "string", stable=True,
+            when="options.mode was sent",
+        ),
+        "escalation": FieldSpec(
+            "What the adaptive mode did: `{escalated, model, threshold, signal, why, "
+            "error, fast}` — `model` the escalation model's id (CLASSIFIER_ESCALATION_MODEL), "
+            "`threshold` the 0-100 confidence it escalates under (options.escalate_below, "
+            "else the model's fast.escalate_below.rating), `signal` the readout's "
+            "confidence (null when the readout was incomplete / capped, and under "
+            "`score: false`), `why` null | 'confidence 62 < 80' | the readout's "
+            "'readout incomplete: …' / 'probability cap reached: …', `error` null or why "
+            "the escalation failed (the readout's answer then stands, escalated false; "
+            "under `score: false` an unparseable answer is not quoted), "
+            "`fast` null or — only when it escalated — the readout it replaced: "
+            "`{model, score, verdict, confidence, coverage}` (score / verdict / confidence "
+            "null when the readout was incomplete, and under `score: false`)",
+            "object", when="options.mode was 'adaptive'",
         ),
         "reference": REFERENCE_FIELD,
         "aggregate": AGGREGATE_FIELD,
@@ -220,10 +279,24 @@ LLM_RESULT = ResultSpec(
         "the confidence round(100 × that band's probability) and the reason a "
         "service-written line of the three band probabilities (without them for a "
         "`score: false` criterion).",
+        "Under options.mode 'adaptive' the readout answers unless its confidence is under "
+        "the threshold or it could not be read; then the escalation model's reasoned "
+        "scoring call answers (detail.model, detail.confidence and every top-level field "
+        "are its), never guided by references. A failed escalation keeps a complete "
+        "readout's answer (detail.escalation.error); the unit errors only when the "
+        "readout was incomplete too.",
         "Box-loop results are in `localization`, not `detail`.",
         "A cv criterion answered by the llm fallback has this shape, `reference` included.",
     ),
 )
+
+# The keys of detail.escalation and of its `fast` (the readout an escalation
+# replaced) — the shape LLM_RESULT's `escalation` field describes, built by
+# _adaptive below; for the tests and for callers.
+ESCALATION_KEYS: tuple[str, ...] = (
+    "escalated", "model", "threshold", "signal", "why", "error", "fast",
+)
+ESCALATION_FAST_KEYS: tuple[str, ...] = ("model", "score", "verdict", "confidence", "coverage")
 
 
 @result_spec(LLM_RESULT)
@@ -250,15 +323,21 @@ async def evaluate_with(
     false`` unit's judgement afterwards (``analysis.scheduler._unjudged``) but
     keeps its reason — a model-written explanation. A fast readout's reason is
     nothing but its band probabilities, i.e. the judgement, so an unjudged
-    fast unit is given ``config.FAST_REASON_UNJUDGED`` instead.
+    fast unit is given ``config.FAST_REASON_UNJUDGED`` instead. The adaptive
+    escalation decision still reads the readout's confidence (the scheduler
+    then clears ``detail.escalation``'s judgement too); an adaptive readout
+    that stood is unjudged ``FAST_REASON_UNJUDGED`` as well, an escalated one
+    keeps the escalation model's reason.
 
     Raises:
         llm.client.LLMCallError: The scoring call failed (HTTP error, or no
             parseable answer after MAX_LLM_RETRIES) — for guided calls, every
-            one of them did. The scheduler turns it into ``status: "error"``.
+            one of them did; a readout's own request failed. The scheduler
+            turns it into ``status: "error"``.
         EvaluationError: A guiding reference was deleted after submit, the
-            model is text-only and the item has no text at all, or a fast
-            readout was incomplete / capped.
+            model is text-only and the item has no text at all, a fast
+            readout was incomplete / capped, or an adaptive one was AND its
+            escalation failed.
     """
     spec = model_for(opts, ctx)
     _, layer = await ctx.text_document(opts["ocr"])
@@ -288,6 +367,11 @@ async def evaluate_with(
 
     mode = opts.get("mode")
     reference_detail: Optional[dict] = None
+    # What the reported answer's call was: its model and what it was sent —
+    # the criterion's own unless an adaptive readout escalated.
+    answered = _Sent(spec, image_b64 is not None, _text_sent(text, truncated, spec, layer))
+    detail_mode = mode
+    escalation_detail: Optional[dict] = None
     if mode == "fast":
         # The one-token readout: never guided (a fast criterion's guide is
         # an empty one whose note says so), posted once, no retry.
@@ -297,6 +381,24 @@ async def evaluate_with(
         )
         if not judged:
             # The band line IS the judgement `score: false` withholds.
+            answer["reason"] = FAST_REASON_UNJUDGED
+        if reference is not None:
+            reference_detail = reference.unapplied_detail()
+    elif mode == "adaptive":
+        # The readout, then — when it is unsure or unreadable — the reasoned
+        # call on the escalation model. Never guided (an empty guide whose
+        # note says so), as fast.
+        result = await _adaptive(
+            name, opts, spec, ctx, page_b64, text, layer, text_truncated=truncated,
+            judged=judged,
+        )
+        answer, confidence_block, headline = result.answer, result.block, result.headline
+        escalation_detail = result.escalation
+        detail_mode = result.mode
+        if result.sent is not None:
+            answered = result.sent
+        elif not judged:
+            # The readout stood: its band line is the withheld judgement.
             answer["reason"] = FAST_REASON_UNJUDGED
         if reference is not None:
             reference_detail = reference.unapplied_detail()
@@ -314,7 +416,7 @@ async def evaluate_with(
     # fallback) the cap makes this a label update only.
     progress.checkpoint(f"{name}: scored", logger=logger)
 
-    if mode != "fast":
+    if mode not in READOUT_MODES:
         # What the model's own sampling says about this answer (models.yaml
         # `confidence`), and which number is the headline: the stated one,
         # until the entry is flipped to `headline: calibrated` with a fitted
@@ -332,18 +434,14 @@ async def evaluate_with(
         detail=with_metric(
             {
                 "hint": opts["hint"],
-                "model": spec.id,
-                "image_sent": image_b64 is not None,
-                "text_sent": {
-                    "chars": len(text),
-                    "truncated": truncated,
-                    "budget": spec.text_char_budget,
-                    "source": layer.source,
-                },
+                "model": answered.spec.id,
+                "image_sent": answered.image_sent,
+                "text_sent": answered.text_sent,
                 "confidence": confidence_block,
                 # Only when the criterion sent options.mode, so a result
                 # without it is exactly what it always was.
-                **({"mode": mode} if mode is not None else {}),
+                **({"mode": detail_mode} if detail_mode is not None else {}),
+                **({"escalation": escalation_detail} if escalation_detail is not None else {}),
                 **({"reference": reference_detail} if reference_detail is not None else {}),
             },
             "llm", answer["score"],
@@ -421,6 +519,89 @@ async def evaluate_with(
     return outcome
 
 
+@dataclass
+class _Sent:
+    """The call whose answer a unit reports: its model, and what it was sent
+    (``detail.model`` / ``image_sent`` / ``text_sent``)."""
+
+    spec: ModelSpec
+    image_sent: bool
+    text_sent: dict
+
+
+def _text_sent(text: str, truncated: bool, spec: ModelSpec, layer: Any) -> dict:
+    """``detail.text_sent`` for a call that was sent ``text`` under ``spec``'s
+    budget."""
+    return {
+        "chars": len(text),
+        "truncated": truncated,
+        "budget": spec.text_char_budget,
+        "source": layer.source,
+    }
+
+
+def _no_fast_block(spec: ModelSpec) -> EvaluationError:
+    """The unit error for a fast / adaptive criterion whose model lost its
+    ``fast:`` block between submit and run (the submit check refuses it
+    now)."""
+    return EvaluationError(
+        f"model {spec.id!r} has no fast block in models.yaml any more (the registry "
+        f"changed after this job was submitted){FAST_UNIT_ERROR_FIX}"
+    )
+
+
+async def _readout(
+    name: str,
+    opts: dict,
+    spec: ModelSpec,
+    page_b64: Optional[str],
+    text: str,
+    *,
+    document_kind: str,
+    text_truncated: bool,
+) -> tuple[dict, Any]:
+    """The one-token readout for one unit, rated: ``(rated, readout)``.
+
+    ONE ``llm.client.call_readout`` (label ``fast/<name>``, kind ``fast``) of
+    ``build_llm_prompt(style="fast")`` — the digits 0-9, score = digit + 1 —
+    and ``llm.confidence.rate_readout`` over it, after the entry's
+    ``fast.calibration.rating`` temperature when one is fitted. ``rated``
+    has the scoring answer's keys (score, verdict, confidence, reason) and
+    the ``block`` (``detail.confidence``); ``readout`` is the
+    ``common.logprobs.OptionReadout``.
+
+    Raises:
+        EvaluationError: The model has no ``fast:`` block any more (the
+            registry changed after submit).
+        llm.client.ReadoutIncomplete / ReadoutCapped: The readout could not
+            be believed — the caller decides (fast fails the unit, adaptive
+            escalates).
+        llm.client.LLMCallError: The request failed (a server refusing
+            ``top_logprobs`` is named).
+    """
+    if spec.fast is None:
+        raise _no_fast_block(spec)
+    prompt = build_llm_prompt(
+        page_b64, name, opts["hint"], text,
+        document_kind=document_kind, text_truncated=text_truncated, model=spec, style="fast",
+    )
+    readout = await llm_client.call_readout(
+        prompt, labels=FAST_DIGITS, label=f"fast/{name}", model=spec,
+    )
+    rated = llm_confidence.rate_readout(readout, spec.fast.calibration.get(DEFAULT_ANSWER_TYPE))
+    logger.info(
+        "llm_eval: '%s' fast readout on %s → %s (%s, confidence %d, coverage %.3f)",
+        name, spec.id, rated["score"], rated["verdict"], rated["confidence"], readout.coverage,
+    )
+    return rated, readout
+
+
+def _answer(rated: dict) -> dict:
+    """A rated readout as a scoring answer (score, verdict, confidence,
+    reason) — what the box loop's gate reads, as it reads a reasoned one."""
+    return {k: rated[k] for k in ("score", "verdict", "confidence", "reason")}
+
+
 async def _fast(
     name: str,
     opts: dict,
@@ -431,45 +612,221 @@ async def _fast(
     document_kind: str,
     text_truncated: bool,
 ) -> tuple[dict, dict, int]:
-    """The fast readout for one unit: ``(answer, detail.confidence, headline)``.
-
-    ONE ``llm.client.call_readout`` (label ``fast/<name>``, kind ``fast``) of
-    ``build_llm_prompt(style="fast")`` — the digits 0-9, score = digit + 1 —
-    and ``llm.confidence.rate_readout`` over it, after the entry's
-    ``fast.calibration.rating`` temperature when one is fitted. ``answer``
-    has the scoring answer's keys (score, verdict, confidence, reason), so
-    the box loop's gate reads it as it reads a reasoned one.
+    """The fast readout for one unit: ``(answer, detail.confidence, headline)``
+    — :func:`_readout`, whose refusal fails the unit.
 
     Raises:
         EvaluationError: The model has no ``fast:`` block any more (the
             registry changed after submit), or the readout was incomplete or
             capped — the message ends "— use mode 'reasoned' for this
-            criterion".
+            criterion" (``config.FAST_UNIT_ERROR_FIX``).
         llm.client.LLMCallError: The request failed (a server refusing
             ``top_logprobs`` is named).
     """
-    if spec.fast is None:
-        raise EvaluationError(
-            f"model {spec.id!r} has no fast block in models.yaml any more (the registry "
-            "changed after this job was submitted) — use mode 'reasoned' for this criterion"
-        )
-    prompt = build_llm_prompt(
-        page_b64, name, opts["hint"], text,
-        document_kind=document_kind, text_truncated=text_truncated, model=spec, style="fast",
-    )
     try:
-        readout = await llm_client.call_readout(
-            prompt, labels=FAST_DIGITS, label=f"fast/{name}", model=spec,
+        rated, _ = await _readout(
+            name, opts, spec, page_b64, text,
+            document_kind=document_kind, text_truncated=text_truncated,
         )
     except llm_client.ReadoutIncomplete as exc:
-        raise EvaluationError(f"{exc.summary} — use mode 'reasoned' for this criterion") from exc
-    rated = llm_confidence.rate_readout(readout, spec.fast.calibration.get("rating"))
+        raise EvaluationError(f"{exc.summary}{FAST_UNIT_ERROR_FIX}") from exc
+    return _answer(rated), rated["block"], rated["confidence"]
+
+
+@dataclass
+class _Adaptive:
+    """What :func:`_adaptive` reports for one unit."""
+
+    answer: dict                # score, verdict, confidence, reason
+    block: dict                 # detail.confidence
+    headline: int               # the top-level confidence
+    mode: str                   # detail.mode: "fast" (the readout stood) | "reasoned"
+    escalation: dict            # detail.escalation (ESCALATION_KEYS)
+    sent: Optional[_Sent]       # the escalation call, when it answered; None = the readout's
+
+
+class _EscalationFailed(Exception):
+    """The escalation could not run at all (the entry unavailable at run
+    time, a text-only escalation model on a page with no text). Its message
+    is ``detail.escalation.error``."""
+
+
+async def _adaptive(
+    name: str,
+    opts: dict,
+    spec: ModelSpec,
+    ctx: DocumentContext,
+    page_b64: Optional[str],
+    text: str,
+    layer: Any,
+    *,
+    text_truncated: bool,
+    judged: bool,
+) -> _Adaptive:
+    """``options.mode: "adaptive"`` for one unit: the readout on the
+    criterion's model (``spec``), then — only when it is unsure — today's
+    REASONED scoring call on the escalation model.
+
+    **When it escalates.** The readout raised ``ReadoutIncomplete`` (``why``
+    its summary, "readout incomplete: …") or ``ReadoutCapped`` ("probability
+    cap reached: …"), or its SIGNAL — the readout's headline confidence,
+    after the entry's ``fast.calibration.rating`` when fitted, computed even
+    for a ``score: false`` criterion — is under the THRESHOLD:
+    ``options.escalate_below``, else the criterion's model's
+    ``fast.escalate_below.rating`` (``why`` "confidence 62 < 80",
+    ``config.ESCALATION_WHY_CONFIDENCE``; without the number under ``score:
+    false``, whose judgement it is). At or over the threshold the readout is
+    the answer (``detail.mode`` ``fast``).
+
+    **The escalation** (:func:`_escalate`): ``build_llm_prompt`` reasoned —
+    the same hint, the same text layer and OCR rule, truncated to the
+    ESCALATION model's ``text_char_budget``, the page image only when it has
+    ``vision``, its reasoning and budgets — never reference-guided; label
+    ``escalate/<name>`` (call kind ``escalate``), measured per ITS
+    ``confidence.method``. Its answer is the unit's (``detail.mode``
+    ``reasoned``, ``detail.model`` the escalation id, its own
+    ``detail.confidence``), with ``escalation.fast`` the readout it
+    replaced. Counted in ``classifier_escalations_total{model, why,
+    outcome}``.
+
+    **A failed escalation** (an HTTP error, a timeout, an unparseable
+    answer, the entry unavailable at run time, a text-only escalation model
+    with no text): a complete readout's answer stands (``escalated: false``,
+    ``error`` the reason). Only when the readout was incomplete / capped AND
+    the escalation failed does the unit error
+    (``config.ADAPTIVE_BOTH_FAILED``, naming both). Under ``score: false``
+    an unparseable answer (``llm.client.AnswerUnparsed``, whose message
+    quotes the answer's start — its verdict and confidence) is reported as
+    ``config.ESCALATION_UNPARSED_UNJUDGED`` instead; the log line keeps it.
+
+    Raises:
+        EvaluationError: The model has no ``fast:`` block any more, or the
+            readout and the escalation both failed.
+        llm.client.LLMCallError: The readout's own request failed (a
+            transport error is not "unsure": the unit errors as in fast).
+    """
+    if spec.fast is None:
+        raise _no_fast_block(spec)
+    threshold = opts.get("escalate_below")
+    if threshold is None:
+        threshold = spec.fast.escalate_below_for(DEFAULT_ANSWER_TYPE)
+    escalation = llm_models.get_registry().escalation
+    refused: Optional[llm_client.ReadoutIncomplete] = None
+    rated: Optional[dict] = None
+    readout = None
+    try:
+        rated, readout = await _readout(
+            name, opts, spec, page_b64, text,
+            document_kind=ctx.doc.kind, text_truncated=text_truncated,
+        )
+    except llm_client.ReadoutIncomplete as exc:
+        refused = exc
+        readout = exc.readout
+    detail = {
+        "escalated": False,
+        "model": escalation.id,
+        "threshold": int(threshold),
+        "signal": rated["confidence"] if rated is not None else None,
+        "why": None,
+        "error": None,
+        "fast": None,
+    }
+    if rated is not None and rated["confidence"] >= threshold:
+        logger.info(
+            "llm_eval: '%s' adaptive: the readout stands (confidence %d >= %d)",
+            name, rated["confidence"], threshold,
+        )
+        return _Adaptive(_answer(rated), rated["block"], rated["confidence"], "fast", detail, None)
+
+    if refused is not None:
+        detail["why"] = refused.summary
+        metric_why = "cap" if refused.reason == "cap" else "incomplete"
+    else:
+        wording = ESCALATION_WHY_CONFIDENCE if judged else ESCALATION_WHY_CONFIDENCE_UNJUDGED
+        detail["why"] = wording.format(signal=rated["confidence"], threshold=threshold)
+        metric_why = "confidence"
+    try:
+        answer, sent = await _escalate(name, opts, escalation, ctx, page_b64, layer)
+    except (llm_client.LLMCallError, _EscalationFailed) as exc:
+        escalations_total.labels(model=escalation.id, why=metric_why, outcome="failed").inc()
+        logger.warning(
+            "llm_eval: '%s' adaptive: the escalation to %s failed (%s): %s",
+            name, escalation.id, detail["why"], exc,
+        )
+        # An unparseable answer's message quotes the model's answer: under
+        # `score: false` that is a judgement the unit must not report.
+        error = (
+            ESCALATION_UNPARSED_UNJUDGED.format(model=escalation.id, attempts=MAX_LLM_RETRIES)
+            if not judged and isinstance(exc, llm_client.AnswerUnparsed)
+            else str(exc) or type(exc).__name__
+        )
+        if refused is not None:
+            raise EvaluationError(ADAPTIVE_BOTH_FAILED.format(
+                readout=refused.summary, model=escalation.id, error=error,
+            )) from exc
+        detail["error"] = error
+        return _Adaptive(_answer(rated), rated["block"], rated["confidence"], "fast", detail, None)
+
+    escalations_total.labels(model=escalation.id, why=metric_why, outcome="ok").inc()
+    detail["escalated"] = True
+    detail["fast"] = {
+        "model": spec.id,
+        "score": rated["score"] if rated is not None else None,
+        "verdict": rated["verdict"] if rated is not None else None,
+        "confidence": rated["confidence"] if rated is not None else None,
+        "coverage": (
+            round(float(readout.coverage), DETAIL_FLOAT_DECIMALS) if readout is not None else None
+        ),
+    }
+    # The escalation model's own measurement and headline (models.yaml
+    # `confidence`), as for any reasoned answer on it.
+    block, headline = llm_confidence.assess(answer, escalation.confidence)
     logger.info(
-        "llm_eval: '%s' fast readout on %s → %s (%s, confidence %d, coverage %.3f)",
-        name, spec.id, rated["score"], rated["verdict"], rated["confidence"], readout.coverage,
+        "llm_eval: '%s' adaptive: escalated to %s (%s) → %s (%s)",
+        name, escalation.id, detail["why"], answer["score"], answer["verdict"],
     )
-    answer = {k: rated[k] for k in ("score", "verdict", "confidence", "reason")}
-    return answer, rated["block"], rated["confidence"]
+    return _Adaptive(answer, block, headline, "reasoned", detail, sent)
+
+
+async def _escalate(
+    name: str,
+    opts: dict,
+    escalation: ModelSpec,
+    ctx: DocumentContext,
+    page_b64: Optional[str],
+    layer: Any,
+) -> tuple[dict, _Sent]:
+    """The escalation call: today's REASONED scoring call for the criterion,
+    on the ESCALATION model — ``build_llm_prompt`` with the same hint and
+    text layer, the text truncated to ITS ``text_char_budget``, the page
+    image only when it has ``vision`` (``build_llm_prompt`` drops it for a
+    text-only entry), its reasoning, budgets and ``confidence`` request.
+    Never reference-guided. ``(answer, what was sent)``.
+
+    Raises:
+        _EscalationFailed: The entry is unavailable now (its key unset since
+            submit), or it is text-only and the page has no text.
+        llm.client.LLMCallError: The call failed (HTTP, timeout, no parseable
+            answer after the retries).
+    """
+    if not escalation.available:
+        raise _EscalationFailed(ESCALATION_UNAVAILABLE_AT_RUN.format(
+            model=escalation.id, reason=escalation.unavailable_reason,
+        ))
+    text, truncated = _budgeted(layer.text, escalation.text_char_budget)
+    if not escalation.vision and not text.strip():
+        raise _EscalationFailed(ESCALATION_NO_TEXT.format(
+            model=escalation.id, source=layer.source,
+        ))
+    prompt = build_llm_prompt(
+        page_b64, name, opts["hint"], text,
+        document_kind=ctx.doc.kind, text_truncated=truncated, model=escalation,
+    )
+    answer = await llm_client.call_model(
+        prompt, label=f"escalate/{name}", validator=answer_validator(name), model=escalation,
+    )
+    image_sent = bool(page_b64) and escalation.vision
+    return answer, _Sent(escalation, image_sent, _text_sent(text, truncated, escalation, layer))
 
 
 def _box_reference_entry(

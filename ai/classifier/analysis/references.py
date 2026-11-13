@@ -121,6 +121,7 @@ from analysis.ocr import get_ocr_engine
 from analysis.outcome import EvaluationError, Outcome
 from api.schemas import CriterionInput
 from config import (
+    ADAPTIVE_NOT_GUIDED_NOTE,
     FAST_NOT_GUIDED_NOTE,
     REFERENCE_AUTO_MIN_CONFIDENCE,
     REFERENCE_BOX_TEXT,
@@ -430,12 +431,14 @@ class JobReferences:
 
     def guide(self, c: CriterionInput, item: Optional[int] = None) -> Optional[CriterionGuide]:
         """The guidance for ``c`` (on ``item``, for ``auto``); None when the
-        model does not answer it. A fast criterion (``options.mode: "fast"``)
-        is answered but never guided: an empty guide whose note says so
-        (``config.FAST_NOT_GUIDED_NOTE``), so its ``detail.reference`` reads
-        ``applied: false`` with the reason."""
-        if c.answered_by_model() and c.is_fast():
-            return CriterionGuide(c.name, self.mode, self._options(c), [], note=FAST_NOT_GUIDED_NOTE)
+        model does not answer it. A fast or adaptive criterion
+        (``options.mode: "fast"`` / ``"adaptive"``) is answered but never
+        guided: an empty guide whose note says so
+        (``config.FAST_NOT_GUIDED_NOTE`` / ``ADAPTIVE_NOT_GUIDED_NOTE``), so
+        its ``detail.reference`` reads ``applied: false`` with the reason."""
+        if c.answered_by_model() and c.reads_out():
+            note = ADAPTIVE_NOT_GUIDED_NOTE if c.is_adaptive() else FAST_NOT_GUIDED_NOTE
+            return CriterionGuide(c.name, self.mode, self._options(c), [], note=note)
         if not c.guided_by_llm():
             return None
         entry = (self.plan.get("criteria") or {}).get(c.name)

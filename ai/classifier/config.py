@@ -720,22 +720,42 @@ CONFIDENCE_SAMPLING_DEFAULT_VIA: str = "n_param"
 # ---------------------------------------------------------------------------
 # Fast mode — an llm criterion's options.mode (api/, llm/models.py,
 # llm/prompts.py, llm/confidence.py, analysis/llm_eval.py,
-# analysis/references.py)
+# analysis/references.py, bin/confidence_calibration.py)
 # ---------------------------------------------------------------------------
 # The readout's prompt and scale are § Prompt wording, "The fast readout".
-# Here: the mode's values, a models.yaml `fast:` block's defaults, and the
-# wording a CALLER reads (400s, a note, the result's reason — tests pin it
-# verbatim). Constants, not env vars: a per-model value goes in the entry's
-# `fast:` block, which wins over these defaults.
+# Here: the mode's values, a models.yaml `fast:` block's defaults, the
+# adaptive mode's escalation (below), and the wording a CALLER reads (400s, a
+# note, the result's reason, an escalation's `why` — tests pin it verbatim).
+# Constants, not env vars: a per-model value goes in the entry's `fast:`
+# block, which wins over these defaults (the one env var, the escalation
+# model, is read by llm/models.py from the name below).
 #
-# ── The values (api/criterion_options.py LLMOptions.mode; llm/prompts.py
-#    build_llm_prompt's style — llm/ never imports api/) ─────────────────
-MODES: tuple[str, ...] = ("reasoned", "fast")
+# ── The values (api/criterion_options.py LLMOptions.mode, whose Literal a
+#    test pins to MODES) ────────────────────────────────────────────────────
+# reasoned  the scoring call, as every criterion always ran (null = this);
+# fast      the one-token readout alone;
+# adaptive  the readout, then — when it is unsure (its confidence under the
+#           threshold) or could not be read (incomplete / capped) — the
+#           reasoned scoring call on the ESCALATION model.
+MODES: tuple[str, ...] = ("reasoned", "fast", "adaptive")
 DEFAULT_MODE: str = "reasoned"  # what options.mode null means
+# The modes that start with the readout: they need a `fast:` block on the
+# criterion's model and are never guided by references
+# (api/criterion_options.py reads_out, guided_by_references).
+READOUT_MODES: tuple[str, ...] = ("fast", "adaptive")
+# The prompts build_llm_prompt writes (llm/prompts.py `style`; llm/ never
+# imports api/). Adaptive has none of its own: its readout is the fast prompt
+# and its escalation the reasoned one.
+PROMPT_STYLES: tuple[str, ...] = ("reasoned", "fast")
 
 # ── A `fast:` block's defaults and bounds (llm/models.py FastConfig) ──────
-# The answer types fast.calibration may be fitted for (the 1-10 rating only).
+# The answer types fast.calibration may be fitted for and fast.escalate_below
+# set per (the 1-10 rating only).
 FAST_ANSWER_TYPES: tuple[str, ...] = ("rating",)
+# The answer type of every criterion today — the 1-10 rating (typed answers
+# are ZT-603 phase 3): whose calibration and threshold a readout reads
+# (analysis/llm_eval.py, bin/confidence_calibration.py).
+DEFAULT_ANSWER_TYPE: str = "rating"
 # The load-time floor on fast.top_logprobs: every digit, plus one more token.
 FAST_MIN_TOP_LOGPROBS: int = len(FAST_DIGITS) + 1
 # Alternatives asked for — vLLM's --max-logprobs default; never above the server's.
@@ -747,6 +767,29 @@ FAST_DEFAULT_MAX_UNSEEN_MASS: float = 0.02
 # Merged into a fast body (greedy); copied per entry, never shared.
 FAST_DEFAULT_EXTRA_BODY: dict = {"temperature": 0}
 
+# ── Adaptive: the escalation model and the threshold (llm/models.py
+#    parse_registry / FastConfig.escalate_below, api/criterion_options.py
+#    LLMOptions.escalate_below, analysis/llm_eval.py _adaptive) ───────────
+# The env var naming the ONE models.yaml entry an adaptive criterion
+# escalates to — read by llm/models.py parse_registry from the env mapping it
+# is given (never at config import). Unset or empty = the registry `default`.
+# An id that is not in models.yaml stops startup (decided on static facts —
+# no DNS at load); an unavailable entry (its key unset) logs a startup WARN
+# and makes adaptive a 400 at submit. It may be external (an https entry
+# with a key): the operator designates it, and GET /models `escalation`
+# reports where adaptive may send pages.
+ESCALATION_MODEL_ENV: str = "CLASSIFIER_ESCALATION_MODEL"
+# The bounds of a threshold — options.escalate_below and an entry's
+# fast.escalate_below.<answer type>: the readout's 0-100 confidence under it
+# escalates (0 = never on confidence, only an incomplete / capped readout;
+# 100 = always, unless the readout says 100).
+ESCALATE_BELOW_MIN: int = 0
+ESCALATE_BELOW_MAX: int = 100
+# fast.escalate_below for an answer type the entry does not set. A guess
+# until bin/confidence_calibration.py --mode fast's escalation curve sets it
+# per model.
+FAST_DEFAULT_ESCALATE_BELOW: int = 80
+
 # ── The wording a caller reads ──────────────────────────────────────────
 # 400: a request-level `mode` (api/schemas.py, api/reference_schemas.py,
 # api/assess.py and api/references.py's multipart forms).
@@ -757,29 +800,109 @@ MODE_NOT_REQUEST_LEVEL: str = (
 )
 # 400: `mode` at a criterion's top level (api/schemas.py CriterionInput).
 MODE_IN_OPTIONS: str = (
-    "mode belongs in options: options.mode on an llm criterion (reasoned | fast)"
+    "mode belongs in options: options.mode on an llm criterion (reasoned | fast | adaptive)"
 )
 # 400: options.mode on a type that has none, by type (api/schemas.py).
 MODE_REFUSED_BY_TYPE: dict[str, str] = {
-    "text": "only an llm criterion has a mode (reasoned | fast); a text criterion is a "
-            "deterministic search of the text layer — no model answers it",
-    "detector": "only an llm criterion has a mode (reasoned | fast); a detector criterion is "
-                "answered by the open-vocabulary detector — no model reasons about it",
-    "cv": "only an llm criterion has a mode (reasoned | fast); a cv criterion is answered by "
-          "an OpenCV detector, the detector service or its llm fallback, which always runs "
-          "reasoned — use an llm criterion for a fast readout",
+    "text": "only an llm criterion has a mode (reasoned | fast | adaptive); a text criterion "
+            "is a deterministic search of the text layer — no model answers it",
+    "detector": "only an llm criterion has a mode (reasoned | fast | adaptive); a detector "
+                "criterion is answered by the open-vocabulary detector — no model reasons "
+                "about it",
+    "cv": "only an llm criterion has a mode (reasoned | fast | adaptive); a cv criterion is "
+          "answered by an OpenCV detector, the detector service or its llm fallback, which "
+          "always runs reasoned — use an llm criterion for a fast readout",
 }
-# 400: options.reference on a fast criterion (api/schemas.py CriterionInput).
+# 400: options.escalate_below set (a value, not null) on an llm criterion
+# whose mode is not 'adaptive' (api/criterion_options.py LLMOptions), and the
+# key on another type, which has no such option (api/schemas.py
+# CriterionInput).
+ESCALATE_BELOW_NEEDS_ADAPTIVE: str = (
+    "escalate_below is the adaptive mode's threshold (a readout whose confidence is under "
+    "it escalates to the reasoned call); set options.mode 'adaptive' or drop escalate_below"
+)
+ESCALATE_BELOW_NOT_LLM: str = (
+    "only an llm criterion with options.mode 'adaptive' has an escalation threshold; drop "
+    "escalate_below"
+)
+# 400: options.reference on a fast / adaptive criterion (api/schemas.py
+# CriterionInput).
 FAST_NOT_GUIDED: str = (
     "references guide the reasoned scoring call, and options.mode 'fast' is a one-token "
     "readout with no reasoning for an example to steer; drop options.reference or use "
     "mode 'reasoned'"
 )
-# detail.reference.note on a fast criterion in a request with references
-# (analysis/references.py JobReferences.guide): answered, never guided.
+ADAPTIVE_NOT_GUIDED: str = (
+    "references guide the reasoned scoring call, and options.mode 'adaptive' starts with a "
+    "one-token readout (its escalation is never guided either); drop options.reference or "
+    "use mode 'reasoned'"
+)
+# detail.reference.note on a fast / adaptive criterion in a request with
+# references (analysis/references.py JobReferences.guide): answered, never
+# guided.
 FAST_NOT_GUIDED_NOTE: str = (
     "options.mode 'fast' is not guided by references: a one-token readout has no "
     "reasoning for an example to steer — use mode 'reasoned' for a guided criterion"
+)
+ADAPTIVE_NOT_GUIDED_NOTE: str = (
+    "options.mode 'adaptive' is not guided by references: it starts with a one-token "
+    "readout, and its escalation is never guided either — use mode 'reasoned' for a "
+    "guided criterion"
+)
+# 400: options.mode 'fast' / 'adaptive' (both start with the readout) on an
+# effective model with no `fast:` block (api/schemas.py check_model_rules).
+# {name}, {mode}, {model}, {source} (READOUT_MODEL_SOURCE: where the model
+# came from), {starts} (READOUT_ADAPTIVE_STARTS for adaptive, else empty) and
+# {capable} (Registry.fast_ids(), else READOUT_NONE_CAPABLE) filled in.
+READOUT_NO_FAST_BLOCK: str = (
+    "criterion {name!r} has options.mode {mode!r}, and its model {model!r} ({source}) has no "
+    "`fast` block in models.yaml — its reasoning cannot be turned off{starts}; fast-capable "
+    "models: {capable} (GET /models supports.fast) — set options.model to one, or use mode "
+    "'reasoned'"
+)
+READOUT_MODEL_SOURCE: dict[str, str] = {
+    "option": "its options.model",
+    "request": "the request's `model`",
+    "default": "the registry default",
+}
+READOUT_ADAPTIVE_STARTS: str = " (adaptive starts with the fast readout)"
+READOUT_NONE_CAPABLE: str = "none on this container"
+# The role each model plays in api/assess.py's 400 for a text-only model on a
+# photo with no OCR: the criterion's own model, and an adaptive criterion's
+# escalation model, which must answer its items too ("'q' (escalation model
+# 'x')").
+TEXT_ONLY_MODEL_ROLES: dict[str, str] = {"model": "model", "escalation": "escalation model"}
+# 400: an adaptive criterion while the escalation model is unavailable (its
+# API key variable unset) — api/schemas.py check_model_rules.
+ADAPTIVE_ESCALATION_UNAVAILABLE: str = (
+    "criterion {name!r} has options.mode 'adaptive', and the escalation model {model!r} ("
+    + ESCALATION_MODEL_ENV + "; GET /models escalation) is unavailable: {reason} — make it "
+    "available, point " + ESCALATION_MODEL_ENV + " at an available entry, or use mode "
+    "'fast' or 'reasoned'"
+)
+# 400: POST /references with an explicit fast / adaptive criterion
+# (api/reference_schemas.py ReferenceRequest); {mode} and {names} filled in.
+REFERENCE_REFUSES_READOUT_MODE: str = (
+    "options.mode {mode!r} on {names}: a reference records reasoned 1-10 answers (its "
+    "expected answer becomes a later prompt's caption); drop options.mode or use 'reasoned'"
+)
+# A reference's warning when from_job does not copy a unit's answer and
+# observation (api/references.py _resolve_from_job): the job ran the
+# criterion fast, or adaptive and its readout stood (it did not escalate — or
+# the unit errored). {name}, {job_id}, {ran} (FROM_JOB_RAN_AS by mode) and
+# {then} (FROM_JOB_THEN_BREAKDOWN / FROM_JOB_THEN_RESCORED) filled in.
+FROM_JOB_READOUT_NOT_COPIED: str = (
+    "{name!r}: job {job_id!r} {ran}, which is never copied as an expected answer or an "
+    "observation — {then}"
+)
+FROM_JOB_RAN_AS: dict[str, str] = {
+    "fast": "ran it as a fast readout (options.mode 'fast')",
+    "adaptive": "ran it adaptive (options.mode 'adaptive') and has no reasoned answer for it "
+                "— the fast readout stood (it did not escalate) or the unit errored",
+}
+FROM_JOB_THEN_BREAKDOWN: str = "your breakdown is the answer"
+FROM_JOB_THEN_RESCORED: str = (
+    "the creation job scores it reasoned; send breakdown[{name!r}] to set it yourself"
 )
 # A fast result's `reason` (llm/confidence.py rate_readout): a readout writes
 # none, so the service writes the band probabilities — and, for a `score:
@@ -789,6 +912,66 @@ FAST_REASON: str = (
     "Fast readout (no reasoning): PASS {PASS:.2f}, MARGINAL {MARGINAL:.2f}, FAIL {FAIL:.2f}."
 )
 FAST_REASON_UNJUDGED: str = "Fast readout (no reasoning)."
+# A readout that failed its unit names the fix (analysis/llm_eval.py — an
+# incomplete / capped readout in mode 'fast', a model that lost its fast
+# block): appended after the message.
+FAST_UNIT_ERROR_FIX: str = " — use mode 'reasoned' for this criterion"
+# detail.escalation.why (analysis/llm_eval.py _adaptive) when the readout's
+# confidence was under the threshold; under `score: false` (whose judgement
+# the number is — detail.escalation.signal is null there) the line without
+# it. An incomplete / capped readout's why is the readout's own summary
+# ("readout incomplete: …" / "probability cap reached: …").
+ESCALATION_WHY_CONFIDENCE: str = "confidence {signal} < {threshold}"
+ESCALATION_WHY_CONFIDENCE_UNJUDGED: str = "confidence < {threshold}"
+# detail.escalation.error when the escalation could not run at all
+# (analysis/llm_eval.py _escalate): the entry lost its key after submit, or a
+# text-only escalation model met a page with no text. A failed call's error
+# is the call's own message — except an unparseable answer under `score:
+# false`: that message quotes the start of the model's answer, which can
+# carry the verdict and confidence the criterion does not report, so the
+# unit says only this (the service log keeps the full message).
+ESCALATION_UNAVAILABLE_AT_RUN: str = "escalation model {model!r} is unavailable: {reason}"
+ESCALATION_NO_TEXT: str = (
+    "escalation model {model!r} is text-only and this page has no text layer (source "
+    "{source!r})"
+)
+ESCALATION_UNPARSED_UNJUDGED: str = (
+    "model {model!r}'s answer could not be parsed after {attempts} attempts (not quoted: a "
+    "`score: false` criterion reports no judgement)"
+)
+# The unit's error when the readout could not be read AND the escalation
+# failed — the only adaptive case with no answer (analysis/llm_eval.py).
+ADAPTIVE_BOTH_FAILED: str = (
+    "{readout} — and the escalation to model {model!r} failed: {error}"
+)
+# GET /criterion-types `mode` block (api/criterion_options.py
+# criterion_types): where options.mode applies, what each mode does, where
+# the escalation model is described, how the threshold resolves, identity.
+MODE_APPLIES_TO: str = (
+    "llm criteria (a 400 on cv / text / detector, and at the top level of a request or a "
+    "criterion)"
+)
+ESCALATION_CATALOG: str = "GET /models escalation"
+MODE_FAST_SUMMARY: str = (
+    "reasoning off, one token: a digit 0-9 read from its probabilities (score = digit + 1); "
+    "no model-written reason; never guided by references; the box loop still runs reasoned"
+)
+MODE_ADAPTIVE_SUMMARY: str = (
+    "the fast readout first; when its confidence is under the threshold, or it could not be "
+    "read (incomplete / the probability cap), the reasoned scoring call on the escalation "
+    "model (" + ESCALATION_MODEL_ENV + ", GET /models escalation) answers instead — its "
+    "answer, detail.model and detail.confidence; detail.escalation says what happened. A "
+    "failed escalation keeps a complete readout's answer. Never guided by references; the "
+    "box loop runs on the criterion's own model, reasoned"
+)
+ESCALATE_BELOW_RESOLUTION: str = (
+    "options.escalate_below (adaptive only), else the criterion's model's models.yaml "
+    "fast.escalate_below.rating (GET /models fast.escalate_below), else the service default"
+)
+MODE_IDENTITY_NOTE: str = (
+    "options.mode and options.escalate_below are not part of a criterion's identity "
+    "('reasoned' equals unset)"
+)
 
 # ---------------------------------------------------------------------------
 # State: the classifier-db Postgres, and the files beside it on /data

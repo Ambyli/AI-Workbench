@@ -12,17 +12,21 @@ bind-mounted read-only over the same path in the container), validated here:
                       ``default``, an ``api_key_env`` on a plain-``http://``
                       URL to a dotted host, a reasoning key set twice, a
                       "Reasoning strength" system line on Muse Glimmer, an
-                      unavailable default.
+                      unavailable default, a ``CLASSIFIER_ESCALATION_MODEL``
+                      that names no entry.
     get_registry()    the process-wide registry, loaded on first use from
                       ``DEFAULT_PATH``. Every caller looks it up at CALL time,
                       so ``use_registry()`` (tests) swaps it everywhere.
     startup_check()   what ``main``'s lifespan runs first: load (so a bad file
-                      fails startup with its reason), log the entries, and
-                      WARN once about any removed env var still set.
-    Registry          the entries by id, the default, ``resolve(id)``,
-                      ``check_selectable(id)`` (the 400 messages),
-                      ``fast_ids()`` (where ``mode: "fast"`` may run) and
-                      ``public()`` (the GET /models payload — never a key).
+                      fails startup with its reason), log the entries (the
+                      ``[default]`` and the ``[escalation]`` marked), WARN
+                      once about any removed env var still set, and WARN
+                      when the escalation model is unavailable.
+    Registry          the entries by id, the default, the ``escalation``
+                      model, ``resolve(id)``, ``check_selectable(id)`` (the
+                      400 messages), ``fast_ids()`` (where ``mode: "fast"``
+                      may run) and ``public()`` (the GET /models payload —
+                      never a key).
     ModelSpec         one loaded entry: everything a prompt builder and the
                       transport need (``body()``; ``fast_body()`` for a
                       readout), plus its own ``ConcurrencyLimit``.
@@ -57,14 +61,28 @@ the ``chat_template_kwargs`` that turn reasoning off, the body extras
 (default ``{temperature: 0}``), ``top_logprobs`` (≥ 11, never above the
 server's ``--max-logprobs``), ``min_coverage`` / ``max_unseen_mass`` (when a
 readout is believed — ``llm.client.call_readout``), ``strip_markers`` (caller
-text that would turn thinking back on) and a per-answer-type
-``calibration``. ``ModelSpec.fast_body`` builds the request. No block = fast
-is a 400 on that entry; nothing branches on a model name. Load refuses a
+text that would turn thinking back on), a per-answer-type
+``calibration`` and a per-answer-type ``escalate_below`` (0-100: an
+``options.mode: "adaptive"`` criterion escalates when its readout's
+confidence is under it; a type left out is filled with the default at load).
+``ModelSpec.fast_body`` builds the request. No block = fast and adaptive are
+a 400 on that entry; nothing branches on a model name. Load refuses a
 reserved key in ``fast.extra_body`` (as in ``confidence.logprobs.request``,
 plus ``logprobs`` / ``top_logprobs``), ``top_logprobs`` under 11, a
-``max_unseen_mass`` of 0 (it would cap every readout) and an unknown
-calibration answer type. The defaults, that floor (11) and the answer types
-are ``config.py`` § Fast mode.
+``max_unseen_mass`` of 0 (it would cap every readout), an unknown
+calibration or escalate_below answer type and a threshold outside 0-100. The
+defaults, that floor (11), the bounds and the answer types are ``config.py``
+§ Fast mode.
+
+**The escalation model.** ``CLASSIFIER_ESCALATION_MODEL`` names the ONE entry
+an adaptive criterion escalates to (its reasoned scoring call); unset is the
+default. It is read by :func:`parse_registry` from the env mapping it is
+given (the same one the keys come from), decided on static facts only — an
+id that is not an entry stops the container, and nothing resolves a host at
+load. It may be an external entry (Claude): the operator designates it, and
+``GET /models`` reports it as ``escalation: {id, host, authenticated,
+available}``. Unavailable (its key unset), ``startup_check`` warns and
+adaptive is a 400 at submit.
 
 **Replaced settings.** The registry replaced ``VISION_LLM_API``,
 ``VISION_LLM_MODEL``, ``VISION_LLM_REASONING_STRENGTH`` /
@@ -91,7 +109,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping, Optional
+from typing import Annotated, Any, Literal, Mapping, Optional
 from urllib.parse import urlsplit
 
 import yaml
@@ -112,7 +130,11 @@ from config import (
     CONFIDENCE_SAMPLING_DEFAULT_VIA,
     CONFIDENCE_SAMPLING_MAX_N,
     CONFIDENCE_SAMPLING_MIN_N,
+    ESCALATE_BELOW_MAX,
+    ESCALATE_BELOW_MIN,
+    ESCALATION_MODEL_ENV,
     FAST_ANSWER_TYPES,
+    FAST_DEFAULT_ESCALATE_BELOW,
     FAST_DEFAULT_EXTRA_BODY,
     FAST_DEFAULT_MAX_UNSEEN_MASS,
     FAST_DEFAULT_MIN_COVERAGE,
@@ -380,11 +402,16 @@ class ConfidenceConfig(_Strict):
 # config.py § Fast mode (FAST_DEFAULT_*, FAST_MIN_TOP_LOGPROBS,
 # FAST_ANSWER_TYPES); an entry's own value wins.
 
-# A fast.calibration key: one of config.FAST_ANSWER_TYPES (the 1-10 rating
-# only today; typed answers — yes / no, choice, levels — join when they exist).
-# Written out for type checkers (a Literal cannot take a variable); a test
-# pins typing.get_args(FastAnswerType) == config.FAST_ANSWER_TYPES.
+# A fast.calibration / fast.escalate_below key: one of config.FAST_ANSWER_TYPES
+# (the 1-10 rating only today; typed answers — yes / no, choice, levels — join
+# when they exist). Written out for type checkers (a Literal cannot take a
+# variable); a test pins typing.get_args(FastAnswerType) ==
+# config.FAST_ANSWER_TYPES.
 FastAnswerType = Literal["rating"]
+
+# One fast.escalate_below value: the 0-100 readout confidence under which an
+# adaptive criterion escalates (config.ESCALATE_BELOW_MIN / _MAX).
+EscalateBelow = Annotated[int, Field(ge=ESCALATE_BELOW_MIN, le=ESCALATE_BELOW_MAX)]
 
 # Body keys fast.extra_body may not set: the confidence block's reserved keys
 # (model / messages / the token field / response_format / chat_template_kwargs
@@ -395,8 +422,8 @@ _FAST_RESERVED = _CONFIDENCE_RESERVED | {"logprobs", "top_logprobs"}
 class FastCalibration(_Strict):
     """``fast.calibration.<answer type>`` — a fitted temperature (and, for a
     two-way answer, a Platt bias) applied to the readout before it is
-    reported (``bin/confidence_calibration.py --mode fast`` will print it —
-    ZT-603 phase 2, not built yet)."""
+    reported (``bin/confidence_calibration.py --mode fast`` fits and prints
+    it, with the ``escalate_below`` its escalation curve suggests)."""
 
     temperature: float = Field(gt=0.0, description="p ∝ exp(logprob / temperature)")
     bias: float = Field(
@@ -455,6 +482,14 @@ class FastConfig(_Strict):
         description="Per answer type: {temperature, bias, n, fitted_on, ground_truth}. "
                     "{} = uncalibrated (the raw readout is reported).",
     )
+    escalate_below: dict[FastAnswerType, EscalateBelow] = Field(
+        default_factory=dict,
+        description="Per answer type, 0-100: an options.mode 'adaptive' criterion on this "
+                    "entry escalates to the escalation model's reasoned call when the "
+                    "readout's confidence (the headline, after calibration) is under it, "
+                    "unless the criterion sends options.escalate_below. A type left out is "
+                    "config.FAST_DEFAULT_ESCALATE_BELOW (filled in at load).",
+    )
 
     @field_validator("strip_markers")
     @classmethod
@@ -475,6 +510,21 @@ class FastConfig(_Strict):
             )
         return self
 
+    @model_validator(mode="after")
+    def _every_threshold(self) -> "FastConfig":
+        """``escalate_below`` complete: every answer type, the default where
+        the entry left one out — so ``GET /models`` shows what will run."""
+        self.escalate_below = {
+            t: int(self.escalate_below.get(t, FAST_DEFAULT_ESCALATE_BELOW))
+            for t in FAST_ANSWER_TYPES
+        }
+        return self
+
+    def escalate_below_for(self, answer_type: str) -> int:
+        """The threshold an adaptive criterion of ``answer_type`` escalates
+        under on this entry (its ``options.escalate_below`` wins)."""
+        return int(self.escalate_below.get(answer_type, FAST_DEFAULT_ESCALATE_BELOW))
+
     def public(self) -> dict[str, Any]:
         """The GET /models ``fast`` block — never the body extras."""
         return {
@@ -482,6 +532,7 @@ class FastConfig(_Strict):
             "min_coverage": self.min_coverage,
             "max_unseen_mass": self.max_unseen_mass,
             "calibrated": [t for t in FAST_ANSWER_TYPES if t in self.calibration],
+            "escalate_below": dict(self.escalate_below),
         }
 
 
@@ -626,10 +677,10 @@ class ModelSpec:
     # body() for score calls, by llm.client (what to extract) and by
     # llm.confidence (the signals, the headline).
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
-    # The parsed `fast:` block, or None (fast is then a 400 on this entry).
-    # Read by fast_body(), llm.client.call_readout (top_logprobs, min_coverage,
-    # max_unseen_mass), llm.prompts (strip_markers) and analysis.llm_eval
-    # (calibration).
+    # The parsed `fast:` block, or None (fast / adaptive are then a 400 on
+    # this entry). Read by fast_body(), llm.client.call_readout (top_logprobs,
+    # min_coverage, max_unseen_mass), llm.prompts (strip_markers) and
+    # analysis.llm_eval (calibration, escalate_below).
     fast: Optional[FastConfig] = None
     _headers: dict[str, str] = field(default_factory=dict, repr=False)
     limit: ConcurrencyLimit = field(init=False, repr=False)
@@ -752,8 +803,8 @@ class ModelSpec:
         """The GET /models entry. Never a key value — only whether there is one.
 
         ``fast`` is null without a ``fast:`` block, else ``{top_logprobs,
-        min_coverage, max_unseen_mass, calibrated: [answer types]}`` — never
-        the body extras."""
+        min_coverage, max_unseen_mass, calibrated: [answer types],
+        escalate_below: {answer type: 0-100}}`` — never the body extras."""
         parts = urlsplit(self.url)
         return {
             "id": self.id,
@@ -785,22 +836,55 @@ class ModelSpec:
                 "headline": self.confidence.headline,
                 "calibrated": self.confidence.calibration is not None,
             },
-            # The one-token readout (options.mode "fast"): null = not here.
+            # The one-token readout (options.mode "fast" / "adaptive"): null =
+            # not here.
             "fast": self.fast.public() if self.fast is not None else None,
+        }
+
+    def where(self) -> dict[str, Any]:
+        """``{id, host, authenticated, available}`` — where a request to this
+        entry goes (GET /models ``escalation``)."""
+        return {
+            "id": self.id,
+            "host": urlsplit(self.url).hostname,
+            "authenticated": self.authenticated,
+            "available": self.available,
         }
 
 
 class Registry:
-    """The loaded entries, by id, and the default."""
+    """The loaded entries, by id, the default and the escalation model.
 
-    def __init__(self, models: dict[str, ModelSpec], default: str, *, path: Optional[Path] = None):
+    ``escalation`` (``escalation_id``) is the ONE entry an ``options.mode:
+    "adaptive"`` criterion escalates to — ``CLASSIFIER_ESCALATION_MODEL``
+    (``config.ESCALATION_MODEL_ENV``), read by :func:`parse_registry`; None
+    here means the default. It is the same ``ModelSpec`` as its entry, so it
+    shares that entry's ``ConcurrencyLimit`` (and ``db.pool_max`` does not
+    change). It may be unavailable (its key unset): adaptive is then a 400 at
+    submit (``api.schemas.check_model_rules``)."""
+
+    def __init__(
+        self,
+        models: dict[str, ModelSpec],
+        default: str,
+        *,
+        path: Optional[Path] = None,
+        escalation: Optional[str] = None,
+    ):
         self.models = dict(models)
         self.default_id = default
         self.path = path
+        self.escalation_id = escalation or default
 
     @property
     def default(self) -> ModelSpec:
         return self.models[self.default_id]
+
+    @property
+    def escalation(self) -> ModelSpec:
+        """The entry an adaptive criterion escalates to (the default when
+        ``CLASSIFIER_ESCALATION_MODEL`` is unset)."""
+        return self.models[self.escalation_id]
 
     def ids(self) -> list[str]:
         return list(self.models)
@@ -839,18 +923,23 @@ class Registry:
         return spec
 
     def fast_ids(self) -> list[str]:
-        """The ids ``options.mode: "fast"`` may run on: entries with a
-        ``fast:`` block that are available, in file order."""
+        """The ids ``options.mode: "fast"`` (and the readout of ``"adaptive"``)
+        may run on: entries with a ``fast:`` block that are available, in file
+        order."""
         return [mid for mid, spec in self.models.items() if spec.supports_fast and spec.available]
 
     def total_concurrency(self) -> int:
-        """Σ max_concurrent — every request slot the registry can hold at once."""
+        """Σ max_concurrent — every request slot the registry can hold at once.
+        The escalation model is one of the entries, counted once."""
         return sum(spec.max_concurrent for spec in self.models.values())
 
     def public(self) -> dict[str, Any]:
-        """The GET /models payload."""
+        """The GET /models payload: ``{default, escalation: {id, host,
+        authenticated, available}, models: [...]}`` — ``escalation`` says
+        where an adaptive criterion may send its pages."""
         return {
             "default": self.default_id,
+            "escalation": self.escalation.where(),
             "models": [spec.public() for spec in self.models.values()],
         }
 
@@ -941,7 +1030,16 @@ def _build(model_id: str, entry: ModelEntry, env: Mapping[str, str]) -> ModelSpe
 def parse_registry(
     data: Any, *, env: Optional[Mapping[str, str]] = None, path: Optional[Path] = None
 ) -> Registry:
-    """A parsed YAML document → ``Registry``. Raises ``RegistryError``."""
+    """A parsed YAML document → ``Registry``. Raises ``RegistryError``.
+
+    ``env`` (default ``os.environ``) gives each entry's API key and
+    ``CLASSIFIER_ESCALATION_MODEL`` (``config.ESCALATION_MODEL_ENV``): the
+    entry adaptive criteria escalate to — unset or empty is the default; an
+    id that is not an entry is a ``RegistryError``. Every check here is on
+    STATIC facts — the file and the env mapping: nothing resolves a host or
+    opens a connection (the image build and the offline test registries
+    call this, and a DNS lookup would fail them whenever the target is
+    down). An unavailable escalation entry loads; ``startup_check`` warns."""
     env = os.environ if env is None else env
     where = str(path) if path else "models.yaml"
     try:
@@ -949,7 +1047,14 @@ def parse_registry(
     except ValidationError as exc:
         raise RegistryError(f"{where} is not a valid model registry: {_format(exc)}") from None
     specs = {mid: _build(mid, entry, env) for mid, entry in parsed.models.items()}
-    registry = Registry(specs, parsed.default, path=path)
+    escalation = (env.get(ESCALATION_MODEL_ENV) or "").strip() or None
+    if escalation is not None and escalation not in specs:
+        raise RegistryError(
+            f"{ESCALATION_MODEL_ENV}={escalation!r} names no entry in {where} (models: "
+            f"{list(specs)}) — set it to one of them, or leave it empty for the default "
+            f"{parsed.default!r}"
+        )
+    registry = Registry(specs, parsed.default, path=path, escalation=escalation)
     if not registry.default.available:
         raise RegistryError(
             f"{where}: the default model {parsed.default!r} is unavailable — "
@@ -1001,8 +1106,11 @@ def removed_env_set(env: Optional[Mapping[str, str]] = None) -> list[str]:
 
 
 def startup_check() -> Registry:
-    """Load the registry (raising ``RegistryError`` for a bad file), log what
-    loaded, and warn once about removed env vars still set."""
+    """Load the registry (raising ``RegistryError`` for a bad file or an
+    unknown ``CLASSIFIER_ESCALATION_MODEL``), log what loaded — the default
+    marked ``[default]``, the escalation model ``[escalation]`` — warn once
+    about removed env vars still set, and warn when the escalation model is
+    unavailable (adaptive criteria are then refused at submit)."""
     registry = get_registry()
     stale = removed_env_set()
     if stale:
@@ -1013,13 +1121,23 @@ def startup_check() -> Registry:
         )
     for spec in registry.models.values():
         logger.info(
-            "models: %s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs "
+            "models: %s%s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs "
             "confidence=%s/%s fast=%s%s",
             spec.id, " [default]" if spec.id == registry.default_id else "",
+            " [escalation]" if spec.id == registry.escalation_id else "",
             urlsplit(spec.url).hostname, spec.served_name, spec.vision,
             spec.max_images_per_prompt, spec.max_concurrent, spec.timeout_s,
             spec.confidence.method, spec.confidence.headline,
             f"top{spec.fast.top_logprobs}" if spec.fast is not None else "no",
             "" if spec.available else f" UNAVAILABLE: {spec.unavailable_reason}",
+        )
+    escalation = registry.escalation
+    if not escalation.available:
+        logger.warning(
+            "models: the escalation model %s [escalation] (%s) is unavailable — %s; "
+            "options.mode 'adaptive' is refused at submit until it is available or %s "
+            "names another entry",
+            escalation.id, ESCALATION_MODEL_ENV, escalation.unavailable_reason,
+            ESCALATION_MODEL_ENV,
         )
     return registry

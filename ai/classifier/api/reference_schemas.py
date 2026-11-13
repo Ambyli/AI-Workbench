@@ -24,8 +24,9 @@ runs) and criterion keys unique within the reference
 (``check_unique_keys``, which /assess does not run: there keys may repeat);
 a breakdown verdict that disagrees with its score
 (``utils.verdict_from_score``); a breakdown for a ``score: false`` criterion;
-a request-level ``mode`` and a criterion with ``options.mode: "fast"`` (a
-reference records reasoned 1-10 answers);
+a request-level ``mode`` and a criterion with ``options.mode: "fast"`` or
+``"adaptive"`` (a reference records reasoned 1-10 answers —
+``config.REFERENCE_REFUSES_READOUT_MODE``);
 breakdown / regions keys that name no criterion; a malformed box or polygon;
 grid coordinates outside 0–1000; a blank ``criteria_keys`` value. What needs
 the bytes (the page exists, a pixel region lies inside it) or the store
@@ -54,9 +55,11 @@ from api.schemas import (
 from config import (
     LLM_BBOX_GRID,
     MODE_NOT_REQUEST_LEVEL,
+    READOUT_MODES,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_MAX_TAGS,
     REFERENCE_REASON_MAX_CHARS,
+    REFERENCE_REFUSES_READOUT_MODE,
     REFERENCE_TAG_MAX_CHARS,
     REFERENCE_TITLE_MAX_CHARS,
     SCORE_HI,
@@ -265,13 +268,15 @@ class ReferenceRequest(_Meta):
                     f"options.reference on {guided}: a reference's own criteria are "
                     "not guided by other references; drop it"
                 )
-            fast = [c.name for c in self.criteria if c.is_fast()]
-            if fast:
-                raise ValueError(
-                    f"options.mode 'fast' on {fast}: a reference records reasoned 1-10 "
-                    "answers (its expected answer becomes a later prompt's caption); drop "
-                    "options.mode or use 'reasoned'"
-                )
+            # Explicit fast / adaptive criteria (both start with a readout,
+            # and adaptive's stays the answer whenever it does not escalate).
+            for mode in READOUT_MODES:
+                names = [
+                    c.name for c in self.criteria
+                    if c.reads_out() and c.resolved_options().get("mode") == mode
+                ]
+                if names:
+                    raise ValueError(REFERENCE_REFUSES_READOUT_MODE.format(mode=mode, names=names))
             self.check_keys([c.name for c in self.criteria], {c.name: c for c in self.criteria})
         # Every model the creation job uses must see images: the job model,
         # and each criterion's own options.model. (A from_job reference's

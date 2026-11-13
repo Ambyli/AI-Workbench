@@ -129,8 +129,10 @@ guards, headings, system sentences — ``REFERENCE_GUARD``,
 wording (an example's text ``BOX_CAPTION_TEXT``, the marks ask ``MARKS_*``,
 the verify's ``VERIFY_PARTIAL_*``) and the fast readout's (``FAST_*``), so
 prompt wording can be tuned without touching the assembly logic here;
-``style``'s values are ``config.MODES``. This module imports those names, so
-``from llm.prompts import BOX_CANDIDATE_HEADING`` still works.
+``style``'s values are ``config.PROMPT_STYLES`` (an adaptive criterion's
+readout is the fast prompt, its escalation the reasoned one). This module
+imports those names, so ``from llm.prompts import BOX_CANDIDATE_HEADING``
+still works.
 ``SCORING_SCAFFOLD`` stays here: it is the answer contract ``llm.validate``
 parses, not wording — as does ``MARKS_SCAFFOLD``, the one ``llm.boxes``
 parses. So does the wording built around per-call values: the scoring
@@ -167,7 +169,7 @@ from config import (
     MARKS_PROMPT,
     MARKS_REFERENCE_GUARD,
     MARKS_SYSTEM_PROMPT,
-    MODES,
+    PROMPT_STYLES,
     REFERENCE_BOX_TEXT_MAX_CHARS,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_GUARD,
@@ -411,7 +413,7 @@ def build_llm_prompt(
             model without a ``fast:`` block.
     """
     spec = _model(model)
-    if style not in MODES:
+    if style not in PROMPT_STYLES:
         raise ValueError(f"style must be 'reasoned' or 'fast', got {style!r}")
     fast = style == "fast"
     if fast:
